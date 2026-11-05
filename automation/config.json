@@ -1,0 +1,56 @@
+{
+  "dataset_root": "H:/data_실사/권은비/워터밤",
+  "target_steps": 3000,
+  "megapixels": 0.5,
+  "rank": 8,
+  "learning_rate": 0.0002,
+  "adaptive_lr": true,
+  "adaptive_lr_min": 0.0002,
+  "adaptive_lr_max": 0.0004,
+  "caption_model": "gemma4-31b-qat-uncen",
+  "caption_base_url": "http://127.0.0.1:18080/v1",
+  "caption_start_script": "C:/LLM/models/Gemma/start-gemma4-64k.bat",
+  "caption_model_file": "C:/LLM/models/Gemma/gemma4-31b-qat-uncen/Gemma4-31B-QAT-Uncensored-HauhauCS-Balanced-Q4_K_M.gguf",
+  "caption_mmproj_file": "C:/LLM/models/Gemma/gemma4-31b-qat-uncen/mmproj-Gemma4-31B-QAT-Uncensored-HauhauCS-Balanced-BF16.gguf",
+  "caption_auto_start": true,
+  "caption_startup_timeout": 300,
+  "caption_request_timeout": 180,
+  "caption_max_output_tokens": 300,
+  "max_images_per_job": 200,
+  "save_every_steps_approx": 500,
+  "sample_prompts": [
+    "{trigger}, a photographic portrait, soft daylight, neutral background",
+    "{trigger}, a full body photograph, casual clothing, outdoor street"
+  ],
+  "comfy": {
+    "url": "http://127.0.0.1:8190",
+    "root": "G:/Lakis/ComfyUI",
+    "workdir": "G:/Lakis",
+    "python": "G:/Lakis/python_embeded/python.exe",
+    "args": ["-s", "ComfyUI/main.py", "--windows-standalone-build", "--port", "8190", "--disable-auto-launch"],
+    "request_timeout": 1800
+  },
+  "models": {
+    "qwen_image21": {
+      "qwen21_dit": "models/Qwen-Image-2.1/transformer",
+      "qwen21_vae": "models/Qwen-Image-2.1/vae/diffusion_pytorch_model.safetensors",
+      "qwen21_text_encoder": "models/Qwen-Image-2.1/text_encoder/model-00001-of-00004.safetensors",
+      "qwen21_training_adapter": "models/fizgig_adapter/fizgig_qwen_image_2.1_training_adapter.safetensors"
+    },
+    "krea2": {
+      "krea2_raw_dit": "G:/Lakis/ComfyUI/models/diffusion_models/krea2_raw_bf16.safetensors",
+      "krea2_turbo_dit": "G:/Lakis/ComfyUI/models/diffusion_models/krea2/krea2_turbo_fp8_scaled.safetensors",
+      "krea2_turbo_lora": "G:/Lakis/ComfyUI/models/diffusion_models/krea2/krea2_turbo_lora_rank_64_bf16.safetensors",
+      "krea2_text_encoder": "G:/Lakis/ComfyUI/models/clip/qwen3vl_4b_fp8_scaled.safetensors",
+      "krea2_vae": "G:/Lakis/ComfyUI/models/vae/qwen_image_vae.safetensors"
+    }
+  },
+  "pipeline": {
+    "projects_dir": "automation/projects",
+    "journal_dir": "automation/state/prompt_journal",
+    "tool2": {
+      "python": "G:/데이터셋 통합작성툴/qwen 2.1 edit/.venv/Scripts/python.exe",
+      "batch": "G:/데이터셋 통합작성툴/qwen 2.1 edit/dataset_batch.py"
+    }
+  }
+}

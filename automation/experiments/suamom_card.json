@@ -1,0 +1,25 @@
+{
+  "_comment": "M0 비교 실험용 캐릭터 카드. project.json(§3.1)의 축소판이고, M3에서 정식 프로젝트로 옮긴다. fixed_traits는 비워 둔다: 학습 캡션이 트리거와 caption_base만 썼으므로 프롬프트도 같게 두어야 공정하다.",
+  "id": "suamom",
+  "kind": "2d",
+  "trigger": "suamom",
+  "subject": "the woman",
+  "caption_base": "korean webtoon style",
+  "fixed_traits": [],
+  "outfits": {"default": ""},
+  "tool2": {
+    "config": "G:/데이터셋 통합작성툴/qwen 2.1 edit/dataset_jobs.json",
+    "character": "수아맘",
+    "dataset": "G:/데이터셋 통합작성툴/qwen 2.1 edit/dataset/수아맘",
+    "characters": "G:/데이터셋 통합작성툴/qwen 2.1 edit/characters/수아맘"
+  },
+  "seed_lora": {
+    "name": "suamom_v1",
+    "dir": "G:/Lakis/ComfyUI/models/loras/2. krea2/suamom_v1",
+    "epochs": [28, 62, 98],
+    "note": "사용자가 예전에 손으로 학습한 Krea2 캐릭터 LoRA. 학습 데이터는 원본(세대 0)으로 본다."
+  },
+  "lineage": {"max_train_generation": 2, "seed_max_generation": 1, "max_edit_depth": 1},
+  "krea2_inference": null,
+  "final_families": ["qwen_image21", "krea2"]
+}

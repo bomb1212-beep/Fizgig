@@ -1,0 +1,14 @@
+runs/
+queue.lock
+stop_requested
+download_manifest.json
+__pycache__/
+*.pyc
+gui_error.log
+# Pipeline runtime state and generated comparison images. The records themselves (experiment.json,
+# candidates.jsonl, timings.json, scores.csv, report.md) are small and are kept: they are the provenance.
+state/
+logs/
+experiments/*/images/
+experiments/*/sheet.html
+experiments/*/run.log

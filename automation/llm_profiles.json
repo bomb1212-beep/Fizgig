@@ -1,0 +1,13 @@
+{
+  "Gemma 4 31B · 64K": {
+    "caption_model": "gemma4-31b-qat-uncen",
+    "caption_base_url": "http://127.0.0.1:18080/v1",
+    "caption_start_script": "C:/LLM/models/Gemma/start-gemma4-64k.bat",
+    "caption_model_file": "C:/LLM/models/Gemma/gemma4-31b-qat-uncen/Gemma4-31B-QAT-Uncensored-HauhauCS-Balanced-Q4_K_M.gguf",
+    "caption_mmproj_file": "C:/LLM/models/Gemma/gemma4-31b-qat-uncen/mmproj-Gemma4-31B-QAT-Uncensored-HauhauCS-Balanced-BF16.gguf",
+    "caption_auto_start": true,
+    "caption_startup_timeout": 300,
+    "caption_request_timeout": 180,
+    "caption_max_output_tokens": 300
+  }
+}

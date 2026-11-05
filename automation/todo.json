@@ -1,0 +1,8 @@
+[
+  {
+    "id": "eunbi_waterbomb",
+    "enabled": true,
+    "trigger": "eunbiwb",
+    "seed": 42
+  }
+]
