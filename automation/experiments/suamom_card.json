@@ -19,6 +19,13 @@
     "epochs": [28, 62, 98],
     "note": "사용자가 예전에 손으로 학습한 Krea2 캐릭터 LoRA. 학습 데이터는 원본(세대 0)으로 본다."
   },
+  "style_reference": {
+    "_comment": "M0 구성 (c)용. 툴2가 edit_bases로 쓰는 정면 원본 1~2장을 그대로 레퍼런스로 쓴다. LoRA 경로는 config.json의 models.krea2.krea2_style_lora.",
+    "images": [
+      "FaceCrop_012.png",
+      "file_00000000755c820986b9a86181c4345d.png"
+    ]
+  },
   "lineage": {"max_train_generation": 2, "seed_max_generation": 1, "max_edit_depth": 1},
   "krea2_inference": null,
   "final_families": ["qwen_image21", "krea2"]

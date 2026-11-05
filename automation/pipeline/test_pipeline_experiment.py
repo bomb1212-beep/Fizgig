@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 AUTO = Path(__file__).resolve().parents[1]
 ROOT = AUTO.parent
@@ -25,9 +26,14 @@ class FakeClient:
 
     def __init__(self):
         self.calls = []
+        self.uploads = []
 
     def name_for(self, kind, path):
         return Path(path).name
+
+    def upload(self, path):
+        self.uploads.append(Path(path).name)
+        return f"dataset_pipeline/{Path(path).name}"
 
     def run(self, graph, out_path=None, **meta):
         self.calls.append({"out": out_path, "meta": meta, "nodes": len(graph)})
@@ -119,6 +125,12 @@ class PlanRunTests(unittest.TestCase):
         options.update(kwargs)
         return exp.plan(self.exp, CARD, **options)
 
+    def styled_card(self):
+        """A card whose variant (c) has somewhere to get reference images from."""
+        (self.dir / "ref.png").write_bytes(b"REF")
+        return dict(CARD, tool2={**(CARD.get("tool2") or {}), "characters": str(self.dir)},
+                    style_reference={"images": ["ref.png"]})
+
     def test_plan_counts_one_task_per_method_and_seed(self):
         manifest = self.plan()
         # 2 slots x (1 tool2 + 1 Krea2 configuration) x 1 seed
@@ -170,6 +182,42 @@ class PlanRunTests(unittest.TestCase):
         self.assertEqual(by_method["qwen_edit"]["edit_depth"], 1)
         self.assertEqual(by_method["krea2_a_e028"]["generator"], "krea2_lora")
         self.assertEqual(by_method["krea2_a_e028"]["models"]["loras"][0]["trained_on_snapshot"], "suamom_v1@28")
+
+    def test_variant_c_records_the_style_lora_it_loaded(self):
+        manifest = exp.plan(self.exp, self.styled_card(), epochs=[28], seeds=(1003,), slot_limit=1,
+                            tool2_folder=self.tool2, variants=("c",))
+        self.assertTrue(all(t["status"] == "pending" for t in manifest["tasks"] if t.get("variant") == "c"))
+        style = self.dir / "style.safetensors"
+        style.write_bytes(b"STYLE")
+        client = FakeClient()
+        with patch.object(exp.models, "overrides", return_value={"krea2_style_lora": str(style)}):
+            exp.run(self.exp, manifest, client=client,
+                    names={"a_unet": "t", "b_unet": "r", "speed_lora": "s", "clip": "c", "vae": "v",
+                           "style_lora": "krea2_style_reference.safetensors"},
+                    lora_dir=self.loras, log=lambda *_: None)
+        # One upload per reference for the whole run, not per image.
+        self.assertEqual(client.uploads, ["ref.png"])
+        records = [json.loads(line) for line in
+                   (self.exp / "candidates.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+        c_records = [r for r in records if r["method"].startswith("krea2_c")]
+        self.assertEqual(len(c_records), 1)
+        roles = [lora.get("role") for lora in c_records[0]["models"]["loras"]]
+        self.assertEqual(roles, [None, "style_reference"])
+        self.assertEqual(c_records[0]["graph_version"], "krea2_ref_turbo@1")
+        self.assertEqual(c_records[0]["models"]["dit"]["name"], "krea2_turbo")
+
+    def test_a_c_task_without_a_style_lora_is_refused(self):
+        manifest = exp.plan(self.exp, self.styled_card(), epochs=[28], seeds=(1003,), slot_limit=1,
+                            tool2_folder=self.tool2, variants=("c",))
+        with self.assertRaises(ValueError):
+            exp.run(self.exp, manifest, client=FakeClient(), names={}, lora_dir=self.loras, log=lambda *_: None)
+
+    def test_a_card_without_reference_images_reports_the_gap(self):
+        manifest = self.plan(variants=("c",), epochs=[28], slot_limit=1, seeds=(1003,))
+        c_tasks = [t for t in manifest["tasks"] if t.get("variant") == "c"]
+        self.assertTrue(all(t["status"] == "missing" for t in c_tasks))
+        self.assertIn("style_reference.images", c_tasks[0]["note"])
+        self.assertIn("c", manifest["variant_notes"])
 
     def test_a_failing_task_does_not_stop_the_others(self):
         manifest = self.plan(epochs=[28, 62], variants=("a",), seeds=(1003,), slot_limit=1)
@@ -327,6 +375,70 @@ class SheetReportTests(unittest.TestCase):
             self.assertIn(f"<th>{method}</th>", page)
         self.assertIn("/scores", page)          # the save button posts to the server
         self.assertIn("CSV 저장", page)
+
+    def test_the_sheet_states_which_end_of_the_scale_is_best(self):
+        page = exp.write_sheet(self.exp, self.manifest).read_text(encoding="utf-8")
+        self.assertIn(exp.SCORE_SCALE, page)
+        self.assertIn("높을수록 좋음", page)
+        self.assertIn("가중 점수", page)
+
+    def test_every_criterion_is_five_clickable_marks_not_a_number_field(self):
+        page = exp.write_sheet(self.exp, self.manifest).read_text(encoding="utf-8")
+        self.assertNotIn('type="number"', page)
+        for field in exp.SCORE_FIELDS:
+            self.assertIn(f'data-field="{field}"', page)
+        cells = len(self.manifest["slots"]) * len(self.manifest["methods"])
+        self.assertEqual(page.count('class="pips"'), cells * len(exp.SCORE_FIELDS))
+        self.assertEqual(page.count('<button type="button" data-value='), cells * len(exp.SCORE_FIELDS) * 5)
+
+    def test_clicking_a_mark_sets_and_unset_it(self):
+        page = exp.write_sheet(self.exp, self.manifest).read_text(encoding="utf-8")
+        self.assertIn("criterion.dataset.value = next", page)
+        self.assertIn("chosen === button.dataset.value ? '' : button.dataset.value", page)
+        self.assertIn("classList.toggle('on'", page)
+
+    def test_a_mark_outside_the_scale_is_ignored(self):
+        rows = exp.score_rows([{"slot": "s", "method": "m", "identity": 7, "quality": 4}])
+        self.assertEqual(rows[0]["_scores"], {"quality": 4.0})
+
+    def test_a_different_character_verdict_counts_even_without_numbers(self):
+        # The judge says "this is not her" and types nothing; that must still reach the error rate.
+        rows = [{"slot": "s", "method": "m", "error": "1"},
+                {"slot": "s", "method": "m", "identity": 5, "instruction": 5, "quality": 5}]
+        summary = exp.aggregate(rows)["m"]
+        self.assertEqual(summary["n"], 2)
+        self.assertEqual(summary["errors"], 1)
+        self.assertEqual(summary["unscored"], 1)
+        self.assertAlmostEqual(summary["error_rate"], 0.5)
+        self.assertAlmostEqual(summary["weighted"], 5.0)   # only the numbered image feeds the mean
+
+    def test_a_method_whose_images_are_all_other_people_is_listed_as_disqualified(self):
+        summary = exp.aggregate([{"slot": "s", "method": "bad", "error": "1"},
+                                 {"slot": "s2", "method": "bad", "error": "1"},
+                                 {"slot": "s", "method": "ok", "identity": 4, "instruction": 4, "quality": 4}])
+        self.assertIsNone(summary["bad"]["weighted"])
+        self.assertEqual(summary["bad"]["n"], 2)
+        refused = dict(exp.disqualified(summary))
+        self.assertIn("bad", refused)
+        self.assertNotIn("ok", refused)
+        self.assertEqual(exp.recommendation(summary)[0], "ok")
+
+    def test_the_report_names_the_disqualified_method(self):
+        exp.write_scores(self.exp, [{"slot": "ang_front_close", "method": "krea2_c_e028", "error": 1},
+                                    {"slot": "ang_front_close", "method": "qwen_edit", "identity": 4,
+                                     "instruction": 4, "quality": 4}])
+        path, best, _reasons = exp.write_report(self.exp, self.manifest, log=lambda *_: None)
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("## 탈락", text)
+        self.assertIn("krea2_c_e028", text)
+        self.assertEqual(best, "qwen_edit")
+
+    def test_higher_marks_rank_higher(self):
+        # The whole point of the scale: more 5s must win, never fewer.
+        better = exp.aggregate([{"slot": "s", "method": "five", "identity": 5, "instruction": 5, "quality": 5}])
+        worse = exp.aggregate([{"slot": "s", "method": "one", "identity": 1, "instruction": 1, "quality": 1}])
+        self.assertGreater(better["five"]["weighted"], worse["one"]["weighted"])
+        self.assertEqual(exp.recommendation({**better, **worse})[0], "five")
 
     def test_scores_round_trip_through_the_csv(self):
         rows = [{"slot": "ang_front_close", "method": "krea2_a_e028", "seed": 1003, "task": "t",

@@ -42,7 +42,8 @@
       "krea2_turbo_dit": "G:/Lakis/ComfyUI/models/diffusion_models/krea2/krea2_turbo_fp8_scaled.safetensors",
       "krea2_turbo_lora": "G:/Lakis/ComfyUI/models/diffusion_models/krea2/krea2_turbo_lora_rank_64_bf16.safetensors",
       "krea2_text_encoder": "G:/Lakis/ComfyUI/models/clip/qwen3vl_4b_fp8_scaled.safetensors",
-      "krea2_vae": "G:/Lakis/ComfyUI/models/vae/qwen_image_vae.safetensors"
+      "krea2_vae": "G:/Lakis/ComfyUI/models/vae/qwen_image_vae.safetensors",
+      "krea2_style_lora": "G:/Lakis/ComfyUI/models/loras/krea2_style_reference.safetensors"
     }
   },
   "pipeline": {

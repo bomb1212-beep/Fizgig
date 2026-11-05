@@ -97,7 +97,8 @@ SLOTS = [
 
 SCORE_FIELDS = ("identity", "instruction", "quality")
 SCORE_LABELS = {"identity": "정체성", "instruction": "포즈·구도 지시 준수", "quality": "품질"}
-# What the recommendation maximises. Identity first: every later step assumes the picture is the same person.
+# 1 is bad, 5 is best: every field is a quality mark, and higher is better everywhere.
+SCORE_SCALE = "1 = 나쁨, 5 = 아주 좋음 (높을수록 좋음)"# What the recommendation maximises. Identity first: every later step assumes the picture is the same person.
 WEIGHTS = {"identity": 0.45, "instruction": 0.30, "quality": 0.25}
 
 
@@ -165,6 +166,15 @@ def plan(exp_dir, card, *, epochs=(), seeds=(1003, 1004), slot_limit=None, tool2
         # "suamom_v1@28,62": the run and the epochs this comparison is allowed to use as snapshots.
         character_lora = (name + ("@" + ",".join(str(int(e)) for e in epochs) if epochs else "")) if name else None
     captions = tool2_dataset(tool2_folder) if tool2_folder else {}
+    characters_folder = (card.get("tool2") or {}).get("characters")
+    # Variant (c) conditions on the same originals tool2 anchors on: one or two front-facing originals, the same for
+    # every slot, because a style reference says who the character is, not what the slot is.
+    style_cfg = card.get("style_reference") or {}
+    reference_paths = []
+    for name in style_cfg.get("images") or []:
+        path = Path(characters_folder) / name if characters_folder else Path(name)
+        reference_paths.append(str(path))
+    absent_refs = [p for p in reference_paths if not Path(p).is_file()]
     methods = ["qwen_edit"] + [f"krea2_{v}_e{int(e):03d}" for v in variants for e in epochs]
     tasks, used = [], set()
     for slot in chosen:
@@ -184,11 +194,20 @@ def plan(exp_dir, card, *, epochs=(), seeds=(1003, 1004), slot_limit=None, tool2
             for variant in variants:
                 for epoch in epochs:
                     method = f"krea2_{variant}_e{int(epoch):03d}"
-                    tasks.append({
+                    task = {
                         **base, "method": method, "kind": "comfy", "variant": variant, "epoch": int(epoch),
                         "file": f"images/{method}/{slot['id']}__s{seed}.png",
                         "prompt": prompt_for(card, slot), "status": "pending", "note": "",
-                    })
+                    }
+                    if variant == "c":
+                        task["references"] = reference_paths
+                        if not reference_paths:
+                            task["status"] = "missing"
+                            task["note"] = "no style_reference.images in the character card"
+                        elif absent_refs:
+                            task["status"] = "missing"
+                            task["note"] = "reference image not found: " + ", ".join(Path(p).name for p in absent_refs)
+                    tasks.append(task)
     missing = sorted({t["slot_id"] for t in tasks if t["status"] == "missing"})
     # A file already sitting where an unfillable slot would put one is left over from an older plan; it is named here
     # so it can be cleaned up, and `run()` never counts it as this slot's result.
@@ -197,9 +216,10 @@ def plan(exp_dir, card, *, epochs=(), seeds=(1003, 1004), slot_limit=None, tool2
             task["stale_file"] = True
     variant_notes = {}
     if "c" in variants:
-        variant_notes["c"] = ("reference conditioning is wired (TextEncodeQwenImageEditPlus + "
-                              "FluxKontextMultiReferenceLatentMethod) but the run needs reference images chosen per "
-                              "slot and the krea2_style_reference LoRA is not installed; see PROGRESS.ko.md section 14")
+        if not reference_paths:
+            variant_notes["c"] = "the character card has no style_reference.images, so nothing is conditioned on"
+        elif absent_refs:
+            variant_notes["c"] = "these reference images are missing: " + ", ".join(absent_refs)
     manifest = {
         "kind": "m0_comparison",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -277,11 +297,13 @@ def run(exp_dir, manifest, *, client, names, lora_dir, log=print, cancel=None):
     acceptance criterion, and it is what makes a multi-hour comparison resumable.
     """
     exp_dir = Path(exp_dir)
-    unsupported = [t["variant"] for t in manifest["tasks"] if t.get("variant") == "c"]
+    unsupported = [t["variant"] for t in manifest["tasks"]
+                   if t.get("variant") == "c" and t.get("status") == "pending" and not names.get("style_lora")]
     if unsupported:
-        raise ValueError("variant 'c' cannot be run by this harness yet: "
-                         + manifest.get("variant_notes", {}).get("c", "no reference images are wired"))
+        raise ValueError("variant 'c' needs the style-reference LoRA: set models.krea2.krea2_style_lora in "
+                         "automation/config.json and make sure ComfyUI can see it")
     timings = read_timings(exp_dir)
+    uploaded = {}
     done = skipped = failed = missing = 0
     for task in manifest["tasks"]:
         out = exp_dir / task["file"]
@@ -315,6 +337,14 @@ def run(exp_dir, manifest, *, client, names, lora_dir, log=print, cancel=None):
                 log(f"  {task['slot_id']} {task['method']}: copied {source.name}")
             else:
                 lora = ensure_character_lora(task["method"], task["epoch"], lora_dir)
+                extra = {}
+                if task["variant"] == "c":
+                    # One upload per reference for the whole run: the same two originals serve every slot.
+                    for path in task.get("references") or []:
+                        if path not in uploaded:
+                            uploaded[path] = client.upload(path)
+                    extra = {"reference_images": [uploaded[p] for p in task["references"]],
+                             "style_lora": names["style_lora"]}
                 graph = krea2_gen.build(
                     task["variant"],
                     unet=names["a_unet" if task["variant"] == "a" else "b_unet"],
@@ -323,6 +353,7 @@ def run(exp_dir, manifest, *, client, names, lora_dir, log=print, cancel=None):
                     character_lora=client.name_for("lora", str(lora)),
                     speed_lora=names["speed_lora"] if task["variant"] == "b" else None,
                     filename_prefix=f"pipeline_experiment/{task['slot_id']}",
+                    **extra,
                 )
                 out.parent.mkdir(parents=True, exist_ok=True)
                 client.run(graph, out, slot_id=task["slot_id"], method=task["method"], seed=task["seed"])
@@ -444,11 +475,19 @@ def write_candidates(exp_dir, manifest, lora_dir):
             # run, say so explicitly rather than leaving the trace dangling.
             snapshot = manifest.get("character_lora") or \
                 f"{manifest['character'].get('id', 'character')}@e{int(task['epoch']):03d}"
+            loras = [lineage.model_entry(lora, trained_on_snapshot=snapshot, trained_on_generation=0)]
+            if task["variant"] == "c":
+                # Reference conditioning also loads the style LoRA, so which one it was belongs in the record.
+                style_path = models.overrides("krea2").get("krea2_style_lora")
+                if style_path and Path(style_path).is_file():
+                    style_entry = lineage.model_entry(style_path, trained_on_snapshot=None,
+                                                      trained_on_generation=0)
+                    style_entry["role"] = "style_reference"
+                    loras.append(style_entry)
             record = lineage.record(
                 out, generator="krea2_lora", parent_ids=[], train_generation=1, edit_depth=0, slot=slot,
-                models={"dit": {"name": "krea2_turbo" if task["variant"] == "a" else "krea2_raw"},
-                        "loras": [lineage.model_entry(lora, trained_on_snapshot=snapshot,
-                                                     trained_on_generation=0)]},
+                models={"dit": {"name": "krea2_turbo" if task["variant"] in ("a", "c") else "krea2_raw"},
+                        "loras": loras},
                 prompt=task["prompt"], seed=task["seed"], steps=krea2_gen.SAMPLING["steps"],
                 cfg=krea2_gen.SAMPLING["cfg"], width=manifest["size"]["width"],
                 height=manifest["size"]["height"], graph_version=krea2_gen.GRAPH_VERSION[task["variant"]],
@@ -464,6 +503,21 @@ def write_candidates(exp_dir, manifest, lora_dir):
 
 
 # --------------------------------------------------------------------------------------------- the contact sheet
+def score_controls():
+    """Five clickable marks per criterion, plus a note and the hard-error tick.
+
+    Clicking a number sets that mark (and lights every mark up to it, so "3" reads as three out of five); clicking the
+    same number again clears it, because a mis-click has to be undoable without a reload. The CSV carries the number.
+    """
+    parts = []
+    for field in SCORE_FIELDS:
+        pips = "".join(f'<button type="button" data-value="{value}" title="{value}점">{value}</button>'
+                       for value in (1, 2, 3, 4, 5))
+        parts.append(f'<div class="criterion" data-field="{field}">'
+                     f'<span class="name">{SCORE_LABELS[field]}</span><span class="pips">{pips}</span></div>')
+    return "".join(parts)
+
+
 def write_sheet(exp_dir, manifest):
     """Write sheet.html and return its path. Cells are slot rows x method columns, inputs under each image."""
     exp_dir = Path(exp_dir)
@@ -487,16 +541,16 @@ def write_sheet(exp_dir, manifest):
                 badge = f'<div class="meta">{html_escape(method)} · s{seed}' + (
                     f' · {seconds:.0f}s' if seconds else "") + "</div>"
                 if not (exp_dir / task["file"]).is_file():
+                    why = task.get("note") or task["status"]
                     inner.append(f'<div class="cell missing">{badge}<div class="ph">'
-                                 f'{html_escape(task["status"])}</div></div>')
+                                 f'{html_escape(why)}</div></div>')
                     continue
                 inner.append(
                     f'<div class="cell">{badge}'
                     f'<a href="{rel}" target="_blank"><img loading="lazy" src="{rel}" alt="{html_escape(key)}"></a>'
                     f'<div class="score" data-task="{html_escape(key)}" data-slot="{html_escape(slot["id"])}" '
                     f'data-method="{html_escape(method)}" data-seed="{seed}">'
-                    + "".join(f'<label>{SCORE_LABELS[f]} <input type="number" min="1" max="5" step="1" '
-                              f'name="{f}"></label>' for f in SCORE_FIELDS)
+                    + score_controls()
                     + '<label class="note">메모 <input type="text" name="note"></label>'
                     + '<label class="err"><input type="checkbox" name="error"> 다른 캐릭터/심한 오류</label>'
                     + "</div></div>")
@@ -508,6 +562,8 @@ def write_sheet(exp_dir, manifest):
         head="".join(f"<th>{html_escape(m)}</th>" for m in methods),
         rows="".join(rows),
         summary=html_escape(_summary_line(manifest)),
+        scale=html_escape(SCORE_SCALE),
+        weights=html_escape(", ".join(f"{SCORE_LABELS[f]} {w:g}" for f, w in WEIGHTS.items())),
     )
     path = exp_dir / "sheet.html"
     path.write_text(page, encoding="utf-8")
@@ -539,6 +595,8 @@ _PAGE_TEMPLATE = """<!doctype html>
  body {{ font: 14px/1.45 system-ui, sans-serif; margin: 16px; background: #111; color: #eee; }}
  h1 {{ font-size: 18px; margin: 0 0 4px; }}
  .summary {{ color: #9ab; margin-bottom: 12px; }}
+ .legend {{ color: #bcd; background: #182028; border: 1px solid #2b3a48; padding: 8px 10px;
+            margin-bottom: 12px; border-radius: 4px; }}
  table {{ border-collapse: collapse; }}
  th, td {{ border: 1px solid #333; padding: 6px; vertical-align: top; }}
  thead th {{ position: sticky; top: 0; background: #1b1b1b; z-index: 2; }}
@@ -548,36 +606,62 @@ _PAGE_TEMPLATE = """<!doctype html>
  .cell {{ margin-bottom: 8px; }}
  .cell img {{ max-width: 220px; height: auto; display: block; border: 1px solid #2a2a2a; }}
  .cell.missing .ph, .cell.empty {{ min-width: 220px; color: #a55; padding: 24px 6px; text-align: center; }}
- .score {{ display: grid; grid-template-columns: 1fr 1fr; gap: 2px 6px; margin-top: 4px; max-width: 220px; }}
- .score label {{ font-size: 11px; color: #9ab; display: flex; gap: 4px; align-items: center; }}
- .score input[type=number] {{ width: 42px; }}
- .score .note {{ grid-column: 1 / -1; }}
+ .score {{ display: grid; grid-template-columns: 1fr; gap: 3px; margin-top: 5px; max-width: 220px; }}
+ .criterion {{ display: flex; align-items: center; gap: 6px; }}
+ .criterion .name {{ font-size: 11px; color: #9ab; width: 96px; flex: none; }}
+ .pips {{ display: flex; gap: 2px; }}
+ .pips button {{ width: 22px; height: 20px; padding: 0; font-size: 11px; line-height: 1;
+                 background: #1d2228; color: #7f8c99; border: 1px solid #333b44; border-radius: 3px; cursor: pointer; }}
+ .pips button:hover {{ border-color: #5a6b7a; color: #cfe0ee; }}
+ .pips button.on {{ background: #2f6f4f; border-color: #47a878; color: #eafff4; font-weight: 600; }}
+ .score .note {{ display: flex; gap: 4px; align-items: center; font-size: 11px; color: #9ab; }}
  .score .note input {{ flex: 1; min-width: 0; }}
- .score .err {{ grid-column: 1 / -1; }}
+ .score .err {{ font-size: 11px; color: #9ab; }}
  #bar {{ position: sticky; bottom: 0; background: #1b1b1b; padding: 8px; border-top: 1px solid #333;
          display: flex; gap: 12px; align-items: center; }}
  button {{ padding: 6px 14px; }}
 </style></head><body>
 <h1>{title}</h1>
 <div class="summary">{summary}</div>
+<div class="legend"><b>점수 기준:</b> {scale} &nbsp;·&nbsp; <b>숫자를 클릭</b>해 매기고, 같은 숫자를 다시 누르면 지워집니다.
+ 세 칸은 정체성 / 포즈·구도 지시 준수 / 품질이고, 추천은 가중 점수({weights})가 가장 높은 방식을 고릅니다.
+ &nbsp;·&nbsp; <b>다른 캐릭터/심한 오류</b>는 숫자와 별개로 오류율에만 집계됩니다.</div>
 <div id="bar"><button id="save">CSV 저장</button><span id="state">점수를 입력하고 저장하세요.</span></div>
 <table><thead><tr><th>slot</th>{head}</tr></thead><tbody>{rows}</tbody></table>
 <script>
+function marksOf(box) {{
+  const value = {{}};
+  box.querySelectorAll('.criterion').forEach(criterion => {{
+    if (criterion.dataset.value) value[criterion.dataset.field] = criterion.dataset.value;
+  }});
+  return value;
+}}
 function rows() {{
   const out = [];
   document.querySelectorAll('.score').forEach(box => {{
-    const value = {{}};
-    let filled = false;
-    box.querySelectorAll('input').forEach(input => {{
-      if (input.type === 'checkbox') {{ value[input.name] = input.checked ? '1' : '0'; if (input.checked) filled = true; }}
-      else if (input.value !== '') {{ value[input.name] = input.value; if (input.name !== 'note') filled = true; }}
-    }});
-    if (!filled) return;
+    const value = marksOf(box);
+    const note = box.querySelector('input[name=note]');
+    const error = box.querySelector('input[name=error]');
+    if (note && note.value !== '') value.note = note.value;
+    if (error && error.checked) value.error = '1';
+    if (Object.keys(value).length === 0) return;
     out.push(Object.assign({{ slot: box.dataset.slot, method: box.dataset.method, seed: box.dataset.seed,
                              task: box.dataset.task }}, value));
   }});
   return out;
 }}
+// One listener for the whole table: a cell is cheap to draw and there are hundreds of them.
+document.addEventListener('click', event => {{
+  const button = event.target.closest('.pips button');
+  if (!button) return;
+  const criterion = button.closest('.criterion');
+  const chosen = criterion.dataset.value || '';
+  const next = chosen === button.dataset.value ? '' : button.dataset.value;
+  criterion.dataset.value = next;
+  criterion.querySelectorAll('.pips button').forEach(mark => {{
+    mark.classList.toggle('on', next !== '' && Number(mark.dataset.value) <= Number(next));
+  }});
+}});
 function toCsv(list) {{
   const cols = ['slot','method','seed','task','identity','instruction','quality','error','note'];
   const esc = v => '"' + String(v === undefined ? '' : v).replace(/"/g, '""') + '"';
@@ -691,19 +775,31 @@ def serve(exp_dir, port=8765, log=print):
 
 # --------------------------------------------------------------------------------------------- the report
 def score_rows(rows):
-    """Keep only rows that carry at least one numeric mark, converted to floats."""
+    """Rows carrying at least one usable mark, or the hard-error flag.
+
+    A mark outside 1-5 is dropped rather than clamped: the fields say 1-5, and a stray 7 (a typo, or a column pasted
+    in the wrong place) would otherwise dominate every average it lands in.
+
+    A row with no numbers but `error` set is kept. "This is a different character" is the strongest thing a judge can
+    say, and the images that earn it are exactly the ones nobody bothers to score; dropping them would report a
+    method's error rate over only its better half.
+    """
     out = []
     for row in rows:
         mark = {}
         for field in SCORE_FIELDS:
             raw = str(row.get(field, "")).strip()
-            if raw:
-                try:
-                    mark[field] = float(raw)
-                except ValueError:
-                    pass
-        if mark:
-            out.append({**row, "_scores": mark, "error": str(row.get("error", "")).strip().lower() in ("1", "true")})
+            if not raw:
+                continue
+            try:
+                value = float(raw)
+            except ValueError:
+                continue
+            if 1.0 <= value <= 5.0:
+                mark[field] = value
+        error = str(row.get("error", "")).strip().lower() in ("1", "true")
+        if mark or error:
+            out.append({**row, "_scores": mark, "error": error})
     return out
 
 
@@ -713,15 +809,24 @@ def weighted(scores):
 
 
 def aggregate(rows):
-    """Per-method means and weighted score, plus a per-category breakdown (side and back angles matter)."""
+    """Per-method means and weighted score, plus a per-category breakdown (side and back angles matter).
+
+    `n` counts every judged image, including the ones flagged as a different character and left unnumbered; only the
+    numbered ones feed the means. `unscored` is how many of `n` had no numbers, so a method whose images were all
+    rejected as other people shows up as n=24, 24 errors, 24 unscored, rather than vanishing.
+    """
     graded = score_rows(rows)
     buckets = {}
     for row in graded:
         method = row.get("method", "?")
-        bucket = buckets.setdefault(method, {"n": 0, "errors": 0, "scores": {f: [] for f in SCORE_FIELDS},
+        bucket = buckets.setdefault(method, {"n": 0, "errors": 0, "unscored": 0,
+                                             "scores": {f: [] for f in SCORE_FIELDS},
                                              "categories": {}, "weighted": []})
         bucket["n"] += 1
         bucket["errors"] += 1 if row["error"] else 0
+        if not row["_scores"]:
+            bucket["unscored"] += 1
+            continue
         for field, value in row["_scores"].items():
             bucket["scores"][field].append(value)
         score = weighted(row["_scores"])
@@ -736,12 +841,24 @@ def aggregate(rows):
             "n": bucket["n"],
             "errors": bucket["errors"],
             "error_rate": bucket["errors"] / bucket["n"] if bucket["n"] else 0.0,
+            "unscored": bucket["unscored"],
             "means": {f: (statistics.mean(v) if v else None) for f, v in bucket["scores"].items()},
             "weighted": statistics.mean(bucket["weighted"]) if bucket["weighted"] else None,
             "categories": {c: {"n": v["n"], "weighted": statistics.mean(v["weighted"]) if v["weighted"] else None}
                            for c, v in bucket["categories"].items()},
         }
     return summary
+
+
+def disqualified(summary):
+    """Methods that should not be recommended at all, with the numbers that disqualified them."""
+    out = []
+    for method, s in sorted(summary.items()):
+        if s.get("weighted") is None:
+            out.append((method, f"채점된 이미지가 없습니다 (판정 {s['n']}장 중 {s['errors']}장을 다른 캐릭터/오류로 표시)"))
+        elif s["error_rate"] >= 0.5:
+            out.append((method, f"오류율 {s['error_rate']:.0%} ({s['errors']}/{s['n']})가 너무 높습니다"))
+    return out
 
 
 def recommendation(summary):
@@ -779,10 +896,14 @@ def write_report(exp_dir, manifest, log=print):
     rows = read_scores(exp_dir)
     summary = aggregate(rows)
     best, reasons = recommendation(summary)
+    refused = disqualified(summary)
+    judged = score_rows(rows)
     lines = [f"# M0 비교 리포트 — {manifest['character'].get('id', '')}", "",
+             f"- 점수 기준: {SCORE_SCALE}; 각 칸은 정체성 / 포즈·구도 지시 준수 / 품질",
+             f"- 추천 기준: 가중 점수({', '.join(f'{SCORE_LABELS[f]} {w:g}' for f, w in WEIGHTS.items())})가 가장 높은 방식",
              f"- 슬롯 {len(manifest['slots'])} × 시드 {len(manifest.get('seeds') or [])}"
              f" × 방식 {len(manifest['methods'])}",
-             f"- 점수 {len(score_rows(rows))}건",
+             f"- 판정 {len(judged)}건 (그중 숫자 없이 오류 표시만 {sum(1 for r in judged if not r['_scores'])}건)",
              f"- LoRA {manifest.get('character_lora') or '(none)'}"]
     for variant, note in (manifest.get("variant_notes") or {}).items():
         lines.append(f"- 구성 ({variant}) 제외: {note}")
@@ -790,14 +911,19 @@ def write_report(exp_dir, manifest, log=print):
         lines.append(f"- 툴2 이미지가 없어 비어 있는 슬롯: {', '.join(manifest['slots_without_tool2'])}")
     lines.append("")
     if summary:
-        lines += ["| 방식 | n | 정체성 | 지시 준수 | 품질 | 가중 | 오류율 |", "|---|---|---|---|---|---|---|"]
-        for method, s in sorted(summary.items(), key=lambda kv: -(kv[1]["weighted"] or 0)):
+        lines += ["| 방식 | 판정 | 정체성 | 지시 준수 | 품질 | 가중 | 다른 캐릭터/오류 | 숫자 없음 |",
+                  "|---|---|---|---|---|---|---|---|"]
+        for method, s in sorted(summary.items(), key=lambda kv: (kv[1]["weighted"] is None,
+                                                                -(kv[1]["weighted"] or 0))):
             m = s["means"]
             lines.append(f"| {method} | {s['n']} | {_fmt(m.get('identity'))} | {_fmt(m.get('instruction'))} | "
-                         f"{_fmt(m.get('quality'))} | {_fmt(s['weighted'])} | {s['error_rate']:.0%} |")
+                         f"{_fmt(m.get('quality'))} | {_fmt(s['weighted'])} | "
+                         f"{s['errors']} ({s['error_rate']:.0%}) | {s['unscored']} |")
         lines.append("")
     lines.append("## 추천")
     lines += [f"**{best}**", ""] + [f"- {r}" for r in reasons] if best else reasons
+    if refused:
+        lines += ["", "## 탈락", ""] + [f"- **{method}**: {why}" for method, why in refused]
     lines.append("")
     path = exp_dir / "report.md"
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -848,6 +974,9 @@ def cmd_run(args):
         print("model problems: " + "; ".join(problems), file=sys.stderr)
         return 1
     names = resolve_krea2_names(client, models.resolve("krea2"))
+    style_path = models.overrides("krea2").get("krea2_style_lora")
+    if any(t.get("variant") == "c" for t in manifest["tasks"]):
+        names["style_lora"] = client.name_for("lora", style_path) if style_path else None
     seed_lora = manifest["character"].get("seed_lora") or {}
     lora_dir = Path(args.lora_dir or seed_lora.get("dir") or "")
     if not lora_dir.is_dir():

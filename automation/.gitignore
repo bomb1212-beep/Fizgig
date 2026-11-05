@@ -12,3 +12,4 @@ logs/
 experiments/*/images/
 experiments/*/sheet.html
 experiments/*/run.log
+gui-test-*/

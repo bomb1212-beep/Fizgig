@@ -1,6 +1,6 @@
 {
  "kind": "m0_comparison",
- "created_at": "2026-11-05T16:32:29",
+ "created_at": "2026-11-05T16:46:34",
  "character": {
   "_comment": "M0 비교 실험용 캐릭터 카드. project.json(§3.1)의 축소판이고, M3에서 정식 프로젝트로 옮긴다. fixed_traits는 비워 둔다: 학습 캡션이 트리거와 caption_base만 썼으므로 프롬프트도 같게 두어야 공정하다.",
   "id": "suamom",
@@ -28,6 +28,13 @@
    ],
    "note": "사용자가 예전에 손으로 학습한 Krea2 캐릭터 LoRA. 학습 데이터는 원본(세대 0)으로 본다."
   },
+  "style_reference": {
+   "_comment": "M0 구성 (c)용. 툴2가 edit_bases로 쓰는 정면 원본 1~2장을 그대로 레퍼런스로 쓴다. LoRA 경로는 config.json의 models.krea2.krea2_style_lora.",
+   "images": [
+    "FaceCrop_012.png",
+    "file_00000000755c820986b9a86181c4345d.png"
+   ]
+  },
   "lineage": {
    "max_train_generation": 2,
    "seed_max_generation": 1,
@@ -42,7 +49,8 @@
  "character_lora": "suamom_v1@28",
  "variants": [
   "a",
-  "b"
+  "b",
+  "c"
  ],
  "epochs": [
   28
@@ -336,7 +344,8 @@
  "methods": [
   "qwen_edit",
   "krea2_a_e028",
-  "krea2_b_e028"
+  "krea2_b_e028",
+  "krea2_c_e028"
  ],
  "tasks": [
   {
@@ -379,6 +388,24 @@
    "note": ""
   },
   {
+   "slot_id": "ang_front_close",
+   "category": "angles",
+   "seed": 1003,
+   "method": "krea2_c_e028",
+   "kind": "comfy",
+   "variant": "c",
+   "epoch": 28,
+   "file": "images/krea2_c_e028/ang_front_close__s1003.png",
+   "prompt": "suamom, korean webtoon style, portrait, upper body, front view, looking at viewer",
+   "status": "done",
+   "note": "",
+   "references": [
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\FaceCrop_012.png",
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\file_00000000755c820986b9a86181c4345d.png"
+   ],
+   "seconds": 26.4
+  },
+  {
    "slot_id": "ang_front_medium",
    "category": "angles",
    "seed": 1003,
@@ -416,6 +443,24 @@
    "prompt": "suamom, korean webtoon style, upper body, front view, looking at viewer",
    "status": "done",
    "note": ""
+  },
+  {
+   "slot_id": "ang_front_medium",
+   "category": "angles",
+   "seed": 1003,
+   "method": "krea2_c_e028",
+   "kind": "comfy",
+   "variant": "c",
+   "epoch": 28,
+   "file": "images/krea2_c_e028/ang_front_medium__s1003.png",
+   "prompt": "suamom, korean webtoon style, upper body, front view, looking at viewer",
+   "status": "done",
+   "note": "",
+   "references": [
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\FaceCrop_012.png",
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\file_00000000755c820986b9a86181c4345d.png"
+   ],
+   "seconds": 26.0
   },
   {
    "slot_id": "ang_front_wide",
@@ -457,6 +502,24 @@
    "note": ""
   },
   {
+   "slot_id": "ang_front_wide",
+   "category": "angles",
+   "seed": 1003,
+   "method": "krea2_c_e028",
+   "kind": "comfy",
+   "variant": "c",
+   "epoch": 28,
+   "file": "images/krea2_c_e028/ang_front_wide__s1003.png",
+   "prompt": "suamom, korean webtoon style, full body, front view, standing, looking at viewer",
+   "status": "done",
+   "note": "",
+   "references": [
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\FaceCrop_012.png",
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\file_00000000755c820986b9a86181c4345d.png"
+   ],
+   "seconds": 26.2
+  },
+  {
    "slot_id": "ang_quarter_medium",
    "category": "angles",
    "seed": 1003,
@@ -494,6 +557,24 @@
    "prompt": "suamom, korean webtoon style, upper body, three-quarter view, looking at viewer",
    "status": "done",
    "note": ""
+  },
+  {
+   "slot_id": "ang_quarter_medium",
+   "category": "angles",
+   "seed": 1003,
+   "method": "krea2_c_e028",
+   "kind": "comfy",
+   "variant": "c",
+   "epoch": 28,
+   "file": "images/krea2_c_e028/ang_quarter_medium__s1003.png",
+   "prompt": "suamom, korean webtoon style, upper body, three-quarter view, looking at viewer",
+   "status": "done",
+   "note": "",
+   "references": [
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\FaceCrop_012.png",
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\file_00000000755c820986b9a86181c4345d.png"
+   ],
+   "seconds": 36.2
   },
   {
    "slot_id": "ang_quarter_close",
@@ -535,6 +616,24 @@
    "note": ""
   },
   {
+   "slot_id": "ang_quarter_close",
+   "category": "angles",
+   "seed": 1003,
+   "method": "krea2_c_e028",
+   "kind": "comfy",
+   "variant": "c",
+   "epoch": 28,
+   "file": "images/krea2_c_e028/ang_quarter_close__s1003.png",
+   "prompt": "suamom, korean webtoon style, portrait, close-up, three-quarter view, looking at viewer",
+   "status": "done",
+   "note": "",
+   "references": [
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\FaceCrop_012.png",
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\file_00000000755c820986b9a86181c4345d.png"
+   ],
+   "seconds": 26.2
+  },
+  {
    "slot_id": "ang_side_medium",
    "category": "angles",
    "seed": 1003,
@@ -572,6 +671,24 @@
    "prompt": "suamom, korean webtoon style, full body, side view, profile, looking away",
    "status": "done",
    "note": ""
+  },
+  {
+   "slot_id": "ang_side_medium",
+   "category": "angles",
+   "seed": 1003,
+   "method": "krea2_c_e028",
+   "kind": "comfy",
+   "variant": "c",
+   "epoch": 28,
+   "file": "images/krea2_c_e028/ang_side_medium__s1003.png",
+   "prompt": "suamom, korean webtoon style, full body, side view, profile, looking away",
+   "status": "done",
+   "note": "",
+   "references": [
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\FaceCrop_012.png",
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\file_00000000755c820986b9a86181c4345d.png"
+   ],
+   "seconds": 32.2
   },
   {
    "slot_id": "ang_back_medium",
@@ -613,6 +730,24 @@
    "note": ""
   },
   {
+   "slot_id": "ang_back_medium",
+   "category": "angles",
+   "seed": 1003,
+   "method": "krea2_c_e028",
+   "kind": "comfy",
+   "variant": "c",
+   "epoch": 28,
+   "file": "images/krea2_c_e028/ang_back_medium__s1003.png",
+   "prompt": "suamom, korean webtoon style, upper body, from behind, looking back",
+   "status": "done",
+   "note": "",
+   "references": [
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\FaceCrop_012.png",
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\file_00000000755c820986b9a86181c4345d.png"
+   ],
+   "seconds": 26.2
+  },
+  {
    "slot_id": "ang_back_wide",
    "category": "angles",
    "seed": 1003,
@@ -650,6 +785,24 @@
    "prompt": "suamom, korean webtoon style, full body, from behind, standing",
    "status": "done",
    "note": ""
+  },
+  {
+   "slot_id": "ang_back_wide",
+   "category": "angles",
+   "seed": 1003,
+   "method": "krea2_c_e028",
+   "kind": "comfy",
+   "variant": "c",
+   "epoch": 28,
+   "file": "images/krea2_c_e028/ang_back_wide__s1003.png",
+   "prompt": "suamom, korean webtoon style, full body, from behind, standing",
+   "status": "done",
+   "note": "",
+   "references": [
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\FaceCrop_012.png",
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\file_00000000755c820986b9a86181c4345d.png"
+   ],
+   "seconds": 34.2
   },
   {
    "slot_id": "frm_upper_body",
@@ -691,6 +844,24 @@
    "note": ""
   },
   {
+   "slot_id": "frm_upper_body",
+   "category": "framing",
+   "seed": 1003,
+   "method": "krea2_c_e028",
+   "kind": "comfy",
+   "variant": "c",
+   "epoch": 28,
+   "file": "images/krea2_c_e028/frm_upper_body__s1003.png",
+   "prompt": "suamom, korean webtoon style, upper body, portrait, front view",
+   "status": "done",
+   "note": "",
+   "references": [
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\FaceCrop_012.png",
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\file_00000000755c820986b9a86181c4345d.png"
+   ],
+   "seconds": 24.3
+  },
+  {
    "slot_id": "frm_face",
    "category": "framing",
    "seed": 1003,
@@ -728,6 +899,24 @@
    "prompt": "suamom, korean webtoon style, portrait, close-up, face focus, front view",
    "status": "done",
    "note": ""
+  },
+  {
+   "slot_id": "frm_face",
+   "category": "framing",
+   "seed": 1003,
+   "method": "krea2_c_e028",
+   "kind": "comfy",
+   "variant": "c",
+   "epoch": 28,
+   "file": "images/krea2_c_e028/frm_face__s1003.png",
+   "prompt": "suamom, korean webtoon style, portrait, close-up, face focus, front view",
+   "status": "done",
+   "note": "",
+   "references": [
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\FaceCrop_012.png",
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\file_00000000755c820986b9a86181c4345d.png"
+   ],
+   "seconds": 36.2
   },
   {
    "slot_id": "frm_dutch",
@@ -769,6 +958,24 @@
    "note": ""
   },
   {
+   "slot_id": "frm_dutch",
+   "category": "framing",
+   "seed": 1003,
+   "method": "krea2_c_e028",
+   "kind": "comfy",
+   "variant": "c",
+   "epoch": 28,
+   "file": "images/krea2_c_e028/frm_dutch__s1003.png",
+   "prompt": "suamom, korean webtoon style, dutch angle, upper body",
+   "status": "done",
+   "note": "",
+   "references": [
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\FaceCrop_012.png",
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\file_00000000755c820986b9a86181c4345d.png"
+   ],
+   "seconds": 26.2
+  },
+  {
    "slot_id": "frm_from_above",
    "category": "framing",
    "seed": 1003,
@@ -806,6 +1013,24 @@
    "prompt": "suamom, korean webtoon style, from above, full body, looking down",
    "status": "done",
    "note": ""
+  },
+  {
+   "slot_id": "frm_from_above",
+   "category": "framing",
+   "seed": 1003,
+   "method": "krea2_c_e028",
+   "kind": "comfy",
+   "variant": "c",
+   "epoch": 28,
+   "file": "images/krea2_c_e028/frm_from_above__s1003.png",
+   "prompt": "suamom, korean webtoon style, from above, full body, looking down",
+   "status": "done",
+   "note": "",
+   "references": [
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\FaceCrop_012.png",
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\file_00000000755c820986b9a86181c4345d.png"
+   ],
+   "seconds": 34.3
   },
   {
    "slot_id": "exp_smile",
@@ -847,6 +1072,24 @@
    "note": ""
   },
   {
+   "slot_id": "exp_smile",
+   "category": "expressions",
+   "seed": 1003,
+   "method": "krea2_c_e028",
+   "kind": "comfy",
+   "variant": "c",
+   "epoch": 28,
+   "file": "images/krea2_c_e028/exp_smile__s1003.png",
+   "prompt": "suamom, korean webtoon style, smile, looking at viewer",
+   "status": "done",
+   "note": "",
+   "references": [
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\FaceCrop_012.png",
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\file_00000000755c820986b9a86181c4345d.png"
+   ],
+   "seconds": 24.3
+  },
+  {
    "slot_id": "exp_angry",
    "category": "expressions",
    "seed": 1003,
@@ -884,6 +1127,24 @@
    "prompt": "suamom, korean webtoon style, angry expression, clenched teeth, looking at viewer",
    "status": "done",
    "note": ""
+  },
+  {
+   "slot_id": "exp_angry",
+   "category": "expressions",
+   "seed": 1003,
+   "method": "krea2_c_e028",
+   "kind": "comfy",
+   "variant": "c",
+   "epoch": 28,
+   "file": "images/krea2_c_e028/exp_angry__s1003.png",
+   "prompt": "suamom, korean webtoon style, angry expression, clenched teeth, looking at viewer",
+   "status": "done",
+   "note": "",
+   "references": [
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\FaceCrop_012.png",
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\file_00000000755c820986b9a86181c4345d.png"
+   ],
+   "seconds": 36.2
   },
   {
    "slot_id": "exp_sad",
@@ -925,6 +1186,24 @@
    "note": ""
   },
   {
+   "slot_id": "exp_sad",
+   "category": "expressions",
+   "seed": 1003,
+   "method": "krea2_c_e028",
+   "kind": "comfy",
+   "variant": "c",
+   "epoch": 28,
+   "file": "images/krea2_c_e028/exp_sad__s1003.png",
+   "prompt": "suamom, korean webtoon style, crying, tear drop, looking down",
+   "status": "done",
+   "note": "",
+   "references": [
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\FaceCrop_012.png",
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\file_00000000755c820986b9a86181c4345d.png"
+   ],
+   "seconds": 38.2
+  },
+  {
    "slot_id": "exp_surprised",
    "category": "expressions",
    "seed": 1003,
@@ -962,6 +1241,24 @@
    "prompt": "suamom, korean webtoon style, surprised expression, open mouth",
    "status": "done",
    "note": ""
+  },
+  {
+   "slot_id": "exp_surprised",
+   "category": "expressions",
+   "seed": 1003,
+   "method": "krea2_c_e028",
+   "kind": "comfy",
+   "variant": "c",
+   "epoch": 28,
+   "file": "images/krea2_c_e028/exp_surprised__s1003.png",
+   "prompt": "suamom, korean webtoon style, surprised expression, open mouth",
+   "status": "done",
+   "note": "",
+   "references": [
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\FaceCrop_012.png",
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\file_00000000755c820986b9a86181c4345d.png"
+   ],
+   "seconds": 24.3
   },
   {
    "slot_id": "bg_classroom",
@@ -1003,6 +1300,24 @@
    "note": ""
   },
   {
+   "slot_id": "bg_classroom",
+   "category": "backgrounds",
+   "seed": 1003,
+   "method": "krea2_c_e028",
+   "kind": "comfy",
+   "variant": "c",
+   "epoch": 28,
+   "file": "images/krea2_c_e028/bg_classroom__s1003.png",
+   "prompt": "suamom, korean webtoon style, classroom background, green chalkboard, wooden desks, indoors, day",
+   "status": "done",
+   "note": "",
+   "references": [
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\FaceCrop_012.png",
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\file_00000000755c820986b9a86181c4345d.png"
+   ],
+   "seconds": 26.1
+  },
+  {
    "slot_id": "bg_street_night",
    "category": "backgrounds",
    "seed": 1003,
@@ -1040,6 +1355,24 @@
    "prompt": "suamom, korean webtoon style, city street at night, neon lights, wet pavement",
    "status": "done",
    "note": ""
+  },
+  {
+   "slot_id": "bg_street_night",
+   "category": "backgrounds",
+   "seed": 1003,
+   "method": "krea2_c_e028",
+   "kind": "comfy",
+   "variant": "c",
+   "epoch": 28,
+   "file": "images/krea2_c_e028/bg_street_night__s1003.png",
+   "prompt": "suamom, korean webtoon style, city street at night, neon lights, wet pavement",
+   "status": "done",
+   "note": "",
+   "references": [
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\FaceCrop_012.png",
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\file_00000000755c820986b9a86181c4345d.png"
+   ],
+   "seconds": 32.2
   },
   {
    "slot_id": "bg_park",
@@ -1081,6 +1414,24 @@
    "note": ""
   },
   {
+   "slot_id": "bg_park",
+   "category": "backgrounds",
+   "seed": 1003,
+   "method": "krea2_c_e028",
+   "kind": "comfy",
+   "variant": "c",
+   "epoch": 28,
+   "file": "images/krea2_c_e028/bg_park__s1003.png",
+   "prompt": "suamom, korean webtoon style, cherry blossom background, park, outdoors, day",
+   "status": "done",
+   "note": "",
+   "references": [
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\FaceCrop_012.png",
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\file_00000000755c820986b9a86181c4345d.png"
+   ],
+   "seconds": 24.3
+  },
+  {
    "slot_id": "bg_bedroom",
    "category": "backgrounds",
    "seed": 1003,
@@ -1118,6 +1469,24 @@
    "prompt": "suamom, korean webtoon style, bedroom background, warm lighting, indoors",
    "status": "done",
    "note": ""
+  },
+  {
+   "slot_id": "bg_bedroom",
+   "category": "backgrounds",
+   "seed": 1003,
+   "method": "krea2_c_e028",
+   "kind": "comfy",
+   "variant": "c",
+   "epoch": 28,
+   "file": "images/krea2_c_e028/bg_bedroom__s1003.png",
+   "prompt": "suamom, korean webtoon style, bedroom background, warm lighting, indoors",
+   "status": "done",
+   "note": "",
+   "references": [
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\FaceCrop_012.png",
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\file_00000000755c820986b9a86181c4345d.png"
+   ],
+   "seconds": 26.1
   },
   {
    "slot_id": "pos_sitting",
@@ -1159,6 +1528,24 @@
    "note": ""
   },
   {
+   "slot_id": "pos_sitting",
+   "category": "poses",
+   "seed": 1003,
+   "method": "krea2_c_e028",
+   "kind": "comfy",
+   "variant": "c",
+   "epoch": 28,
+   "file": "images/krea2_c_e028/pos_sitting__s1003.png",
+   "prompt": "suamom, korean webtoon style, sitting, full body",
+   "status": "done",
+   "note": "",
+   "references": [
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\FaceCrop_012.png",
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\file_00000000755c820986b9a86181c4345d.png"
+   ],
+   "seconds": 26.1
+  },
+  {
    "slot_id": "pos_walking",
    "category": "poses",
    "seed": 1003,
@@ -1196,6 +1583,24 @@
    "prompt": "suamom, korean webtoon style, walking, full body, moving toward the viewer",
    "status": "done",
    "note": ""
+  },
+  {
+   "slot_id": "pos_walking",
+   "category": "poses",
+   "seed": 1003,
+   "method": "krea2_c_e028",
+   "kind": "comfy",
+   "variant": "c",
+   "epoch": 28,
+   "file": "images/krea2_c_e028/pos_walking__s1003.png",
+   "prompt": "suamom, korean webtoon style, walking, full body, moving toward the viewer",
+   "status": "done",
+   "note": "",
+   "references": [
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\FaceCrop_012.png",
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\file_00000000755c820986b9a86181c4345d.png"
+   ],
+   "seconds": 32.1
   },
   {
    "slot_id": "pos_waving",
@@ -1237,6 +1642,24 @@
    "note": ""
   },
   {
+   "slot_id": "pos_waving",
+   "category": "poses",
+   "seed": 1003,
+   "method": "krea2_c_e028",
+   "kind": "comfy",
+   "variant": "c",
+   "epoch": 28,
+   "file": "images/krea2_c_e028/pos_waving__s1003.png",
+   "prompt": "suamom, korean webtoon style, waving hand, upper body, looking at viewer",
+   "status": "done",
+   "note": "",
+   "references": [
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\FaceCrop_012.png",
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\file_00000000755c820986b9a86181c4345d.png"
+   ],
+   "seconds": 26.2
+  },
+  {
    "slot_id": "pos_phone",
    "category": "poses",
    "seed": 1003,
@@ -1274,6 +1697,24 @@
    "prompt": "suamom, korean webtoon style, holding phone, upper body, looking at phone",
    "status": "done",
    "note": ""
+  },
+  {
+   "slot_id": "pos_phone",
+   "category": "poses",
+   "seed": 1003,
+   "method": "krea2_c_e028",
+   "kind": "comfy",
+   "variant": "c",
+   "epoch": 28,
+   "file": "images/krea2_c_e028/pos_phone__s1003.png",
+   "prompt": "suamom, korean webtoon style, holding phone, upper body, looking at phone",
+   "status": "done",
+   "note": "",
+   "references": [
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\FaceCrop_012.png",
+    "G:\\데이터셋 통합작성툴\\qwen 2.1 edit\\characters\\수아맘\\file_00000000755c820986b9a86181c4345d.png"
+   ],
+   "seconds": 32.2
   }
  ],
  "lineage_caps": {
