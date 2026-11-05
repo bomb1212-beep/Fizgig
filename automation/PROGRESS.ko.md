@@ -5,7 +5,7 @@
 프로젝트: `G:\데이터셋 통합작성툴\Fizgig_auto`  
 기록 범위: 모델 준비, 기존 사진 자동 캡션, 학습 자동화 코드, GUI 초안 및 로컬 파일·코드·검사 결과의 재점검.
 
-**최신 갱신 — 데이터셋 파이프라인 M0 (2026-11-05):** 캐릭터 LoRA 데이터셋 통합 파이프라인(`TASK_SPEC_dataset_pipeline.md`)의 첫 마일스톤을 구현했다. 모델 경로 정리, ComfyUI 클라이언트, Krea2 그래프 빌더(a/b/c), 비교 하네스와 계보 기록이며, **14절**에 정리했다. 실제 GPU로 Krea2 구성 (a)(b)를 각 24장 생성하고 재실행 시 추가 생성 0건임을 확인했다. 학습은 실행하지 않았고 M1~M5는 착수하지 않았다. 아래 1~13절은 파이프라인 이전 시점의 기록이다.
+**최신 갱신 — 데이터셋 파이프라인 M0·M1 (2026-11-05):** 캐릭터 LoRA 데이터셋 통합 파이프라인(`TASK_SPEC_dataset_pipeline.md`)의 첫 두 마일스톤을 구현했다. M0은 모델 경로 정리, ComfyUI 클라이언트, Krea2 그래프 빌더(a/b/c), 비교 하네스와 계보 기록이고(**14절**), M1은 runner의 family 지원(캐시·샘플·완료 판정·캡션 프로필 일반화)이다(**15절**). 실제 GPU로 Krea2 구성 (a)(b)(c)를 각 24장 생성해 사람 점수를 받았고, 그 결과로 추론 구성을 (b)로 확정했다. Krea2 소규모 실제 학습(8~10장·3에포크)으로 캐시→학습→체크포인트→일시정지·재개→ComfyUI 로드까지 확인했다. M2~M5는 착수하지 않았고 툴2는 손대지 않았다. 아래 1~13절은 파이프라인 이전 시점의 기록이다.
 
 **이전 갱신 — GUI 구현:** 한국어 GUI의 설정·TODO·사진/캡션 검수·실행·로그·일시정지/재개 연결과 실행 배치 파일을 완성했다. 실행기 검사 18개, 실제 Tk GUI 검사 9개가 통과했고 화면을 렌더링해 검수했다. 기존 CLI에서 진행 중인 실제 학습에도 읽기 전용으로 연결했다. 학습 완료·최종 품질 확인은 아직 남아 있다. 아래 1~12절은 GUI 완성 이전 시점의 기록이며, 변경된 현재 동작과 검증은 **13절** 및 `README.ko.md`를 따른다.
 
@@ -462,4 +462,64 @@ Turbo DiT에 가속 LoRA를 겹치는 구성은 코드가 거부한다. 샘플�
 명세 §4에 따라 **다음 마일스톤으로 넘어가기 전에 사용자 확인을 받는다.** 14.7의 결과로 §7 Q2(추론 구성)는 (b)를 추천했으나, `project.json`의 `krea2_inference`에 기록하려면 사용자 확정이 필요하다(또는 시드를 늘려 0.17 차이를 확정할지 결정).
 
 M1은 runner의 family 지원(qwen_image21 | krea2)과 캐시·샘플·완료 판정 일반화다.
+
+## 15. 데이터셋 파이프라인 M1 — runner의 family 지원 — 2026-11-05 (한국 시간)
+
+근거 명세: `TASK_SPEC_dataset_pipeline.md` §4 M1. **§7 Q2 확정:** 사용자가 M0 결과를 보고 Krea2 추론 구성을 **(b) RAW DiT + 가속 LoRA + 캐릭터 LoRA**로 정했다. 에포크 선정은 M3에서 한다. 이 결정은 `automation/experiments/suamom_card.json`의 `krea2_inference`에 기록했고, 탈락한 (c)의 사유도 함께 남겼다.
+
+### 15.1 하드코딩 제거 (확인 완료)
+
+| 항목 | 이전 | 지금 |
+| --- | --- | --- |
+| 학습 기술자 | `get("qwen_image21")` | `get(family_of(cfg))` |
+| 캐시 파일 패턴 | `*_qwenimage21.safetensors` | `*_<arch_id>.safetensors` + 메타데이터의 `architecture`까지 대조 |
+| 학습 아키텍처 | `architecture="qwenimage21"` | `desc.arch_id` |
+| 샘플 기본값 | 768×768·25 steps·CFG 1.0 | `desc.preview_width/height/steps/cfg` (Krea2는 1024·8 steps) |
+| doctor 모델 키 | `qwen21_*` 4개 고정 | family별 선언된 모델 파일 전부 |
+| family 지정 | 불가 | job의 `family` 키 (기본 `qwen_image21`) |
+
+프리셋은 **cfg가 지정하지 않은 값만** 채운다. 그래서 "Krea 2 Ultra Fast" 프리셋(rank 8, adaptive 2e-4/4e-4)이 기본값이 되고, todo 항목에서 `rank`·`learning_rate`를 적으면 그 값이 이긴다 — 사용자의 옛 설정(rank 64, LR 1e-4)을 todo로 재현할 수 있다(검사로 확인).
+
+### 15.2 작업 버전과 캐시 분리 (확인 완료)
+
+- 작업 버전 해시에 **family를 포함**한다. 단 기본값(`qwen_image21`)일 때는 키를 넣지 않아, 기존 Qwen 2.1 작업의 버전이 **문자 그대로 유지**된다. 고정 입력에 대한 해시가 `107be407f043e0a7`로 예전과 같음을 검사로 고정했다.
+- `comfy`/`models`/`pipeline` 블록도 해시에서 제외했다. 배관 설정을 추가해도 기존 실행이 새 폴더로 옮겨가지 않는다.
+- `state.json`에 `family`/`arch_id`를 기록하고, 다른 family의 상태를 만나면 그 실행을 이어받지 않고 처음부터 시작한다고 알린다.
+- 캐시는 family별 `arch_id`로 파일명이 갈리고(`<stem>_krea2drv_te.safetensors`), 파일 메타데이터의 `architecture`까지 확인한다. 다른 family의 캐시는 재사용하지 않는다(검사 4건).
+
+### 15.3 학습 완료와 프리뷰 완료 분리 (확인 완료)
+
+`output_state()`가 **(학습 완료, 프리뷰 존재)** 두 판정을 따로 돌려준다. 최종 LoRA 헤더(`ss_epoch`)와 `-state` 폴더(`training_state.json`·`lora.safetensors`·`optimizer.pt`·`rng.pt`)가 정상이면 학습 완료다. 프리뷰가 없으면 `preview_missing` 경고만 남기고 **재학습하지 않는다**. 이전에는 프리뷰가 없으면 미완료로 판정해 학습을 처음부터 다시 돌렸다.
+
+### 15.4 캡션 프로필과 정책 (구현 완료)
+
+- `kind: photo | anime`로 지침 파일을 고른다. `photo`는 기존 `caption_instructions.txt`, `anime`은 새 `caption_instructions_anime.txt`(Danbooru 태그 + 문장, 툴2의 Qwen3-VL 프롬프트를 로컬 모델용으로 옮긴 것)다. 어느 파일을 썼는지가 캡션 식별자에 들어가므로, kind를 바꾸면 캡션이 섞이지 않고 새로 만든다.
+- `caption_policy`:
+  - `missing-only`(기본, 기존 동작): 캡션이 없는 이미지만 만든다. 있는 캡션은 건드리지 않는다.
+  - `preserve`: 캡션을 새로 만들지 않는다. 캡션이 빠진 이미지가 있으면 조용히 만들지 않고 **사유를 밝히며 실패**한다(직접 손본 데이터셋을 덮어쓰지 않기 위해).
+  - `explicit-recaption`: 모든 캡션을 다시 쓴다. 캡션 스타일만 다른 스냅샷 2개를 비교할 때(§7 Q4) 쓴다.
+
+### 15.5 실제 Krea 2 학습 (확인 완료, GPU)
+
+`pipeline/verify_family_training.py`로 임시 작업 폴더에서 실제 학습을 돌렸다(실제 `config.json`/`todo.json`은 건드리지 않는다). 8~10장, 3에포크, 0.25MP, rank 8, `caption_policy: preserve`.
+
+1. 캐시 → 텍스트 캐시 → 학습 3단계 완료. 캐시 20개 파일이 모두 `*_krea2drv_te.safetensors`로 생성됐다(family 분리 확인).
+2. 체크포인트 `-000001`, `-000002`, 최종 LoRA, 상태 폴더 3개, 프리뷰 6장(프롬프트 2 × 3에포크) 생성. `complete: true`.
+3. **일시정지·재개:** 학습 중 첫 체크포인트가 생기면 `.pause_requested`를 써서 멈췄고("Training paused; queue stopped"), 다음 실행이 그 체크포인트를 `--resume`으로 넘겨 이어서 완료했다. 재개된 학습 명령 1개, `--resume` 인자로 `m1_verify-000001-state` 전달을 실제로 확인했다.
+4. **ComfyUI 로드:** 학습이 끝난 LoRA(56MB)를 `models/loras`에 하드링크로 노출해 `/object_info`가 인식하는 것을 확인하고, 구성 (b)로 **1024×1024 이미지를 실제 생성**했다(`automation/state/m1_load_check.png`). 확인 후 링크와 임시 폴더는 지웠다.
+
+프리뷰를 강제로 끈 경우 "완료 + 경고" 판정은 단위 검사로 확인했다(실제 GPU 재현은 하지 않았다).
+
+### 15.6 아직 하지 않은 것 / 미검증
+
+- **Krea2 에포크 선정**(§7 Q2의 나머지)은 M3이다. 이번 학습은 3에포크짜리 동작 확인이지 품질 비교가 아니다.
+- **프리뷰 끈 실제 학습**은 GPU로 재현하지 않았다(판정 로직만 검사).
+- 캡션 `anime` 프로필로 **실제 캡션을 생성해 보지 않았다**. Gemma로 그 지침이 태그 형식을 실제로 내는지는 미검증이다(preserve 정책으로 캡션 생성을 건너뛴 학습만 했다).
+- M2~M5는 착수하지 않았다. 툴2는 여전히 손대지 않았다.
+
+### 15.7 검사
+
+명세 §5.7의 명령으로 **163개 통과**(기존 27 + 파이프라인 105 + family 31), 실패·오류 0건.
+
+`test_runner_family.py`가 확인하는 것: 기존 Qwen 작업 버전 불변, 파이프라인 블록이 버전을 움직이지 않음, family별 실행 폴더 분리, 알 수 없는 family 거부, 캡션 프로필·정책 3종, 다른 family 캐시 거부(파일명·메타데이터), stale 캡션 무효화, Krea2 계획의 `--family`/`--dit`/샘플 기본값/어댑터 부재, todo가 프리셋을 덮어쓰기, 프리셋이 미지정 값을 채우기, 학습 완료·프리뷰 분리 판정 6건.
 

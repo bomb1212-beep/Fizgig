@@ -27,6 +27,14 @@ DEFAULT_FAMILY = "qwen_image21"
 # is checked on disk before anything loads, and hashing them would move every existing run to a new version directory
 # the moment the block is added. The family is hashed only when it is not the default, for the same reason.
 PIPELINE_SETTINGS = ("comfy", "models", "pipeline", "pipeline_model_paths")
+# Caption instructions per project kind (spec 4 M1). A 2D character and a photo want different words out of the same
+# local model, and the file a run used is part of its caption identity, so switching kind re-captions rather than
+# silently mixing two styles in one dataset.
+CAPTION_PROFILES = {"photo": "caption_instructions.txt", "anime": "caption_instructions_anime.txt"}
+# missing-only: caption only the images that have none, never overwrite (the default, and the old behaviour).
+# preserve:     touch no caption at all; every image must already have one.
+# explicit-recaption: rewrite every caption, which is what comparing two caption styles needs (spec 7 Q4).
+CAPTION_POLICIES = ("missing-only", "preserve", "explicit-recaption")
 
 def emit_event(kind, **values):
     if EVENTS:
@@ -142,9 +150,32 @@ def version_settings(cfg):
         out["family"] = family
     return out
 
+def caption_profile(cfg):
+    """Which caption instructions a run uses, chosen by the project's kind.
+
+    `photo` is the original Gemma instruction file. `anime` is the Danbooru-tag style tool2's Qwen3-VL captions use,
+    which is also what a Krea 2 / Qwen 2.1 LoRA is trained against; its own file keeps the two apart.
+    """
+    kind = str(cfg.get("kind") or "photo").strip().lower()
+    if kind not in CAPTION_PROFILES:
+        raise ValueError(f"unknown kind {kind!r}; known: " + ", ".join(sorted(CAPTION_PROFILES)))
+    return kind
+
+def caption_policy(cfg):
+    """What to do with captions that are already on the images."""
+    policy = str(cfg.get("caption_policy") or "missing-only").strip().lower()
+    if policy not in CAPTION_POLICIES:
+        raise ValueError(f"unknown caption_policy {policy!r}; known: " + ", ".join(CAPTION_POLICIES))
+    return policy
+
+def instructions_for(cfg):
+    """The caption instructions text for this run's kind (the photo file is the historical default)."""
+    path = AUTO / CAPTION_PROFILES[caption_profile(cfg)]
+    return path.read_text(encoding="utf-8-sig")
+
 def context(cfg):
     images, rejected = inventory(cfg)
-    instructions = (AUTO / "caption_instructions.txt").read_text(encoding="utf-8-sig")
+    instructions = instructions_for(cfg)
     version = digest({"settings": version_settings(cfg), "images": images, "instructions": instructions})[:16]
     run = AUTO / "runs" / (cfg["id"] + "-" + version)
     return run, images, rejected, instructions
@@ -194,47 +225,77 @@ def working_fingerprint(run):
     return digest([(p.name, hashlib.sha256(p.read_bytes()).hexdigest()) for p in sorted(folder.iterdir())
                    if p.is_file() and (p.suffix in EXTENSIONS or p.suffix == ".txt")])
 
-def caches_valid(run):
+def caches_valid(run, family=None):
+    """Whether this run's cache is complete, current and built for this family.
+
+    The family's own `arch_id` is in every cache filename (`<stem>_<arch>.safetensors`,
+    `<stem>_<arch>_te.safetensors`) and in the file metadata, so a cache written by another family is never accepted:
+    two families share nothing here, not even the file that describes a caption.
+    """
     from safetensors import safe_open
     from fizgig.families.launch import cache_dir_for
+    arch = model_paths.description(family or DEFAULT_FAMILY).arch_id
     folder = Path(cache_dir_for(str(run / "cache"), str(run / "images")))
     try:
         for image in (run / "images").iterdir():
             if image.suffix not in EXTENSIONS:
                 continue
-            latents = list(folder.glob(image.stem + "_*_qwenimage21.safetensors"))
+            latents = list(folder.glob(image.stem + f"_*_{arch}.safetensors"))
             if len(latents) != 1:
                 return False
             with safe_open(str(latents[0]), framework="pt") as f:
                 if not any(k.startswith("latent_") for k in f.keys()):
                     return False
-            with safe_open(str(folder / (image.stem + "_qwenimage21_te.safetensors")), framework="pt") as f:
+                if (f.metadata() or {}).get("architecture") != arch:
+                    return False
+            with safe_open(str(folder / f"{image.stem}_{arch}_te.safetensors"), framework="pt") as f:
+                metadata = f.metadata() or {}
                 if not any(k.startswith("cond__") for k in f.keys()):
                     return False
-                if (f.metadata() or {}).get("caption1") != image.with_suffix(".txt").read_text(encoding="utf-8-sig").strip():
+                if metadata.get("architecture") != arch:
+                    return False
+                if metadata.get("caption1") != image.with_suffix(".txt").read_text(encoding="utf-8-sig").strip():
                     return False
         return True
     except Exception:
         # Safetensors raises its own exception type for a damaged header.
         return False
 
-def output_valid(run, cfg, epochs):
+def output_state(run, cfg, epochs):
+    """(training_ok, preview_ok) — two verdicts, because a missing preview is not a missing LoRA.
+
+    Fizgig turns previews off when VRAM is tight and trains on regardless. Judging the run by its previews made such a
+    finished run look unfinished and trained it again from scratch. The final LoRA and the saved training state are the
+    evidence that training finished; previews are a report on top of it.
+    """
     from safetensors import safe_open
     output = run / "output"
     try:
         with safe_open(str(output / (cfg["id"] + ".safetensors")), framework="pt") as f:
             if not f.keys() or (f.metadata() or {}).get("ss_epoch") != str(epochs):
-                return False
+                return False, False
         saved = output / f"{cfg['id']}-{epochs:06d}-state"
         if not all((saved / name).is_file() for name in ("training_state.json", "lora.safetensors", "optimizer.pt", "rng.pt")):
-            return False
+            return False, False
         if read_json(saved / "training_state.json").get("epoch") != epochs:
-            return False
-        if cfg.get("sample_prompts") and not list((output / "sample").glob(f"{cfg['id']}_e{epochs:06d}_*.png")):
-            return False
-        return True
+            return False, False
+        preview = not cfg.get("sample_prompts") or bool(
+            list((output / "sample").glob(f"{cfg['id']}_e{epochs:06d}_*.png")))
+        return True, preview
     except Exception:
-        return False
+        return False, False
+
+def output_valid(run, cfg, epochs):
+    """Training completion only; kept as the name the rest of this file already reads."""
+    return output_state(run, cfg, epochs)[0]
+
+def preview_missing(run, cfg, epochs):
+    """The warning to show when training finished but the preview set did not."""
+    training_ok, preview_ok = output_state(run, cfg, epochs)
+    if training_ok and not preview_ok:
+        return (f"preview_missing: {cfg['id']} finished training at epoch {epochs}, but no preview image was written "
+                "(Fizgig turns previews off when VRAM is short). Not retraining.")
+    return ""
 
 def prepare(cfg):
     run, images, rejected, instructions = context(cfg)
@@ -268,10 +329,25 @@ def prepare(cfg):
     return run, images, instructions
 
 def captions(run, cfg, instructions, limit=None):
+    """Caption the images the policy says the run still needs.
+
+    The three policies are deliberately different from each other: `missing-only` fills gaps, `preserve` refuses to
+    invent anything (a curated dataset must not gain a machine-written caption), and `explicit-recaption` rewrites
+    every image, which is how two caption styles get compared on the same pictures (spec 7 Q4).
+    """
     check_pause()
+    policy = caption_policy(cfg)
     files = sorted(p for p in (run / "images").iterdir() if p.suffix in EXTENSIONS)
-    pending = [p for p in files if not p.with_suffix(".txt").exists()
-               or not p.with_suffix(".txt").read_text(encoding="utf-8").strip()]
+    blank = [p for p in files if not p.with_suffix(".txt").exists()
+             or not p.with_suffix(".txt").read_text(encoding="utf-8").strip()]
+    if policy == "preserve":
+        if blank:
+            raise ValueError(
+                f"caption_policy is 'preserve' but {len(blank)} image(s) have no caption "
+                f"(e.g. {blank[0].name[:16]}); caption them, select another image set, or use 'missing-only'")
+        print("Caption policy 'preserve': existing captions kept, nothing written.", flush=True)
+        return
+    pending = files if policy == "explicit-recaption" else blank
     if limit is not None:
         pending = pending[:limit]
     if not pending:
@@ -291,13 +367,14 @@ def captions(run, cfg, instructions, limit=None):
             emit_event("caption", done=i, total=len(pending))
 
 def launch_plan(run, cfg, n):
+    """The family's preset, the run's settings, and the family's own preview defaults, as Fizgig's planner takes them.
+
+    The preset supplies what a run's settings do not name (optimizer, precision, EMA, the family's own switches); the
+    run's settings win where they are set, which is how a todo item overrides a family default (spec 4 M1).
+    """
     from fizgig.families.registry import get
     from fizgig.families.launch import plan
     family = family_of(cfg)
-    if family != DEFAULT_FAMILY:
-        # M1 generalizes the rest of this file (cache names, architecture, sample defaults); until then a run must not
-        # quietly plan a Krea 2 job with the Qwen 2.1 descriptor.
-        raise ValueError(f"family {family!r} is not wired into the runner yet; only {DEFAULT_FAMILY} training runs")
     desc = get(family)
     # Batch=1, accumulation=1, repeat=1: one image is one step per epoch.
     epochs = max(1, math.floor(cfg["target_steps"] / n + 0.5))
@@ -315,18 +392,23 @@ def launch_plan(run, cfg, n):
         LORA_LR_RATIO=1, GRADIENT_ACCUMULATION=1, MAX_GRAD_NORM=1.0, NETWORK_DROPOUT=0,
         SAVE_STATE=True, SAVE_STATE_ON_TRAIN_END=True, KEEP_LAST_N_STATES=2,
         caption_trigger=cfg["trigger"], loss_watch={"detect": True},
-        samples={"enabled": True, "every": every, "width": 768, "height": 768,
-                 "steps": 25, "cfg": 1.0, "seed": 42,
+        # Preview shape and sampling come from the family: 768x768/25 steps suited Qwen 2.1, while Krea 2's preview
+        # checkpoint is 8 steps CFG-free at 1024.
+        samples={"enabled": True, "every": every, "width": desc.preview_width, "height": desc.preview_height,
+                 "steps": desc.preview_steps, "cfg": desc.preview_cfg, "seed": 42,
                  "prompts": [p.replace("{trigger}", cfg["trigger"]) for p in cfg["sample_prompts"]]})
     result = plan(desc, inputs)
-    print(f"Target {cfg['target_steps']}; {n} steps/epoch x {epochs} epochs = ~{n * epochs} steps.")
+    print(f"Target {cfg['target_steps']}; {n} steps/epoch x {epochs} epochs = ~{n * epochs} steps "
+          f"({family}, {desc.arch_id}).")
     if result.problems:
         raise ValueError("\n".join(result.problems))
     return result
 
 def execute(run, cfg, n):
+    family = family_of(cfg)
+    desc = model_paths.description(family)
     if LocalClient(cfg).listening():
-        raise RuntimeError("Gemma server is still running. Close it before Qwen GPU training, then rerun.")
+        raise RuntimeError(f"Gemma server is still running. Close it before {family} GPU training, then rerun.")
     result = launch_plan(run, cfg, n)
     for directory in result.dirs:
         Path(directory).mkdir(parents=True, exist_ok=True)
@@ -337,7 +419,14 @@ def execute(run, cfg, n):
     state = read_json(state_path) if state_path.exists() else {"completed_stages": []}
     fingerprint = working_fingerprint(run)
     epochs = max(1, math.floor(cfg["target_steps"] / n + 0.5))
-    cached_ok = caches_valid(run)
+    # A state written by another family is not a state this run can resume: different cache files, different
+    # architecture, different trainer.
+    if state.get("family") not in (None, family):
+        print(f"Run state belongs to {state['family']}; starting {family} from the top.", flush=True)
+        state = {"completed_stages": []}
+    state["family"] = family
+    state["arch_id"] = desc.arch_id
+    cached_ok = caches_valid(run, family)
     # Earlier runners did not save fingerprints. Adopt a legacy run only when its
     # cache captions match and every content-addressed photo still matches its name.
     legacy_matches = (state.get("dataset_fingerprint") is None and cached_ok and
@@ -354,7 +443,11 @@ def execute(run, cfg, n):
         state["dataset_fingerprint"] = fingerprint
     final_ok = output_valid(run, cfg, epochs)
     if state.get("complete") and final_ok:
-        print("Already completed; skipped.")
+        state["family"] = family
+        warning = preview_missing(run, cfg, epochs)
+        state["preview_missing"] = bool(warning)
+        write_json(state_path, state)
+        print("Already completed; skipped." + (f" {warning}" if warning else ""), flush=True)
         return
     state["complete"] = False
     if not final_ok:
@@ -375,7 +468,7 @@ def execute(run, cfg, n):
                 generate_dataset_group_by_blueprint, load_user_config)
             from multiprocessing import Value
             blueprint = BlueprintGenerator(ConfigSanitizer()).generate(
-                load_user_config(str(run / "dataset.toml")), argparse.Namespace(), architecture="qwenimage21")
+                load_user_config(str(run / "dataset.toml")), argparse.Namespace(), architecture=desc.arch_id)
             group = generate_dataset_group_by_blueprint(blueprint.dataset_group, training=True,
                                                         shared_epoch=Value("i", 0))
             actual_steps = len(group)
@@ -407,12 +500,19 @@ def execute(run, cfg, n):
         if stage.name == "Training" and not (run / "output" / (cfg["id"] + ".safetensors")).exists():
             raise RuntimeError("Training exited without the final LoRA; inspect Training.log.")
         if stage.name == "Training" and not output_valid(run, cfg, epochs):
-            raise RuntimeError("Final LoRA, saved training state or final-epoch samples are missing/invalid; inspect Training.log.")
+            raise RuntimeError("Final LoRA or the saved training state is missing/invalid; inspect Training.log.")
         state["completed_stages"].append(stage.name)
         if stage.name == "Cache Preparation":
             state["rebuild_latents"] = False
         write_json(state_path, state)
     state["complete"] = True
+    warning = preview_missing(run, cfg, epochs)
+    if warning:
+        state["preview_missing"] = True
+        print(warning, flush=True)
+        emit_event("warning", kind_detail="preview_missing", job=cfg["id"])
+    else:
+        state.pop("preview_missing", None)
     write_json(state_path, state)
     print(f"DONE: {run / 'output'}", flush=True)
 
