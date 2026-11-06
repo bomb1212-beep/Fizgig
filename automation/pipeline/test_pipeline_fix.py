@@ -128,6 +128,70 @@ class PlanTests(Base):
         second = fix.plan(self.project, log=lambda *_: None)
         self.assertNotEqual(first["batch"], second["batch"])
 
+    def test_an_image_that_already_has_a_correction_is_not_drawn_again(self):
+        # A correction stays on the reviewer's `fix` decision, so the original is still `fix` after it was corrected.
+        # Planning again must not redraw it: the reviewer asked for one correction, not for one per run of the stage.
+        sources = self.origins()
+        target = self.candidate("fixme.png", parents=[sources["o1.png"]])
+        data = fix.plan(self.project, log=lambda *_: None)
+        Path(data["jobs"][0]["out"]).parent.mkdir(parents=True, exist_ok=True)
+        Path(data["jobs"][0]["out"]).write_bytes(TINY_PNG + b"CORRECTED")
+        outcome = fix.import_corrections(
+            self.project, data,
+            [{"out": data["jobs"][0]["out"], "status": "done", "steps": 25, "cfg": 1.0, "resolution": 1024, "seed": 7}],
+            log=lambda *_: None)
+        second = fix.plan(self.project, log=lambda *_: None)
+        self.assertEqual(second["jobs"], [])
+        self.assertEqual([row["id"] for row in second["already"]], [target])
+        self.assertEqual(second["already"][0]["corrected_as"], [outcome["records"][0]["id"]])
+        self.assertEqual(second["blocked"], [], "an already corrected image is not a failure")
+
+    def test_only_the_image_just_marked_is_planned(self):
+        # The real shape of the project: seven corrections already exist, and the reviewer marks an eighth image.
+        sources = self.origins()
+        done = self.candidate("done.png", parents=[sources["o1.png"]])
+        first = fix.plan(self.project, log=lambda *_: None)
+        Path(first["jobs"][0]["out"]).parent.mkdir(parents=True, exist_ok=True)
+        Path(first["jobs"][0]["out"]).write_bytes(TINY_PNG + b"CORRECTED")
+        fix.import_corrections(self.project, first,
+                               [{"out": first["jobs"][0]["out"], "status": "done", "steps": 25, "cfg": 1.0,
+                                 "resolution": 1024, "seed": 7}], log=lambda *_: None)
+        fresh = self.candidate("fresh.png", parents=[sources["o2.png"]])
+        data = fix.plan(self.project, log=lambda *_: None)
+        self.assertEqual([job["id"] for job in data["jobs"]], [fresh])
+        self.assertEqual([row["id"] for row in data["already"]], [done])
+
+    def test_a_named_image_can_be_corrected_again(self):
+        sources = self.origins()
+        target = self.candidate("fixme.png", parents=[sources["o1.png"]])
+        data = fix.plan(self.project, log=lambda *_: None)
+        Path(data["jobs"][0]["out"]).parent.mkdir(parents=True, exist_ok=True)
+        Path(data["jobs"][0]["out"]).write_bytes(TINY_PNG + b"CORRECTED")
+        fix.import_corrections(self.project, data,
+                               [{"out": data["jobs"][0]["out"], "status": "done", "steps": 25, "cfg": 1.0,
+                                 "resolution": 1024, "seed": 7}], log=lambda *_: None)
+        again = fix.plan(self.project, redo=[target], log=lambda *_: None)
+        self.assertEqual([job["id"] for job in again["jobs"]], [target])
+        self.assertEqual(again["already"], [])
+
+    def test_a_correction_of_a_correction_is_planned_only_when_named(self):
+        # Correcting a corrected picture is how a second pass is asked for, so an undecided correction of a correction
+        # is not re-corrected by accident: only an image whose own decision says `fix` is ever planned.
+        sources = self.origins()
+        target = self.candidate("fixme.png", parents=[sources["o1.png"]])
+        data = fix.plan(self.project, log=lambda *_: None)
+        Path(data["jobs"][0]["out"]).parent.mkdir(parents=True, exist_ok=True)
+        Path(data["jobs"][0]["out"]).write_bytes(TINY_PNG + b"CORRECTED")
+        outcome = fix.import_corrections(
+            self.project, data,
+            [{"out": data["jobs"][0]["out"], "status": "done", "steps": 25, "cfg": 1.0, "resolution": 1024, "seed": 7}],
+            log=lambda *_: None)
+        corrected = outcome["records"][0]["id"]
+        self.assertEqual(fix.plan(self.project, log=lambda *_: None)["jobs"], [])
+        self.project.decide(corrected, "fix")
+        jobs = [job["id"] for job in fix.plan(self.project, log=lambda *_: None)["jobs"]]
+        self.assertEqual(jobs, [corrected], "a person marking the correction itself is what asks for a second pass")
+
 
 class ImportTests(Base):
     def _plan_with_out(self):
@@ -209,6 +273,29 @@ class ImportTests(Base):
         outcome = fix.import_corrections(self.project, data, results, log=lambda *_: None)
         self.assertEqual(outcome["records"][0]["caption"], "trg, its own caption")
         self.assertEqual(outcome["records"][0]["caption_source"], "the correction's own caption")
+
+    def test_the_recorded_size_is_the_file_not_the_resolution_budget(self):
+        # tool2 reports `resolution` as a budget of resolution**2 pixels and takes the shape from the input, so a
+        # 1541 budget came back as 1216x1952. Recording the budget as both width and height would be a false statement
+        # about the file, and the export and the quota board both read it.
+        target, data, _results = self._plan_with_out()
+        out = Path(data["jobs"][0]["out"])
+        out.write_bytes(TINY_PNG)
+        row = {"out": str(out), "status": "done", "steps": 25, "cfg": 1.0, "resolution": 1541, "seed": 7}
+        outcome = fix.import_corrections(self.project, data, [row], log=lambda *_: None)
+        corrected = outcome["records"][0]
+        self.assertEqual((corrected["width"], corrected["height"]), (1, 1),
+                         "the size comes from the file's own header")
+        self.assertEqual(corrected["resolution_budget"], 1541, "the budget is kept, but as the budget it is")
+
+    def test_a_file_whose_size_cannot_be_read_is_still_imported(self):
+        _target, data, _results = self._plan_with_out()
+        out = Path(data["jobs"][0]["out"])
+        out.write_bytes(b"not a picture")
+        row = {"out": str(out), "status": "done", "steps": 25, "cfg": 1.0, "resolution": 1541, "seed": 7}
+        outcome = fix.import_corrections(self.project, data, [row], log=lambda *_: None)
+        self.assertEqual(len(outcome["records"]), 1, "an unreadable size is not a reason to lose the correction")
+        self.assertIsNone(outcome["records"][0]["width"])
 
     def test_the_page_shows_the_picture_it_corrected(self):
         target, data, results = self._plan_with_out()

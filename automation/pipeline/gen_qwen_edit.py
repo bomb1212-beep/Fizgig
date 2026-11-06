@@ -20,6 +20,7 @@ import importlib.util
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -603,6 +604,29 @@ def _caption_of(path):
         return sidecar.read_text(encoding="utf-8-sig").strip()
     except OSError:
         return ""
+
+
+def image_size(path):
+    """(width, height) read from a PNG or JPEG header, without decoding the picture.
+
+    tool2's `resolution` is a budget of `resolution**2` pixels, and the graph takes the shape from its first input, so
+    the recorded size of a generated picture has to come from the file itself rather than from that setting.
+    """
+    path = Path(path)
+    with open(path, "rb") as handle:
+        head = handle.read(32)
+    if head[:8] == b"\x89PNG\r\n\x1a\n":
+        return struct.unpack(">II", head[16:24])
+    if head[:2] == b"\xff\xd8":
+        data = path.read_bytes()
+        i = 2
+        while i + 9 < len(data):
+            marker, length = data[i + 1], struct.unpack(">H", data[i + 2:i + 4])[0]
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                height, width = struct.unpack(">HH", data[i + 5:i + 9])
+                return width, height
+            i += 2 + length
+    raise ValueError(f"{path.name}: not a PNG or JPEG whose size can be read")
 
 
 def restore_slots(project, exp_dir, *, apply=True, log=print):

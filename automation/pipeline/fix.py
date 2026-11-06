@@ -40,17 +40,30 @@ DEFAULT_FIX_PROMPT = ("Correct this picture without changing who or what it show
                       "and fix drawing errors, extra or duplicated figures, broken hands and smeared line art.")
 
 
-def plan(project, *, refs="none", log=print):
-    """The corrections to run: {batch, jobs, blocked, refs, prompts}.
+def corrections_of(project, target_id):
+    """The candidates already imported as corrections of `target_id`, oldest first.
+
+    A correction stays on the reviewer's `fix` decision - deciding the original is what asked for it - so without this
+    lookup every later run of the stage would draw every correction that already exists a second time.
+    """
+    return [record for record in project.candidates() if record.get("fix_of") == target_id]
+
+
+def plan(project, *, refs="none", redo=(), log=print):
+    """The corrections to run: {batch, jobs, blocked, refs, prompts, already}.
 
     `blocked` is not a failure of this stage: it is the list of images the reviewer marked but that cannot be
     corrected as things stand, each with the reason, because a silent skip would look like the stage had done its job.
+    An image that already has a correction is skipped the same way and listed under `already`, with the ids it was
+    corrected into, unless its id is named in `redo` - a second correction of the same picture is a decision, not a
+    side effect of running the stage again.
     """
     review = project.review()
     holdout = project.holdout_entry()
     holdout_ids = set(holdout["ids"])
     holdout_shas = set(holdout["shas"])
-    jobs, blocked = [], []
+    redo = set(redo or ())
+    jobs, blocked, already = [], [], []
 
     reference_files, reference_ids = [], []
     if refs == "originals":
@@ -81,6 +94,10 @@ def plan(project, *, refs="none", log=print):
             blocked.append({"id": record["id"], "reason": "it is a holdout original"})
             continue
         note = str(state.get("note") or "").strip()
+        existing = corrections_of(project, record["id"]) if record["id"] not in redo else []
+        if existing:
+            already.append({"id": record["id"], "corrected_as": [row["id"] for row in existing]})
+            continue
         jobs.append({
             "id": record["id"],
             "input": str(path),
@@ -99,12 +116,15 @@ def plan(project, *, refs="none", log=print):
     for job in jobs:
         job["out"] = str(folder / f"{job['id']}.png")
     log(f"[fix] {len(jobs)} correction(s) planned" + (f", {len(blocked)} blocked" if blocked else "")
+        + (f", {len(already)} already corrected" if already else "")
         + (f"; references: {len(reference_ids)}" if reference_ids else "; no references"))
     for job in jobs:
         log(f"  {job['id']}  slot={job['slot'] or '-'}  {job['prompt_source']}")
     for row in blocked:
         log(f"  blocked {row['id']}: {row['reason']}")
-    return {"batch": batch, "folder": str(folder), "jobs": jobs, "blocked": blocked, "refs": refs,
+    for row in already:
+        log(f"  already corrected {row['id']}: {', '.join(row['corrected_as'])}")
+    return {"batch": batch, "folder": str(folder), "jobs": jobs, "blocked": blocked, "already": already, "refs": refs,
             "reference_ids": reference_ids, "default_prompt": DEFAULT_FIX_PROMPT}
 
 
@@ -178,14 +198,22 @@ def import_corrections(project, plan_data, results, *, log=print):
         if row.get("status") != "done" or not out.is_file():
             skipped.append({"id": job["id"], "reason": row.get("error") or row.get("status") or "no result row"})
             continue
+        # The row's `resolution` is a budget of resolution**2 pixels, not a pixel count: the graph takes the shape
+        # from the first input, so 1541 came back as 1216x1952. The record keeps what the file actually is.
+        width = height = None
+        try:
+            width, height = gen.image_size(out)
+        except (OSError, ValueError):
+            pass
         record = lineage.record(
             out, generator="qwen_edit", parent_ids=[job["id"]] + list(job.get("ref_ids") or []),
             train_generation=int(job.get("generation") or 0), edit_depth=int(job.get("edit_depth") or 0) + 1,
             slot={"slot_id": job.get("slot"), "category": job.get("category")},
             prompt=job["prompt"], seed=row.get("seed"), steps=row.get("steps"), cfg=row.get("cfg"),
-            width=row.get("resolution"), height=row.get("resolution"),
+            width=width, height=height,
             graph_version=f"tool2:{row.get('graph_version') or ''}".rstrip(":"),
-            fix_of=job["id"], fix_batch=plan_data["batch"], fix_prompt_source=job["prompt_source"])
+            fix_of=job["id"], fix_batch=plan_data["batch"], fix_prompt_source=job["prompt_source"],
+            resolution_budget=row.get("resolution"))
         caption = gen._caption_of(out)
         source = "the correction's own caption"
         if not caption:
@@ -211,16 +239,19 @@ def main(argv=None):
     parser.add_argument("--project", required=True, help="project folder")
     parser.add_argument("--refs", choices=("none", "originals"), default="none",
                         help="references a correction may use: the character's originals (holdout excluded) or none")
+    parser.add_argument("--redo", action="append", default=[], metavar="ID",
+                        help="correct this image again even though a correction of it already exists (repeatable)")
     parser.add_argument("--plan", action="store_true", help="show the corrections without running anything")
     parser.add_argument("--run", action="store_true", help="run the corrections and import the results")
     parser.add_argument("--cancel-file", help="stop when this file appears")
     args = parser.parse_args(argv)
 
     project = pj.Project.open(args.project)
-    plan_data = plan(project, refs=args.refs)
+    plan_data = plan(project, refs=args.refs, redo=args.redo)
     print(json.dumps({"batch": plan_data["batch"], "jobs": [
         {"id": job["id"], "slot": job["slot"], "prompt_source": job["prompt_source"], "refs": len(job["refs"])}
-        for job in plan_data["jobs"]], "blocked": plan_data["blocked"]}, ensure_ascii=False, indent=1))
+        for job in plan_data["jobs"]], "blocked": plan_data["blocked"],
+        "already": plan_data["already"]}, ensure_ascii=False, indent=1))
     if args.plan or not args.run:
         return 0
     results = run(plan_data, cancel_file=args.cancel_file)
