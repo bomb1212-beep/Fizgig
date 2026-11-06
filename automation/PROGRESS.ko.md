@@ -609,3 +609,138 @@ ComfyUI를 **UTF-8 환경 없이** 띄우면 커스텀 노드 로딩 실패를 �
 ### 16.11 다음
 
 M3(생성기 B/C: 시드 LoRA 학습 → 에포크 평가 → 슬롯 배치 생성 → 보정)는 M4 검수 UI의 채택/기각 최소 기능이 먼저 필요하다(명세 §4 M3-1). 사용자는 확인 없이 계속 진행해도 된다고 했으므로, GPU가 필요한 지점과 사용자 결정이 필요한 지점에서만 멈춘다.
+
+## 17. 데이터셋 파이프라인 M3 — 생성기 B/C (진행 중) — 2026-11-06 (한국 시간)
+
+근거 명세: `TASK_SPEC_dataset_pipeline.md` §4 M3. **이 절은 진행 중 기록이며, M3는 아직 끝나지 않았다.** 다음 세션용 요약·명령은 작업 루트의 `HANDOFF.ko.md`에 따로 정리했다.
+
+### 17.1 프로젝트 계층 (구현 완료)
+
+`automation/pipeline/project.py`. 명세 §3.1의 폴더 구조를 만든다(`project.json`, `sources/`, `sources.jsonl`, `candidates.jsonl`, `review.json`, `exports/`, `pipeline.lock`).
+
+- **원본 판정은 폴더가 아니라 기록으로 한다.** tool2의 `set_anchor()`가 합성 앵커를 `characters/<name>/`에 넣기 때문이다. 카드의 `synthetic_sources`가 1순위, 없으면 tool2 자신의 후보 파일 접두사(`anchor_refined_` 등)를 근거로 삼고 **판정 근거를 함께 기록**한다.
+- 원본은 내용 해시 이름(`<sha256[:16]>.<ext>`)으로 복사하며, 같은 내용이 두 이름으로 오면 한 건으로 본다. 원본 바이트는 건드리지 않는다.
+- 홀드아웃(§7 Q6): 사용자 원본이 `holdout.min_sources`(기본 15) 이상일 때만 자동으로 뺀다. 카드가 파일명을 지정하면 그것을 우선하고, 없으면 정면 1장 + 다음 1장.
+- 검수 결정(`accept`/`reject`/`fix`)과 슬롯별 쿼터 집계. `accepted(limit_generation=...)`로 세대 상한을 적용할 수 있다.
+- 프로젝트 잠금(`pipeline.lock`): 다른 살아 있는 프로세스가 잡고 있으면 거부하고, 죽은 프로세스의 잠금은 회수한다.
+- 후보 들여오기: `import_candidates(records, base=...)`가 이미지를 `candidates/<generator>/<batch>/`로 복사하고 내용 해시로 이름을 붙인다. **`base`가 필요한 이유**: 이전 실행이 기록한 `file`이 그 실행의 폴더 기준 상대 경로일 수 있어서, M0 실험의 후보 21건을 들여올 때 이것 때문에 한 번 실패했다.
+
+### 17.2 검수 UI (구현 완료 — M4의 최소 기능을 앞당김)
+
+`automation/pipeline/review.py`. 명세 §4 M3-1이 M4의 채택/기각을 먼저 요구하므로 최소 기능을 만들었다.
+
+- 로컬 웹 페이지(stdlib http.server, §7 Q3). 이미지 그리드, 후보마다 채택/기각/보정 버튼, **A/R/F 키**, 슬롯 쿼터 현황판(부족한 슬롯을 강조).
+- 결정은 `review.json`에 즉시 기록되고, 페이지 새로고침만으로 GPU 작업이 시작되지 않는다(보정은 기록만 하고 실행은 별도 단계).
+- **"다른 캐릭터"로 판단된 이미지는 보정할 수 없다** — 서버가 400으로 거부한다(§4 M3-4의 요구).
+- 점수 정렬·근접 중복 묶음·내보내기 버튼은 M4에 남아 있다.
+
+### 17.3 시드 스냅샷과 시드 학습 (구현 완료, 학습 진행 중)
+
+`automation/pipeline/seed.py`. 명세 §7 Q5: 시드 입력은 **원본(세대 0) + 검수에서 채택한 Qwen 산출물(세대 1)**이고, `seed_max_generation`(기본 1)을 넘는 이미지는 막고 홀드아웃은 제외한다.
+
+- 상한을 넘는 후보는 **조용히 빼지 않고 사유와 함께 기록**한다(`refused`).
+- 캡션은 이미지 내용 해시로 **tool2가 같은 그림에 쓴 캡션**을 찾아 쓴다(tool2의 캡션 지침이 이미 캐릭터 고정 특징을 빼도록 되어 있어 §7 Q4의 `omit`과 맞는다). 없으면 카드에서 만든 캡션을 쓰고, 어느 쪽을 썼는지 이미지마다 기록한다.
+- `seed.runner_config()`가 **`models`/`comfy` 블록까지** 러너 설정에 넣는다. 이것이 없으면 러너가 `prefs.json`으로 되돌아가 깨진 경로를 읽는다(실제로 이 때문에 한 번 실패했다).
+- 러너는 이제 `--config`/`--todo`/`--runs-dir`을 받아 **프로젝트 폴더 안에서** 돌아간다. 경로는 AUTO 기준으로 풀리므로 기존 검사·GUI의 `AUTO` 패치 방식이 그대로 동작한다.
+- **`2d` vs `anime`:** 카드의 `kind`는 "2d"인데 캡션 프로필 이름은 "anime"이라 시드 학습이 `unknown kind '2d'`로 실패했다. `KIND_ALIASES`로 이어 줬다(`2d`→anime, `photo`→photo, kind 없음→photo로 기존 동작 유지).
+
+**실제 실행(수아맘)**
+
+1. 프로젝트 생성: `automation/projects/suamom/` (카드 + 24슬롯 쿼터 각 1장)
+2. 원본 16장 들여오기 → 사용자 15 + 합성 1(앵커 6%)
+3. **M0 실험의 `qwen_edit` 후보 21건을 프로젝트로 들여오기**
+4. 결정을 **사용자의 M0 점수에서 유도**: `다른 캐릭터` 표시 또는 정체성 ≤2 → 기각(3건), 나머지 채택(18건). `by` 필드에 "user (M0 scores)"로 남겼고 **검수 페이지에서 사용자가 바꿀 수 있다**.
+5. 시드 스냅샷 `090d024339ee`: **32장 = 사용자 원본 13 + 합성 19(59%)**, 홀드아웃 원본 2장 제외, 상한 초과 0건. 59%는 §7 Q5의 경고 기준(70%) 아래다.
+6. 시드 LoRA 학습 시작: `family=krea2`, rank 8, adaptive LR, 31스텝/에포크 × 31에포크 = **961스텝**, `caption_policy=preserve`(캡션을 새로 만들지 않음). 캐시 62개 완료 후 학습 진행 중이며, 체크포인트와 프리뷰가 저장되고 VRAM 피크 16.9GB다.
+
+### 17.4 아직 하지 않은 것 (M3의 나머지)
+
+- **M3-2 에포크 평가 그리드**: 코드 없음. 고정 8 프롬프트 × 2 시드를 체크포인트마다 ComfyUI 실제 추론 구성으로 생성하고, 검수 UI에 에포크×프롬프트 그리드로 보여 사용자가 에포크를 고르게 해야 한다.
+- **M3-3 슬롯 배치 생성**: 코드 없음. 24슬롯 × 시드, 쿼터 기준으로 부족한 슬롯부터.
+- **M3-4 보정(C)**: 코드 없음. 툴2의 `--fix-jobs`는 M2에서 완성·검증했으므로 그것을 호출하는 부분만 남았다.
+- **CLIP 점수기**(M4): 없음. 시드 학습 결과의 품질도 아직 판단하지 않았다.
+- 검수 페이지를 실제로 브라우저에서 조작해 보지는 않았다(서버 응답과 페이지 생성은 검사로 확인).
+
+### 17.5 검사
+
+툴1 **242개 통과**(기존 27 + family 32 + 파이프라인 183). 새로 추가된 40개(`test_pipeline_seed.py`)가 프로젝트 생성·원본 판정·홀드아웃·검수 결정·쿼터·잠금·검수 서버(A/R/F POST 포함)·시드 상한·캡션 선택·스냅샷 id·러너 설정·러너 실행(모의 러너)을 확인한다.
+
+## 18. 데이터셋 파이프라인 T1~T3 — 시드 자격·스냅샷 무결성·검수 웹 — 2026-11-06 (한국 시간)
+
+근거 명세: 작업 루트의 `NEXT_LLM_TASK_SPEC.ko.md` §2의 T1·T2·T3(P0 세 건). **이 절은 그 세 작업의 구현·검증 기록이다.** T4·T5와 M3-2/3/4는 아직이다(18.6).
+
+### 18.0 먼저 재현한 것 (임시 복사본, 실제 프로젝트는 읽기만)
+
+실제 `projects/suamom`을 임시 폴더로 복사해(런 폴더 제외) 고치기 전 상태를 그대로 돌려, 명세가 지적한 실패를 눈으로 확인했다.
+
+| # | 재현한 실패 | 관측값 |
+| --- | --- | --- |
+| T1 | 홀드아웃이 시드로 들어간다 | `plan_inputs()`가 **32장 유지·거부 0건**. 채택 18건 중 **15건**의 직접 `parent_ids`에 홀드아웃 `s_52c06839f1e82b86`/`s_9dc5902674987205`가 있는데도 그대로 입력이 됐다. 부모가 기록되지 않은 합성 앵커 `s_d000a176b8b50158`도 입력이었고, 그 앵커만 부모로 가진 채택 후보 2건도 함께 들어갔다 |
+| T2 | 같은 바이트가 두 번 들어간다 | `snapshot.json` 입력 **32건**인데 고유 SHA는 **31개**. `s_34f99231b55b678a`와 `c_34f99231b55b678a`가 같은 바이트라 같은 이미지·캡션 경로에 두 번 쓰였다(디스크 31장 / manifest 32건). 합성 비율도 19/32=59%로 계산됐다 |
+| T3 | 페이지가 그리는 URL이 404 | 페이지가 내보낸 `/image/<id>.png` **21개 전부 404**, 확장자를 뺀 같은 URL만 200. MIME은 확장자와 무관하게 `image/png` |
+| T3 | 서버가 아무거나 받아 준다 | 없는 id `c_doesnotexist`에 `accept`를 POST하면 **200**으로 `review.json`에 새 줄이 생겼다. `note`에 "다른 캐릭터"가 적힌 후보에 `fix`를 POST해도 **200** |
+| T3 | 동시 저장이 유실된다 | 카드 4장에 동시 POST → 3건이 `PermissionError: [WinError 32] ... review.json.tmp`로 실패하고 응답 없이 연결이 끊겼다(고정 `.tmp` 이름 경쟁). 결정 1건 유실 |
+
+### 18.1 T1 — 시드 입력 자격과 홀드아웃 격리 (`pipeline/seed.py`, `pipeline/project.py`, `pipeline/gen_qwen_edit.py`)
+
+- **`seed.audit()`가 자격 판정의 단일 지점**이다. source와 candidate 각각에 대해 `kept` 또는 `excluded` 한 줄을 돌려주고, 제외는 **사유 코드 + 문장 + 대처**로 남긴다(`EXCLUSIONS` 표). 코드는 `holdout_source`/`holdout_direct`/`holdout_indirect`/`holdout_via_lora`/`missing_parent`/`cyclic_lineage`/`unverified_ancestor`/`no_ancestry`/`lora_snapshot_unverified`/`synthetic_source`/`not_reviewed`/`rejected`/`marked_for_fix`/`different_character`/`generator_not_eligible`/`generation_cap`/`edit_depth_cap`/`missing_file`/`tampered_file`/`duplicate_bytes` 20종.
+- **입력은 사용자 원본 + 채택된 `qwen_edit`만.** 합성 source(앵커)는 원본이 아니므로 제외하고, 그 앵커에 **부모 기록이 없으면 격리**한다(`quarantined`). 격리된 앵커를 조상으로 둔 후보는 `unverified_ancestor`로 함께 제외한다 — 앵커의 출처를 복원할 수 없으면 그 앵커가 홀드아웃에서 나왔을 가능성을 배제할 수 없기 때문이다.
+- **계보 검사**는 `seed.walk()`가 부모를 끝까지 따라가며 (조상, 미확인 부모, 순환)을 돌려준다. 직접 부모의 홀드아웃(`holdout_direct`)과 조상의 홀드아웃(`holdout_indirect`)을 구분해 보고한다. LoRA로 만든 이미지는 `trained_on_snapshot`을 프로젝트의 스냅샷 manifest와 대조해, 그 스냅샷이 홀드아웃을 품었으면 `holdout_via_lora`, 기록을 찾을 수 없으면 `lora_snapshot_unverified`로 막는다.
+- **바이트 검증**: 디스크의 실제 SHA가 기록과 다르면 `tampered_file`, 파일이 없으면 `missing_file`.
+- **한 그림은 한 장**: 자격을 통과한 입력을 SHA로 묶어 대표 1건만 남기고, 같은 바이트의 모든 계보 ID를 `lineage_ids`에 보존한다(`duplicate_bytes`).
+- **홀드아웃 동결**: `Project.holdout_entry()`가 `ids`/`files`/`shas`를 카드에 동결한다(`freeze_holdout`). 한 번 동결하면 원본을 더 들여오거나 이름이 바뀌어도 집합이 움직이지 않는다. 실제 프로젝트에 적용했다(18.4).
+- **생성기 A도 같은 규칙을 쓴다**: `gen_qwen_edit.build_snapshot()`이 카드의 동결된 홀드아웃을 **이름과 내용 해시 양쪽으로** 입력 폴더에서 빼고, 그 사실을 스냅샷의 `config.json`(실행별 설정의 `excluded_inputs`)과 `snapshot.json`(`excluded_detail`)에 함께 기록한다. 카드가 레퍼런스로 지목한 파일이 제외되면 **계획 단계에서 경고**한다(`missing_references`).
+- **M0 유래 결정 구분**: `review.json` 각 항목에 `origin`(`m0_score`/`user`)을 남긴다. `decide(by="user (M0 scores)")`가 자동으로 `m0_score`를 붙이고, `audit()`의 `accepted_from_m0`/`accepted_by_review`로 갈라 센다.
+
+### 18.2 T2 — 스냅샷 무결성과 재실행 (`pipeline/seed.py`)
+
+- **경로 해석**: `Project.resolve_file()`이 프로젝트 기준·`automation/` 기준·절대 경로를 모두 받는다. 그래서 작업 루트에서 돌리든 툴1 폴더에서 돌리든 같은 결과가 나온다(18.5에서 실제 확인).
+- **ID가 캡션과 정책까지 묶는다**: `snapshot_identity()`는 프로젝트 카드 digest, `policy`(`seed-v1`), lineage 상한, 홀드아웃 SHA, 그리고 **(이미지 SHA, 캡션 SHA) 쌍**을 해시한다. 그래서 캡션 정책을 바꾸면 새 ID가 되고, 같은 입력·같은 캡션은 같은 ID가 된다.
+- **임시 폴더에서 검증 후 게시**: `seed_lora/<id>.tmp-<pid>-<rand>/`에 이미지·캡션·`snapshot.json`을 쓰고, `validate_snapshot()`(고유 SHA 수 = manifest 입력 수 = 디스크 이미지 수 = 캡션 수, 각 이미지의 실제 SHA, 캡션 SHA)을 통과해야만 `os.replace`로 `seed_lora/<id>/`가 된다. 실패하면 임시 폴더만 지운다.
+- **재실행은 지우고 다시 만들지 않는다**: 이미 게시된 ID가 있고 검증을 통과하면 `reused: True`로 그대로 돌려준다(파일 mtime 보존). 검증에 실패하면 **아무것도 덮어쓰지 않고** 무엇이 깨졌는지와 복구 방법을 문장으로 남긴다.
+- **캡션 충돌**: 같은 바이트에 서로 다른 캡션이 붙어 있으면 고른 캡션·출처·후보들을 `caption_conflicts`에 남긴다.
+- 합성 비율은 **고유 이미지** 기준으로 다시 계산한다(19/32 → 0%).
+
+### 18.3 T3 — 검수 웹: 보이는 이미지와 저장되는 결정 (`pipeline/review.py`, `pipeline/project.py`)
+
+- **URL과 라우트 통일**: 페이지는 `/image/<id><파일 확장자>`를 내보내고 서버는 그 경로를 그대로 받는다(확장자를 뺀 요청도 계속 동작). MIME은 파일 확장자에 맞춘다(`png`/`jpeg`/`webp`). 페이지가 그린 URL과 서버가 답하는 URL이 같은 함수(`review.image_url`)에서 나온다.
+- **구조화된 사유**: `review.json` 항목에 `reason`(`different_character`/`wrong_style`/`artifact`/`other`)을 저장한다. 페이지에 **"다른 캐릭터"(D)** 버튼을 추가했고, 그 사유가 붙은 이미지는 **채택·보정이 서버에서 400으로 거부**된다(기각만 가능). 행의 `fixable`은 이제 실제 값이다(전에는 `mark != "reject" or True`로 항상 참).
+- **이력 마이그레이션**: `Project.review_plan()`/`migrate_review()`가 `note` 문장에서 "다른 캐릭터"를 찾아 `reason`으로 옮기고, 모든 항목에 `origin`을 붙인다. **쓰기 전에 변경 건수와 이유를 먼저 출력**한다(`--migrate-review`, `--apply` 없이는 미리보기).
+- **거부 규칙**: 존재하지 않는 id는 400(`존재하지 않는 후보입니다`)이며 `review.json`에 흔적을 남기지 않는다. 사유·결정 값 검증도 서버가 한다.
+- **동시성**: `project.FileGuard`가 모든 프로젝트 쓰기의 read-modify-write를 감싼다(스레드: 경로별 RLock, 프로세스: `msvcrt.locking`/`fcntl.flock` 바이트 범위 잠금, 재진입 시 OS 잠금을 다시 잡지 않음). `write_json`은 호출마다 고유한 임시 이름에 쓰고 `os.replace`로 바꾼다. `Lock`은 소유자(pid·thread·token)를 기록하고 **자기 것이 아닌 잠금 파일은 지우지 않는다**(같은 PID의 다른 스레드 진입도 거부).
+- **한 번의 클릭 = 한 번의 요청**: 페이지가 `next` 상태를 계산해 `decision: null`까지 한 번에 POST한다. "결정 → 취소" 두 요청 사이의 중간 상태가 사라졌다.
+
+### 18.4 실제 수아맘 감사 결과 (동결·마이그레이션 적용 후)
+
+`sources 16(사용자 15·합성 1) · 후보 21 · 채택 18(전부 M0 유래) · 제외 24 · 시드 입력 13`.
+
+| 제외 사유 | 건수 | 해당 |
+| --- | --- | --- |
+| `holdout_direct` | 15 | 채택 후보 중 직접 부모에 홀드아웃이 있는 것(명세가 지목한 15건과 일치) |
+| `unverified_ancestor` | 2 | `c_acee84f1199c61ca`, `c_f81396d5eac51bf7` — 유일한 부모가 부모 미기록 앵커 |
+| `holdout_source` | 2 | 홀드아웃 원본 2장 자신 |
+| `different_character` | 2 | `c_de03f8a92db6e854`, `c_6d1948d655d88390` (기각 + 사유) |
+| `rejected` | 1 | `c_51d0a56baa28a748` |
+| `duplicate_bytes` | 1 | `c_34f99231b55b678a` = `s_34f99231b55b678a`와 동일 바이트 |
+| `synthetic_source` | 1 | 앵커 `s_d000a176b8b50158`(부모 기록 없음 → 격리) |
+
+- **새 시드 예상 목록 = 사용자 원본 13장**(홀드아웃 2장 제외, 합성 0%). 이전 스냅샷 `090d024339ee`(32건/31장)와의 차이 18장은 위 사유로 전부 설명된다: 홀드아웃 파생 15 + 앵커 파생 2 + 중복 바이트 1.
+- **유효 후보 부족분**: 채택 18건 중 시드로 쓸 수 있는 후보는 **0건**이다. 후보를 시드에 넣으려면 (a) 홀드아웃이 아닌 원본에서 A를 다시 돌리거나, (b) 앵커 `s_d000a176b8b50158`의 출처를 기록해야 한다. **이 결정은 사용자 몫이므로 손대지 않았다.**
+- 스냅샷을 복사본에서 만들어 확인했다: `id=46785f6593c1`, 13장, 고유 SHA 13 = 이미지 13 = 캡션 13, 재실행 `reused=True`에 mtime 13/13 보존. 실제 프로젝트에는 **아직 새 스냅샷을 게시하지 않았다**(새 학습은 사용자 지시 후 — 명세 §4-2).
+- 마이그레이션은 실제 프로젝트에 적용했다: `review.json` 21건에 `origin: m0_score`, 2건에 `reason: different_character`; `project.json.holdout`에 `ids`/`files`/`shas`/`frozen_at` 동결. 감사 원본은 `automation/experiments/seed_audit/suamom_seed_audit.json`.
+
+### 18.5 검사
+
+- 툴1 **284개 통과** (17절의 242 + 신규 42). `test_pipeline_seed.py`가 40 → 71개로 늘었고, `test_pipeline_gen_qwen_edit.py`에 홀드아웃 3건이 붙었다. 새 검사가 확인하는 것: 홀드아웃 직접·간접 파생 거부, 앵커 격리와 그 자식 거부, 미검수/기각/보정/다른 캐릭터 구분, 다른 생성기 거부, 미확인 부모·순환·세대 초과, LoRA 스냅샷 미확인, 바이트 변조, M0 유래 구분, 동결 후 홀드아웃 불변, 중복 바이트 1장화, manifest=이미지=캡션 일치, 재실행 재사용·mtime 보존, 캡션 변경 시 새 ID, 손상된 스냅샷 미덮어쓰기, 페이지의 모든 이미지 URL 200, 없는 id/다른 캐릭터 400, 동시 POST 4건 보존, 한 요청 취소, 스레드 12개 동시 결정 보존, 잠금 소유권 해제, stderr 1MiB를 쏟는 러너가 멈추지 않음.
+- 툴2 **52개 통과**(변경 없음, 회귀 확인).
+- **작업 루트와 툴1 폴더 양쪽 실행**: 같은 스냅샷 ID `5efb2777817d`가 나왔고, 두 번째 실행은 `reused=True`로 기존 파일을 그대로 썼다.
+- **아직 사람이 확인하지 않은 것**: 브라우저에서 실제로 이미지가 보이는지·키 입력·새로고침은 검사(HTTP 응답·페이지 HTML)로만 확인했다. 시드 학습 결과의 품질, 그리고 새 시드로 다시 학습했을 때의 결과는 아직 없다.
+
+### 18.6 아직 하지 않은 것
+
+- **T4**(생성기 A를 기존 프로젝트에 안전하게 연결: sources 병합, 후보 보존, `--import-only` 경로, M0 슬롯 복원, 24슬롯 집계) — 코드 없음. `Project.quotas()`가 채택 18건에서 0을 세는 문제는 그대로다(후보의 `slot`이 `category`만 갖고 있어 슬롯 id로 집계되지 않는다).
+- **T5**(툴2 재개·보정·하위 프로세스) — 툴1 쪽 스트림 처리만 이번에 고쳤다(양쪽 stdio를 스레드로 비우고 핸들을 닫아 `ResourceWarning`이 사라졌다). 툴2의 저널/재개/`--fix-jobs` 검증은 남아 있다.
+- **M3-2/3/4**(`epochs.py`, `batch_gen.py`, 보정 C), **M4**(점수기·불변 export), **M5**(Tk 통합·프로젝트 CLI) — 그대로.
+- **새 시드 학습은 사용자 지시 후에 실행한다.** 기존 런 `090d024339ee`는 비교·진단용으로 보존한다(재개·정식 승격 금지).
+
+

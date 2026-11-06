@@ -31,10 +31,30 @@ PIPELINE_SETTINGS = ("comfy", "models", "pipeline", "pipeline_model_paths")
 # local model, and the file a run used is part of its caption identity, so switching kind re-captions rather than
 # silently mixing two styles in one dataset.
 CAPTION_PROFILES = {"photo": "caption_instructions.txt", "anime": "caption_instructions_anime.txt"}
+# A project card says what the character is (spec 3.2: "2d" or "photo"); the caption profile says what the local model
+# should be told. "2d" and "anime" are the same thing here, and a job with no kind at all keeps the photo
+# instructions, which is what every run made before this existed used.
+KIND_ALIASES = {"2d": "anime", "anime": "anime", "photo": "photo", "real": "photo"}
 # missing-only: caption only the images that have none, never overwrite (the default, and the old behaviour).
 # preserve:     touch no caption at all; every image must already have one.
 # explicit-recaption: rewrite every caption, which is what comparing two caption styles needs (spec 7 Q4).
 CAPTION_POLICIES = ("missing-only", "preserve", "explicit-recaption")
+# Where this process reads its job list and settings from, and where it puts its runs. They follow AUTO (so a caller
+# that redirects AUTO - the GUI tests, a scratch run - moves them too) unless the CLI points them somewhere else, which
+# is how the pipeline gives a project its own settings and its own run folder.
+_PATH_OVERRIDES = {}
+
+
+def config_path():
+    return _PATH_OVERRIDES.get("config") or (AUTO / "config.json")
+
+
+def todo_path():
+    return _PATH_OVERRIDES.get("todo") or (AUTO / "todo.json")
+
+
+def runs_root():
+    return _PATH_OVERRIDES.get("runs") or (AUTO / "runs")
 
 def emit_event(kind, **values):
     if EVENTS:
@@ -85,7 +105,7 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 def settings(job):
-    cfg = read_json(AUTO / "config.json")
+    cfg = read_json(config_path())
     cfg.update(job)
     required = ("id", "dataset_root", "target_steps", "max_images_per_job", "rank", "save_every_steps_approx",
                 "caption_base_url", "caption_model", "caption_max_output_tokens")
@@ -154,11 +174,13 @@ def caption_profile(cfg):
     """Which caption instructions a run uses, chosen by the project's kind.
 
     `photo` is the original Gemma instruction file. `anime` is the Danbooru-tag style tool2's Qwen3-VL captions use,
-    which is also what a Krea 2 / Qwen 2.1 LoRA is trained against; its own file keeps the two apart.
+    which is also what a Krea 2 / Qwen 2.1 LoRA is trained against; its own file keeps the two apart. A card's `2d`
+    means the anime profile (spec 3.2 names the character, this names the instructions).
     """
-    kind = str(cfg.get("kind") or "photo").strip().lower()
-    if kind not in CAPTION_PROFILES:
-        raise ValueError(f"unknown kind {kind!r}; known: " + ", ".join(sorted(CAPTION_PROFILES)))
+    raw = str(cfg.get("kind") or "photo").strip().lower()
+    kind = KIND_ALIASES.get(raw)
+    if kind is None:
+        raise ValueError(f"unknown kind {raw!r}; known: " + ", ".join(sorted(KIND_ALIASES)))
     return kind
 
 def caption_policy(cfg):
@@ -170,14 +192,14 @@ def caption_policy(cfg):
 
 def instructions_for(cfg):
     """The caption instructions text for this run's kind (the photo file is the historical default)."""
-    path = AUTO / CAPTION_PROFILES[caption_profile(cfg)]
+    path = config_path().parent / CAPTION_PROFILES[caption_profile(cfg)]
     return path.read_text(encoding="utf-8-sig")
 
 def context(cfg):
     images, rejected = inventory(cfg)
     instructions = instructions_for(cfg)
     version = digest({"settings": version_settings(cfg), "images": images, "instructions": instructions})[:16]
-    run = AUTO / "runs" / (cfg["id"] + "-" + version)
+    run = runs_root() / (cfg["id"] + "-" + version)
     return run, images, rejected, instructions
 
 def caption_identity(cfg, instructions):
@@ -192,7 +214,7 @@ def save_run_config(run, cfg, instructions):
 def caption_sources(cfg, instructions, exclude=None):
     identity = caption_identity(cfg, instructions)
     sources = []
-    for run in sorted((AUTO / "runs").glob(cfg["id"] + "-*"), key=lambda p: p.stat().st_mtime, reverse=True):
+    for run in sorted(runs_root().glob(cfg["id"] + "-*"), key=lambda p: p.stat().st_mtime, reverse=True):
         if run == exclude or not run.is_dir():
             continue
         try:
@@ -587,11 +609,19 @@ def main():
     parser.add_argument("--job", action="append")
     parser.add_argument("--events", action="store_true", help="Structured progress for the desktop GUI")
     parser.add_argument("--limit", type=int, help="Caption at most N pending photos (caption command only)")
+    parser.add_argument("--config", help="settings file (default automation/config.json); the caption instructions "
+                                         "are read from the same folder")
+    parser.add_argument("--todo", help="job list (default automation/todo.json)")
+    parser.add_argument("--runs-dir", help="where runs are written (default automation/runs); the pipeline points "
+                                           "this at the project folder")
     args = parser.parse_args()
     EVENTS = args.events
+    for key, value in (("config", args.config), ("todo", args.todo), ("runs", args.runs_dir)):
+        if value:
+            _PATH_OVERRIDES[key] = Path(value).resolve()
     if args.limit is not None and (args.command != "caption" or args.limit <= 0):
         parser.error("--limit must be positive and can only be used with caption")
-    jobs = [j for j in read_json(AUTO / "todo.json") if j.get("enabled", True)
+    jobs = [j for j in read_json(todo_path()) if j.get("enabled", True)
             and (not args.job or j["id"] in args.job)]
     if not jobs or len({j['id'] for j in jobs}) != len(jobs):
         raise ValueError("No selected jobs or duplicate job ids.")

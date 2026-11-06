@@ -9,6 +9,10 @@ gui_error.log
 # candidates.jsonl, timings.json, scores.csv, report.md) are small and are kept: they are the provenance.
 state/
 logs/
+# Per-project locks: the named claim and the short write guard. Both are created on first use, and the guard is
+# deliberately never deleted, so they are ignored here rather than cleaned up by hand.
+projects/*/pipeline.lock
+projects/*/pipeline.write.lock
 experiments/*/images/
 experiments/*/sheet.html
 experiments/*/run.log

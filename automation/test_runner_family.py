@@ -56,6 +56,11 @@ class CaptionProfileTests(unittest.TestCase):
         self.assertEqual(runner.caption_profile(LEGACY_CFG), "photo")
         self.assertIn("photograph", runner.instructions_for(LEGACY_CFG))
 
+    def test_a_project_kind_of_2d_means_the_anime_profile(self):
+        # The card says what the character is ("2d"); the profile says what the local model is told.
+        self.assertEqual(runner.caption_profile(dict(LEGACY_CFG, kind="2d")), "anime")
+        self.assertEqual(runner.caption_profile(dict(LEGACY_CFG, kind="photo")), "photo")
+
     def test_anime_selects_its_own_instructions(self):
         cfg = dict(LEGACY_CFG, kind="anime")
         self.assertEqual(runner.caption_profile(cfg), "anime")

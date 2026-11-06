@@ -22,6 +22,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 AUTO = Path(__file__).resolve().parents[1]          # automation
@@ -36,6 +37,29 @@ IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 # as such: the card's `synthetic_sources` list is the certain answer.
 SYNTHETIC_PREFIXES = ("anchor_refined_", "anchor_", "retired_", "refined_", "sheet_")
 DEFAULT_TOOL2 = {"python": "", "batch": ""}
+# The character keys that name an input image tool2 needs. If a holdout is one of these, the run cannot show what it
+# was asked to show, and that has to be said during the plan rather than discovered in the output.
+REFERENCE_KEYS = ("edit_bases", "body_bases", "figure_refs", "profile_refs", "fullbody_source", "sheet_face",
+                  "sheet_choice")
+
+
+def holdout_from_card(card):
+    """The holdout the card froze: {ids, files, shas, reason}. Empty when nothing was frozen."""
+    holdout = ((card or {}).get("holdout") or {})
+    return {"ids": list(holdout.get("ids") or []), "files": list(holdout.get("files") or []),
+            "shas": list(holdout.get("shas") or []), "reason": holdout.get("reason", "")}
+
+
+def named_references(entry):
+    """The input file names a character entry points at, whichever of the reference keys it uses."""
+    out = []
+    for key in REFERENCE_KEYS:
+        value = (entry or {}).get(key)
+        if isinstance(value, str):
+            out.append(value)
+        elif isinstance(value, (list, tuple)):
+            out.extend(str(item) for item in value)
+    return sorted(set(out))
 
 
 def tool_paths(cfg=None):
@@ -98,10 +122,15 @@ def snapshot_id(tool2_cfg, char_folder, sources, graph_version):
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:12]
 
 
-def build_snapshot(project_dir, card, *, exclude=(), tool2_config=None, paths=None, log=print):
+def build_snapshot(project_dir, card, *, exclude=(), holdout=None, tool2_config=None, paths=None, log=print):
     """Write this run's settings and input folder, and return where everything is.
 
-    `exclude` drops named inputs (the holdout set, spec 7 Q6) from the snapshot, so a generator cannot see them.
+    The holdout is kept out of the run twice over: by the file names the card froze, and by content hash, so a holdout
+    that was renamed on its way into the character folder is still left behind. `exclude` adds names for one run;
+    `holdout` overrides what the card says (a dict with `files` and `shas`).
+
+    Both the copied folder and the snapshot's own settings record the exclusion, so which images a run could see is
+    answerable afterwards from either one.
     """
     project_dir = Path(project_dir)
     char = card.get("tool2") or {}
@@ -122,11 +151,33 @@ def build_snapshot(project_dir, card, *, exclude=(), tool2_config=None, paths=No
     chars_root = Path(char.get("characters") or (config_path.parent / "characters" / folder))
     if not chars_root.is_dir():
         raise ValueError(f"the character's input folder does not exist: {chars_root}")
-    excluded = set(exclude)
-    kept = [p for p in sorted(chars_root.iterdir())
-            if p.suffix.lower() in IMAGE_SUFFIXES and p.name not in excluded]
+    holdout = {**holdout_from_card(card), **(holdout or {})}
+    excluded_names = set(exclude) | set(holdout.get("files") or [])
+    excluded_shas = set(holdout.get("shas") or [])
+
+    kept, dropped = [], []
+    for path in sorted(chars_root.iterdir()):
+        if path.suffix.lower() not in IMAGE_SUFFIXES:
+            continue
+        if path.name in excluded_names:
+            dropped.append({"name": path.name, "reason": "holdout (named in the card's frozen holdout)"})
+            continue
+        try:
+            digest = lineage.sha256_file(path)
+        except OSError:
+            dropped.append({"name": path.name, "reason": "unreadable"})
+            continue
+        if digest in excluded_shas:
+            dropped.append({"name": path.name, "reason": "holdout (the same bytes as a holdout original)"})
+            continue
+        kept.append(path)
     if not kept:
-        raise ValueError(f"no usable input images left in {chars_root} after excluding {sorted(excluded)}")
+        raise ValueError(f"no usable input images left in {chars_root} after excluding "
+                         f"{sorted({row['name'] for row in dropped})}")
+    missing_references = sorted(set(named_references(entry)) & {row["name"] for row in dropped})
+    if missing_references:
+        log(f"[gen_qwen_edit] warning: the character needs these excluded inputs as references: "
+            f"{', '.join(missing_references)}; the run cannot show what it was asked for without them")
 
     sources = []
     for path in kept:
@@ -146,13 +197,14 @@ def build_snapshot(project_dir, card, *, exclude=(), tool2_config=None, paths=No
         if not dest.exists():
             shutil.copy2(path, dest)               # bytes, not a link: the snapshot must not follow a later edit
     snapshot_cfg = dict(tool2_cfg)
-    snapshot_cfg["characters"] = [entry]
+    snapshot_cfg["characters"] = [{**entry, "excluded_inputs": sorted({row["name"] for row in dropped})}]
     (base / "config.json").write_text(json.dumps(snapshot_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
     result = {
         "id": ident, "base": str(base), "config": str(base / "config.json"), "chars": str(chars_dir),
         "out": str(out_dir), "result_json": str(base / "result.json"), "character": folder,
         "graph_version": graph_version, "tool2_batch": str(batch), "tool2_python": paths.get("python") or sys.executable,
-        "tool2_config": str(config_path), "excluded": sorted(excluded),
+        "tool2_config": str(config_path), "excluded": sorted({row["name"] for row in dropped}),
+        "excluded_detail": dropped, "missing_references": missing_references, "holdout": holdout,
         "sources": sources, "source_hashes": {r["src_path"]: r["sha256"] for r in sources},
     }
     (base / "snapshot.json").write_text(json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -183,27 +235,43 @@ def run(snapshot, *, only=None, limit=None, cancel_file=None, log=print, on_even
     log(f"[gen_qwen_edit] {' '.join(command)}")
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                encoding="utf-8", errors="replace", cwd=str(Path(snapshot["tool2_batch"]).parent))
-    # With --events every stdout line is one JSON event and the human log is on stderr; read both, in that order.
-    for line in process.stdout:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except ValueError:
-            log(line)
-            continue
-        if on_event is not None:
-            on_event(event)
-        else:
-            log(f"  {event.get('kind')} {event.get('stem', event.get('character', ''))}")
-    errors = process.stderr.read()
-    code = process.wait()
+    # With --events every stdout line is one JSON event and the human log is on stderr. stderr is drained on its own
+    # thread: tool2 logs a lot, and a full stderr pipe would stop the run dead while this loop waits on stdout.
+    errors = []
+    drain = threading.Thread(target=_drain, args=(process.stderr, errors), daemon=True)
+    drain.start()
+    try:
+        for line in process.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                log(line)
+                continue
+            if on_event is not None:
+                on_event(event)
+            else:
+                log(f"  {event.get('kind')} {event.get('stem', event.get('character', ''))}")
+    finally:
+        process.stdout.close()
+        code = process.wait()
+        drain.join(timeout=10)
     if code:
-        raise RuntimeError(f"tool2 exited {code}: {errors.strip()[-2000:]}")
+        raise RuntimeError(f"tool2 exited {code}: {''.join(errors).strip()[-2000:]}")
     if dry_run:
         return None
     return read_json(snapshot["result_json"])
+
+
+def _drain(stream, sink):
+    """Read a subprocess stream to the end, so it can neither block on a full pipe nor be left open."""
+    try:
+        for line in stream:
+            sink.append(line)
+    finally:
+        stream.close()
 
 
 def tool2_manifest(out_dir, chars_dir):

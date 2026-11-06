@@ -1,0 +1,1090 @@
+{
+ "policy": "seed-v1",
+ "caps": {
+  "max_train_generation": 2,
+  "seed_max_generation": 1,
+  "max_edit_depth": 1
+ },
+ "holdout": {
+  "ids": [
+   "s_52c06839f1e82b86",
+   "s_9dc5902674987205"
+  ],
+  "files": [
+   "FaceCrop_012.png",
+   "file_00000000755c820986b9a86181c4345d.png"
+  ],
+  "shas": [
+   "52c06839f1e82b869697c91cefeb52bb672ac08ab100e245dbf58b3a3c7205fa",
+   "9dc590267498720548e0bfa29f9797e34f878b544d4b14b94c5f9e936a85fc60"
+  ],
+  "frozen": true,
+  "reason": "2 source(s) frozen in the card"
+ },
+ "kept": [
+  {
+   "id": "s_6b0209fb4bcc0f36",
+   "kind": "source",
+   "origin": "user",
+   "sha256": "6b0209fb4bcc0f365bde18c0d36450004b2c40d96dec92b48e3e81bd84e1d239",
+   "path": "projects\\suamom\\sources\\6b0209fb4bcc0f36.png",
+   "generation": 0,
+   "edit_depth": 0,
+   "caption": "",
+   "caption_source": "",
+   "lineage_ids": [
+    "s_6b0209fb4bcc0f36"
+   ],
+   "decision_by": "",
+   "decision_origin": "",
+   "slot": "",
+   "prompt": ""
+  },
+  {
+   "id": "s_41e3c0afbf49208a",
+   "kind": "source",
+   "origin": "user",
+   "sha256": "41e3c0afbf49208aed4c85c11b61ce0a6b40658e6ef31b0bc9e2bce1fa04418a",
+   "path": "projects\\suamom\\sources\\41e3c0afbf49208a.png",
+   "generation": 0,
+   "edit_depth": 0,
+   "caption": "",
+   "caption_source": "",
+   "lineage_ids": [
+    "s_41e3c0afbf49208a"
+   ],
+   "decision_by": "",
+   "decision_origin": "",
+   "slot": "",
+   "prompt": ""
+  },
+  {
+   "id": "s_3be991a057fbca0e",
+   "kind": "source",
+   "origin": "user",
+   "sha256": "3be991a057fbca0e38140d1a5ef091f32d6ebfc5dc3303cf6509aea4b165b073",
+   "path": "projects\\suamom\\sources\\3be991a057fbca0e.png",
+   "generation": 0,
+   "edit_depth": 0,
+   "caption": "",
+   "caption_source": "",
+   "lineage_ids": [
+    "s_3be991a057fbca0e"
+   ],
+   "decision_by": "",
+   "decision_origin": "",
+   "slot": "",
+   "prompt": ""
+  },
+  {
+   "id": "s_fd1a204655f65c71",
+   "kind": "source",
+   "origin": "user",
+   "sha256": "fd1a204655f65c71175fbc76137e8cab085158de4796475712ff4840ba0d2875",
+   "path": "projects\\suamom\\sources\\fd1a204655f65c71.png",
+   "generation": 0,
+   "edit_depth": 0,
+   "caption": "",
+   "caption_source": "",
+   "lineage_ids": [
+    "s_fd1a204655f65c71"
+   ],
+   "decision_by": "",
+   "decision_origin": "",
+   "slot": "",
+   "prompt": ""
+  },
+  {
+   "id": "s_94f00c7f6077ffe6",
+   "kind": "source",
+   "origin": "user",
+   "sha256": "94f00c7f6077ffe62fbc0b668a0115355b211b41615b9e63cde071dfcc0b42de",
+   "path": "projects\\suamom\\sources\\94f00c7f6077ffe6.png",
+   "generation": 0,
+   "edit_depth": 0,
+   "caption": "",
+   "caption_source": "",
+   "lineage_ids": [
+    "s_94f00c7f6077ffe6"
+   ],
+   "decision_by": "",
+   "decision_origin": "",
+   "slot": "",
+   "prompt": ""
+  },
+  {
+   "id": "s_c87c7b8832bc146b",
+   "kind": "source",
+   "origin": "user",
+   "sha256": "c87c7b8832bc146b061a3678b2883fd78bf4aaa3f6a387ad259a97a15b742556",
+   "path": "projects\\suamom\\sources\\c87c7b8832bc146b.png",
+   "generation": 0,
+   "edit_depth": 0,
+   "caption": "",
+   "caption_source": "",
+   "lineage_ids": [
+    "s_c87c7b8832bc146b"
+   ],
+   "decision_by": "",
+   "decision_origin": "",
+   "slot": "",
+   "prompt": ""
+  },
+  {
+   "id": "s_34f99231b55b678a",
+   "kind": "source",
+   "origin": "user",
+   "sha256": "34f99231b55b678a57052dba83a6a83495d0acc02942429f58aeeb73e5a1115e",
+   "path": "projects\\suamom\\sources\\34f99231b55b678a.png",
+   "generation": 0,
+   "edit_depth": 0,
+   "caption": "",
+   "caption_source": "",
+   "lineage_ids": [
+    "c_34f99231b55b678a",
+    "s_34f99231b55b678a"
+   ],
+   "decision_by": "",
+   "decision_origin": "",
+   "slot": "",
+   "prompt": ""
+  },
+  {
+   "id": "s_c84213a519824544",
+   "kind": "source",
+   "origin": "user",
+   "sha256": "c84213a5198245440f01d5b04e802f5b5c362698a03ce1b622c3332490616d3e",
+   "path": "projects\\suamom\\sources\\c84213a519824544.png",
+   "generation": 0,
+   "edit_depth": 0,
+   "caption": "",
+   "caption_source": "",
+   "lineage_ids": [
+    "s_c84213a519824544"
+   ],
+   "decision_by": "",
+   "decision_origin": "",
+   "slot": "",
+   "prompt": ""
+  },
+  {
+   "id": "s_d544ab4f309f73f4",
+   "kind": "source",
+   "origin": "user",
+   "sha256": "d544ab4f309f73f4fce79a31fa96a1cbb5c232df4e23bf46ab18c83d1cc49665",
+   "path": "projects\\suamom\\sources\\d544ab4f309f73f4.png",
+   "generation": 0,
+   "edit_depth": 0,
+   "caption": "",
+   "caption_source": "",
+   "lineage_ids": [
+    "s_d544ab4f309f73f4"
+   ],
+   "decision_by": "",
+   "decision_origin": "",
+   "slot": "",
+   "prompt": ""
+  },
+  {
+   "id": "s_37b3177d5ab1e7cc",
+   "kind": "source",
+   "origin": "user",
+   "sha256": "37b3177d5ab1e7cc12cf0c6dfa085cc94f10a4453c790c2171ec3858cd00ce68",
+   "path": "projects\\suamom\\sources\\37b3177d5ab1e7cc.png",
+   "generation": 0,
+   "edit_depth": 0,
+   "caption": "",
+   "caption_source": "",
+   "lineage_ids": [
+    "s_37b3177d5ab1e7cc"
+   ],
+   "decision_by": "",
+   "decision_origin": "",
+   "slot": "",
+   "prompt": ""
+  },
+  {
+   "id": "s_d529af91589af4cb",
+   "kind": "source",
+   "origin": "user",
+   "sha256": "d529af91589af4cbf034c2258ad3ec0e78bfae5b52e7a928780f774f119c1b58",
+   "path": "projects\\suamom\\sources\\d529af91589af4cb.png",
+   "generation": 0,
+   "edit_depth": 0,
+   "caption": "",
+   "caption_source": "",
+   "lineage_ids": [
+    "s_d529af91589af4cb"
+   ],
+   "decision_by": "",
+   "decision_origin": "",
+   "slot": "",
+   "prompt": ""
+  },
+  {
+   "id": "s_84a8e1adaa805ec7",
+   "kind": "source",
+   "origin": "user",
+   "sha256": "84a8e1adaa805ec7f61849a2a3c799b19b0d531e735269fc7963526451a104e7",
+   "path": "projects\\suamom\\sources\\84a8e1adaa805ec7.png",
+   "generation": 0,
+   "edit_depth": 0,
+   "caption": "",
+   "caption_source": "",
+   "lineage_ids": [
+    "s_84a8e1adaa805ec7"
+   ],
+   "decision_by": "",
+   "decision_origin": "",
+   "slot": "",
+   "prompt": ""
+  },
+  {
+   "id": "s_f41bac75e4bf8f9d",
+   "kind": "source",
+   "origin": "user",
+   "sha256": "f41bac75e4bf8f9d90e9b6e9056966eea006ba81c46342ce9e4912cbc0abc3ec",
+   "path": "projects\\suamom\\sources\\f41bac75e4bf8f9d.png",
+   "generation": 0,
+   "edit_depth": 0,
+   "caption": "",
+   "caption_source": "",
+   "lineage_ids": [
+    "s_f41bac75e4bf8f9d"
+   ],
+   "decision_by": "",
+   "decision_origin": "",
+   "slot": "",
+   "prompt": ""
+  }
+ ],
+ "excluded": [
+  {
+   "id": "s_d000a176b8b50158",
+   "kind": "source",
+   "sha256": "d000a176b8b50158dc390e0b3eab328b3d814987c795eec942f1e4d75d9f51fb",
+   "file": "sources\\d000a176b8b50158.png",
+   "code": "synthetic_source",
+   "category": "eligibility",
+   "reason": "a synthetic image in sources/ is not a user original (origin synthetic; no recorded parent)",
+   "fix": "keep it out of the seed set; it can still be a reference"
+  },
+  {
+   "id": "s_52c06839f1e82b86",
+   "kind": "source",
+   "sha256": "52c06839f1e82b869697c91cefeb52bb672ac08ab100e245dbf58b3a3c7205fa",
+   "file": "sources\\52c06839f1e82b86.png",
+   "code": "holdout_source",
+   "category": "holdout",
+   "reason": "this original is the holdout itself",
+   "fix": "nothing: it exists so the LoRA can be judged on something it never saw"
+  },
+  {
+   "id": "s_9dc5902674987205",
+   "kind": "source",
+   "sha256": "9dc590267498720548e0bfa29f9797e34f878b544d4b14b94c5f9e936a85fc60",
+   "file": "sources\\9dc5902674987205.png",
+   "code": "holdout_source",
+   "category": "holdout",
+   "reason": "this original is the holdout itself",
+   "fix": "nothing: it exists so the LoRA can be judged on something it never saw"
+  },
+  {
+   "id": "c_5283e0bb977a6def",
+   "kind": "candidate",
+   "sha256": "5283e0bb977a6def406237cdfc14c1dac0535ca98ff629fac24a5a91c08b23c0",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\5283e0bb977a6def.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86, s_9dc5902674987205)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout"
+  },
+  {
+   "id": "c_de03f8a92db6e854",
+   "kind": "candidate",
+   "sha256": "de03f8a92db6e85459b3e684bb9d07c78f4e37f2b920b60e9940b57470528e28",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\de03f8a92db6e854.png",
+   "code": "different_character",
+   "category": "review",
+   "reason": "the reviewer judged it another person",
+   "fix": "nothing: it cannot be corrected"
+  },
+  {
+   "id": "c_51d0a56baa28a748",
+   "kind": "candidate",
+   "sha256": "51d0a56baa28a748c7e023aa64f33a40fe98da4d0f0d31251f84764c9f5d1f02",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\51d0a56baa28a748.png",
+   "code": "rejected",
+   "category": "review",
+   "reason": "the reviewer rejected it",
+   "fix": "nothing"
+  },
+  {
+   "id": "c_1adac5d8ee3325db",
+   "kind": "candidate",
+   "sha256": "1adac5d8ee3325db2122b344902fd36c0b74474f86b14e2ed37e1400f9405b30",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\1adac5d8ee3325db.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86, s_9dc5902674987205)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout"
+  },
+  {
+   "id": "c_8cfce37933736e06",
+   "kind": "candidate",
+   "sha256": "8cfce37933736e06a7a98b1a6b7c0ba9ac05b5a4cb31a5ea6ae60ce4bff0ce9a",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\8cfce37933736e06.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86, s_9dc5902674987205)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout"
+  },
+  {
+   "id": "c_acee84f1199c61ca",
+   "kind": "candidate",
+   "sha256": "acee84f1199c61cad1bbe9dde20c9b07269c592a77d6126ee69a791787edd4cd",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\acee84f1199c61ca.png",
+   "code": "unverified_ancestor",
+   "category": "lineage",
+   "reason": "an ancestor is a synthetic anchor with no recorded parent (s_d000a176b8b50158)",
+   "fix": "record the anchor's parent, or generate from a labelled original instead"
+  },
+  {
+   "id": "c_f81396d5eac51bf7",
+   "kind": "candidate",
+   "sha256": "f81396d5eac51bf721fe7d63293587e5a2e46beed266c6c98b2dcc86334d960e",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\f81396d5eac51bf7.png",
+   "code": "unverified_ancestor",
+   "category": "lineage",
+   "reason": "an ancestor is a synthetic anchor with no recorded parent (s_d000a176b8b50158)",
+   "fix": "record the anchor's parent, or generate from a labelled original instead"
+  },
+  {
+   "id": "c_f82340f45018a586",
+   "kind": "candidate",
+   "sha256": "f82340f45018a586be12d7b85e8d96120211e0daa96f0e08046e560c03e3b07a",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\f82340f45018a586.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout"
+  },
+  {
+   "id": "c_b6734aea4ef9e5ed",
+   "kind": "candidate",
+   "sha256": "b6734aea4ef9e5ed121994119a74b550e7d0090fd27cc3a9deeb1c7c35401751",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\b6734aea4ef9e5ed.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout"
+  },
+  {
+   "id": "c_158e1ddafd15af78",
+   "kind": "candidate",
+   "sha256": "158e1ddafd15af7804837baea52bd6d5c54fe31dede0ac932704232c0cbe1d88",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\158e1ddafd15af78.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86, s_9dc5902674987205)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout"
+  },
+  {
+   "id": "c_0e3b69b27e85680f",
+   "kind": "candidate",
+   "sha256": "0e3b69b27e85680f99b690365fabe4ddf0d97892e3580a0cdbb93b7283b23b59",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\0e3b69b27e85680f.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86, s_9dc5902674987205)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout"
+  },
+  {
+   "id": "c_e9b7d80ab7975aef",
+   "kind": "candidate",
+   "sha256": "e9b7d80ab7975aef6860174f8ed64c8403f758975e137226bd9fa7d740d984ce",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\e9b7d80ab7975aef.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86, s_9dc5902674987205)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout"
+  },
+  {
+   "id": "c_ce5484cf17ac28cc",
+   "kind": "candidate",
+   "sha256": "ce5484cf17ac28cc33bcc9105ac422665a65e85754f75106e3d1c730c17248da",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\ce5484cf17ac28cc.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86, s_9dc5902674987205)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout"
+  },
+  {
+   "id": "c_a8f115bc81f3f8fa",
+   "kind": "candidate",
+   "sha256": "a8f115bc81f3f8fa5940e32439f638f233b44696302fe474c17c4299e68fb53b",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\a8f115bc81f3f8fa.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86, s_9dc5902674987205)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout"
+  },
+  {
+   "id": "c_9c4441ee61e7e6b2",
+   "kind": "candidate",
+   "sha256": "9c4441ee61e7e6b240cad391aaa6de5157b50cb1ef1c786a5eb61b84ed79deb8",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\9c4441ee61e7e6b2.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86, s_9dc5902674987205)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout"
+  },
+  {
+   "id": "c_24093499ce7a8ffd",
+   "kind": "candidate",
+   "sha256": "24093499ce7a8ffd674a21a0493e89446771b57e2768909b80fb9b7b121ba49d",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\24093499ce7a8ffd.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86, s_9dc5902674987205)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout"
+  },
+  {
+   "id": "c_d198b9062c33928b",
+   "kind": "candidate",
+   "sha256": "d198b9062c33928b72333d1238b9e442058a707a74957d816f704604869c5ed5",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\d198b9062c33928b.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86, s_9dc5902674987205)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout"
+  },
+  {
+   "id": "c_6d1948d655d88390",
+   "kind": "candidate",
+   "sha256": "6d1948d655d8839054ad9e75f434cb9ec6706f040024ed2018291cc8518b6c7a",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\6d1948d655d88390.png",
+   "code": "different_character",
+   "category": "review",
+   "reason": "the reviewer judged it another person",
+   "fix": "nothing: it cannot be corrected"
+  },
+  {
+   "id": "c_c4ae75000a56d9b8",
+   "kind": "candidate",
+   "sha256": "c4ae75000a56d9b8bf3a71c4b32b3cf78bf3929d9aaa6a09fbe8539130c66dda",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\c4ae75000a56d9b8.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86, s_9dc5902674987205)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout"
+  },
+  {
+   "id": "c_e0e232881a473823",
+   "kind": "candidate",
+   "sha256": "e0e232881a473823187807b94104b4d51c7b792d3603ab8e9116375090ca7f2a",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\e0e232881a473823.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86, s_9dc5902674987205)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout"
+  },
+  {
+   "id": "c_34f99231b55b678a",
+   "kind": "candidate",
+   "sha256": "34f99231b55b678a57052dba83a6a83495d0acc02942429f58aeeb73e5a1115e",
+   "file": "G:\\데이터셋 통합작성툴\\Fizgig_auto\\automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\34f99231b55b678a.png",
+   "code": "duplicate_bytes",
+   "category": "integrity",
+   "reason": "another kept image has the same bytes; this one is not the representative (same bytes as s_34f99231b55b678a)",
+   "fix": "nothing: one picture is one training image",
+   "representative": "s_34f99231b55b678a"
+  }
+ ],
+ "rows": [
+  {
+   "id": "s_d000a176b8b50158",
+   "kind": "source",
+   "sha256": "d000a176b8b50158dc390e0b3eab328b3d814987c795eec942f1e4d75d9f51fb",
+   "file": "sources\\d000a176b8b50158.png",
+   "code": "synthetic_source",
+   "category": "eligibility",
+   "reason": "a synthetic image in sources/ is not a user original (origin synthetic; no recorded parent)",
+   "fix": "keep it out of the seed set; it can still be a reference",
+   "eligible": false
+  },
+  {
+   "id": "s_52c06839f1e82b86",
+   "kind": "source",
+   "sha256": "52c06839f1e82b869697c91cefeb52bb672ac08ab100e245dbf58b3a3c7205fa",
+   "file": "sources\\52c06839f1e82b86.png",
+   "code": "holdout_source",
+   "category": "holdout",
+   "reason": "this original is the holdout itself",
+   "fix": "nothing: it exists so the LoRA can be judged on something it never saw",
+   "eligible": false
+  },
+  {
+   "id": "s_9dc5902674987205",
+   "kind": "source",
+   "sha256": "9dc590267498720548e0bfa29f9797e34f878b544d4b14b94c5f9e936a85fc60",
+   "file": "sources\\9dc5902674987205.png",
+   "code": "holdout_source",
+   "category": "holdout",
+   "reason": "this original is the holdout itself",
+   "fix": "nothing: it exists so the LoRA can be judged on something it never saw",
+   "eligible": false
+  },
+  {
+   "id": "s_6b0209fb4bcc0f36",
+   "kind": "source",
+   "sha256": "6b0209fb4bcc0f365bde18c0d36450004b2c40d96dec92b48e3e81bd84e1d239",
+   "file": "projects\\suamom\\sources\\6b0209fb4bcc0f36.png",
+   "eligible": true,
+   "code": "",
+   "category": "",
+   "reason": "user original",
+   "fix": ""
+  },
+  {
+   "id": "s_41e3c0afbf49208a",
+   "kind": "source",
+   "sha256": "41e3c0afbf49208aed4c85c11b61ce0a6b40658e6ef31b0bc9e2bce1fa04418a",
+   "file": "projects\\suamom\\sources\\41e3c0afbf49208a.png",
+   "eligible": true,
+   "code": "",
+   "category": "",
+   "reason": "user original",
+   "fix": ""
+  },
+  {
+   "id": "s_3be991a057fbca0e",
+   "kind": "source",
+   "sha256": "3be991a057fbca0e38140d1a5ef091f32d6ebfc5dc3303cf6509aea4b165b073",
+   "file": "projects\\suamom\\sources\\3be991a057fbca0e.png",
+   "eligible": true,
+   "code": "",
+   "category": "",
+   "reason": "user original",
+   "fix": ""
+  },
+  {
+   "id": "s_fd1a204655f65c71",
+   "kind": "source",
+   "sha256": "fd1a204655f65c71175fbc76137e8cab085158de4796475712ff4840ba0d2875",
+   "file": "projects\\suamom\\sources\\fd1a204655f65c71.png",
+   "eligible": true,
+   "code": "",
+   "category": "",
+   "reason": "user original",
+   "fix": ""
+  },
+  {
+   "id": "s_94f00c7f6077ffe6",
+   "kind": "source",
+   "sha256": "94f00c7f6077ffe62fbc0b668a0115355b211b41615b9e63cde071dfcc0b42de",
+   "file": "projects\\suamom\\sources\\94f00c7f6077ffe6.png",
+   "eligible": true,
+   "code": "",
+   "category": "",
+   "reason": "user original",
+   "fix": ""
+  },
+  {
+   "id": "s_c87c7b8832bc146b",
+   "kind": "source",
+   "sha256": "c87c7b8832bc146b061a3678b2883fd78bf4aaa3f6a387ad259a97a15b742556",
+   "file": "projects\\suamom\\sources\\c87c7b8832bc146b.png",
+   "eligible": true,
+   "code": "",
+   "category": "",
+   "reason": "user original",
+   "fix": ""
+  },
+  {
+   "id": "s_34f99231b55b678a",
+   "kind": "source",
+   "sha256": "34f99231b55b678a57052dba83a6a83495d0acc02942429f58aeeb73e5a1115e",
+   "file": "projects\\suamom\\sources\\34f99231b55b678a.png",
+   "eligible": true,
+   "code": "",
+   "category": "",
+   "reason": "user original",
+   "fix": ""
+  },
+  {
+   "id": "s_c84213a519824544",
+   "kind": "source",
+   "sha256": "c84213a5198245440f01d5b04e802f5b5c362698a03ce1b622c3332490616d3e",
+   "file": "projects\\suamom\\sources\\c84213a519824544.png",
+   "eligible": true,
+   "code": "",
+   "category": "",
+   "reason": "user original",
+   "fix": ""
+  },
+  {
+   "id": "s_d544ab4f309f73f4",
+   "kind": "source",
+   "sha256": "d544ab4f309f73f4fce79a31fa96a1cbb5c232df4e23bf46ab18c83d1cc49665",
+   "file": "projects\\suamom\\sources\\d544ab4f309f73f4.png",
+   "eligible": true,
+   "code": "",
+   "category": "",
+   "reason": "user original",
+   "fix": ""
+  },
+  {
+   "id": "s_37b3177d5ab1e7cc",
+   "kind": "source",
+   "sha256": "37b3177d5ab1e7cc12cf0c6dfa085cc94f10a4453c790c2171ec3858cd00ce68",
+   "file": "projects\\suamom\\sources\\37b3177d5ab1e7cc.png",
+   "eligible": true,
+   "code": "",
+   "category": "",
+   "reason": "user original",
+   "fix": ""
+  },
+  {
+   "id": "s_d529af91589af4cb",
+   "kind": "source",
+   "sha256": "d529af91589af4cbf034c2258ad3ec0e78bfae5b52e7a928780f774f119c1b58",
+   "file": "projects\\suamom\\sources\\d529af91589af4cb.png",
+   "eligible": true,
+   "code": "",
+   "category": "",
+   "reason": "user original",
+   "fix": ""
+  },
+  {
+   "id": "s_84a8e1adaa805ec7",
+   "kind": "source",
+   "sha256": "84a8e1adaa805ec7f61849a2a3c799b19b0d531e735269fc7963526451a104e7",
+   "file": "projects\\suamom\\sources\\84a8e1adaa805ec7.png",
+   "eligible": true,
+   "code": "",
+   "category": "",
+   "reason": "user original",
+   "fix": ""
+  },
+  {
+   "id": "s_f41bac75e4bf8f9d",
+   "kind": "source",
+   "sha256": "f41bac75e4bf8f9d90e9b6e9056966eea006ba81c46342ce9e4912cbc0abc3ec",
+   "file": "projects\\suamom\\sources\\f41bac75e4bf8f9d.png",
+   "eligible": true,
+   "code": "",
+   "category": "",
+   "reason": "user original",
+   "fix": ""
+  },
+  {
+   "id": "c_5283e0bb977a6def",
+   "kind": "candidate",
+   "sha256": "5283e0bb977a6def406237cdfc14c1dac0535ca98ff629fac24a5a91c08b23c0",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\5283e0bb977a6def.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86, s_9dc5902674987205)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout",
+   "eligible": false
+  },
+  {
+   "id": "c_de03f8a92db6e854",
+   "kind": "candidate",
+   "sha256": "de03f8a92db6e85459b3e684bb9d07c78f4e37f2b920b60e9940b57470528e28",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\de03f8a92db6e854.png",
+   "code": "different_character",
+   "category": "review",
+   "reason": "the reviewer judged it another person",
+   "fix": "nothing: it cannot be corrected",
+   "eligible": false
+  },
+  {
+   "id": "c_51d0a56baa28a748",
+   "kind": "candidate",
+   "sha256": "51d0a56baa28a748c7e023aa64f33a40fe98da4d0f0d31251f84764c9f5d1f02",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\51d0a56baa28a748.png",
+   "code": "rejected",
+   "category": "review",
+   "reason": "the reviewer rejected it",
+   "fix": "nothing",
+   "eligible": false
+  },
+  {
+   "id": "c_1adac5d8ee3325db",
+   "kind": "candidate",
+   "sha256": "1adac5d8ee3325db2122b344902fd36c0b74474f86b14e2ed37e1400f9405b30",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\1adac5d8ee3325db.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86, s_9dc5902674987205)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout",
+   "eligible": false
+  },
+  {
+   "id": "c_8cfce37933736e06",
+   "kind": "candidate",
+   "sha256": "8cfce37933736e06a7a98b1a6b7c0ba9ac05b5a4cb31a5ea6ae60ce4bff0ce9a",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\8cfce37933736e06.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86, s_9dc5902674987205)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout",
+   "eligible": false
+  },
+  {
+   "id": "c_acee84f1199c61ca",
+   "kind": "candidate",
+   "sha256": "acee84f1199c61cad1bbe9dde20c9b07269c592a77d6126ee69a791787edd4cd",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\acee84f1199c61ca.png",
+   "code": "unverified_ancestor",
+   "category": "lineage",
+   "reason": "an ancestor is a synthetic anchor with no recorded parent (s_d000a176b8b50158)",
+   "fix": "record the anchor's parent, or generate from a labelled original instead",
+   "eligible": false
+  },
+  {
+   "id": "c_f81396d5eac51bf7",
+   "kind": "candidate",
+   "sha256": "f81396d5eac51bf721fe7d63293587e5a2e46beed266c6c98b2dcc86334d960e",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\f81396d5eac51bf7.png",
+   "code": "unverified_ancestor",
+   "category": "lineage",
+   "reason": "an ancestor is a synthetic anchor with no recorded parent (s_d000a176b8b50158)",
+   "fix": "record the anchor's parent, or generate from a labelled original instead",
+   "eligible": false
+  },
+  {
+   "id": "c_f82340f45018a586",
+   "kind": "candidate",
+   "sha256": "f82340f45018a586be12d7b85e8d96120211e0daa96f0e08046e560c03e3b07a",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\f82340f45018a586.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout",
+   "eligible": false
+  },
+  {
+   "id": "c_b6734aea4ef9e5ed",
+   "kind": "candidate",
+   "sha256": "b6734aea4ef9e5ed121994119a74b550e7d0090fd27cc3a9deeb1c7c35401751",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\b6734aea4ef9e5ed.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout",
+   "eligible": false
+  },
+  {
+   "id": "c_158e1ddafd15af78",
+   "kind": "candidate",
+   "sha256": "158e1ddafd15af7804837baea52bd6d5c54fe31dede0ac932704232c0cbe1d88",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\158e1ddafd15af78.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86, s_9dc5902674987205)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout",
+   "eligible": false
+  },
+  {
+   "id": "c_0e3b69b27e85680f",
+   "kind": "candidate",
+   "sha256": "0e3b69b27e85680f99b690365fabe4ddf0d97892e3580a0cdbb93b7283b23b59",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\0e3b69b27e85680f.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86, s_9dc5902674987205)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout",
+   "eligible": false
+  },
+  {
+   "id": "c_e9b7d80ab7975aef",
+   "kind": "candidate",
+   "sha256": "e9b7d80ab7975aef6860174f8ed64c8403f758975e137226bd9fa7d740d984ce",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\e9b7d80ab7975aef.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86, s_9dc5902674987205)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout",
+   "eligible": false
+  },
+  {
+   "id": "c_ce5484cf17ac28cc",
+   "kind": "candidate",
+   "sha256": "ce5484cf17ac28cc33bcc9105ac422665a65e85754f75106e3d1c730c17248da",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\ce5484cf17ac28cc.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86, s_9dc5902674987205)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout",
+   "eligible": false
+  },
+  {
+   "id": "c_a8f115bc81f3f8fa",
+   "kind": "candidate",
+   "sha256": "a8f115bc81f3f8fa5940e32439f638f233b44696302fe474c17c4299e68fb53b",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\a8f115bc81f3f8fa.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86, s_9dc5902674987205)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout",
+   "eligible": false
+  },
+  {
+   "id": "c_9c4441ee61e7e6b2",
+   "kind": "candidate",
+   "sha256": "9c4441ee61e7e6b240cad391aaa6de5157b50cb1ef1c786a5eb61b84ed79deb8",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\9c4441ee61e7e6b2.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86, s_9dc5902674987205)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout",
+   "eligible": false
+  },
+  {
+   "id": "c_24093499ce7a8ffd",
+   "kind": "candidate",
+   "sha256": "24093499ce7a8ffd674a21a0493e89446771b57e2768909b80fb9b7b121ba49d",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\24093499ce7a8ffd.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86, s_9dc5902674987205)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout",
+   "eligible": false
+  },
+  {
+   "id": "c_d198b9062c33928b",
+   "kind": "candidate",
+   "sha256": "d198b9062c33928b72333d1238b9e442058a707a74957d816f704604869c5ed5",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\d198b9062c33928b.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86, s_9dc5902674987205)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout",
+   "eligible": false
+  },
+  {
+   "id": "c_6d1948d655d88390",
+   "kind": "candidate",
+   "sha256": "6d1948d655d8839054ad9e75f434cb9ec6706f040024ed2018291cc8518b6c7a",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\6d1948d655d88390.png",
+   "code": "different_character",
+   "category": "review",
+   "reason": "the reviewer judged it another person",
+   "fix": "nothing: it cannot be corrected",
+   "eligible": false
+  },
+  {
+   "id": "c_34f99231b55b678a",
+   "kind": "candidate",
+   "sha256": "34f99231b55b678a57052dba83a6a83495d0acc02942429f58aeeb73e5a1115e",
+   "file": "G:\\데이터셋 통합작성툴\\Fizgig_auto\\automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\34f99231b55b678a.png",
+   "eligible": true,
+   "code": "",
+   "category": "",
+   "reason": "accepted Qwen edit",
+   "fix": ""
+  },
+  {
+   "id": "c_c4ae75000a56d9b8",
+   "kind": "candidate",
+   "sha256": "c4ae75000a56d9b8bf3a71c4b32b3cf78bf3929d9aaa6a09fbe8539130c66dda",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\c4ae75000a56d9b8.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86, s_9dc5902674987205)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout",
+   "eligible": false
+  },
+  {
+   "id": "c_e0e232881a473823",
+   "kind": "candidate",
+   "sha256": "e0e232881a473823187807b94104b4d51c7b792d3603ab8e9116375090ca7f2a",
+   "file": "automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\e0e232881a473823.png",
+   "code": "holdout_direct",
+   "category": "holdout",
+   "reason": "a parent of this image is a holdout original (s_52c06839f1e82b86, s_9dc5902674987205)",
+   "fix": "nothing: the holdout exists so this cannot be trained on; make a new edit from a non-holdout",
+   "eligible": false
+  },
+  {
+   "id": "c_34f99231b55b678a",
+   "kind": "candidate",
+   "sha256": "34f99231b55b678a57052dba83a6a83495d0acc02942429f58aeeb73e5a1115e",
+   "file": "G:\\데이터셋 통합작성툴\\Fizgig_auto\\automation\\projects\\suamom\\candidates\\qwen_edit\\manual\\34f99231b55b678a.png",
+   "code": "duplicate_bytes",
+   "category": "integrity",
+   "reason": "another kept image has the same bytes; this one is not the representative (same bytes as s_34f99231b55b678a)",
+   "fix": "nothing: one picture is one training image",
+   "eligible": false
+  }
+ ],
+ "counts": {
+  "sources": 16,
+  "candidates": 21,
+  "accepted": 18,
+  "accepted_from_m0": 18,
+  "accepted_by_review": 0,
+  "kept": 13,
+  "kept_sources": 13,
+  "kept_candidates": 0,
+  "synthetic": 0,
+  "user": 13,
+  "excluded": 24,
+  "by_category": {
+   "eligibility": 1,
+   "holdout": 17,
+   "review": 3,
+   "lineage": 2,
+   "integrity": 1
+  },
+  "by_code": {
+   "synthetic_source": 1,
+   "holdout_source": 2,
+   "holdout_direct": 15,
+   "different_character": 2,
+   "rejected": 1,
+   "unverified_ancestor": 2,
+   "duplicate_bytes": 1
+  }
+ },
+ "synthetic_share": 0.0,
+ "duplicates": {
+  "34f99231b55b678a57052dba83a6a83495d0acc02942429f58aeeb73e5a1115e": [
+   "c_34f99231b55b678a",
+   "s_34f99231b55b678a"
+  ]
+ },
+ "quarantined": [
+  "s_d000a176b8b50158"
+ ],
+ "quotas": {
+  "ang_front_close": {
+   "target": 1,
+   "accepted": 0,
+   "eligible": 0
+  },
+  "ang_front_medium": {
+   "target": 1,
+   "accepted": 0,
+   "eligible": 0
+  },
+  "ang_front_wide": {
+   "target": 1,
+   "accepted": 0,
+   "eligible": 0
+  },
+  "ang_quarter_medium": {
+   "target": 1,
+   "accepted": 0,
+   "eligible": 0
+  },
+  "ang_quarter_close": {
+   "target": 1,
+   "accepted": 0,
+   "eligible": 0
+  },
+  "ang_side_medium": {
+   "target": 1,
+   "accepted": 0,
+   "eligible": 0
+  },
+  "ang_back_medium": {
+   "target": 1,
+   "accepted": 0,
+   "eligible": 0
+  },
+  "ang_back_wide": {
+   "target": 1,
+   "accepted": 0,
+   "eligible": 0
+  },
+  "frm_upper_body": {
+   "target": 1,
+   "accepted": 0,
+   "eligible": 0
+  },
+  "frm_face": {
+   "target": 1,
+   "accepted": 0,
+   "eligible": 0
+  },
+  "frm_dutch": {
+   "target": 1,
+   "accepted": 0,
+   "eligible": 0
+  },
+  "frm_from_above": {
+   "target": 1,
+   "accepted": 0,
+   "eligible": 0
+  },
+  "exp_smile": {
+   "target": 1,
+   "accepted": 0,
+   "eligible": 0
+  },
+  "exp_angry": {
+   "target": 1,
+   "accepted": 0,
+   "eligible": 0
+  },
+  "exp_sad": {
+   "target": 1,
+   "accepted": 0,
+   "eligible": 0
+  },
+  "exp_surprised": {
+   "target": 1,
+   "accepted": 0,
+   "eligible": 0
+  },
+  "bg_classroom": {
+   "target": 1,
+   "accepted": 0,
+   "eligible": 0
+  },
+  "bg_street_night": {
+   "target": 1,
+   "accepted": 0,
+   "eligible": 0
+  },
+  "bg_park": {
+   "target": 1,
+   "accepted": 0,
+   "eligible": 0
+  },
+  "bg_bedroom": {
+   "target": 1,
+   "accepted": 0,
+   "eligible": 0
+  },
+  "pos_sitting": {
+   "target": 1,
+   "accepted": 0,
+   "eligible": 0
+  },
+  "pos_walking": {
+   "target": 1,
+   "accepted": 0,
+   "eligible": 0
+  },
+  "pos_waving": {
+   "target": 1,
+   "accepted": 0,
+   "eligible": 0
+  },
+  "pos_phone": {
+   "target": 1,
+   "accepted": 0,
+   "eligible": 0
+  }
+ },
+ "shortfall": {
+  "accepted": 18,
+  "eligible": 0,
+  "note": "accepted candidates that cannot be seed inputs, by reason: different_character 2, duplicate_bytes 1, holdout_direct 15, holdout_source 2, rejected 1, synthetic_source 1, unverified_ancestor 2"
+ }
+}

@@ -233,6 +233,48 @@ class ImportTests(SnapshotTests):
         self.assertEqual(len(records), 1)
 
 
+class HoldoutTests(SnapshotTests):
+    """T1: generator A cannot see the holdout, by name or by bytes, and says so when a reference is missing."""
+
+    def test_a_frozen_holdout_is_kept_out_without_the_caller_saying_so(self):
+        card = json.loads(json.dumps(self.card))
+        card["holdout"] = {"ids": ["s_testsource"], "files": ["front.png"], "shas": [], "reason": "frozen"}
+        snap = gen.build_snapshot(self.project, card, paths=self.paths, log=lambda *_: None)
+        names = {Path(r["src_path"]).name for r in snap["sources"]}
+        self.assertNotIn("front.png", names)
+        self.assertFalse((Path(snap["chars"]) / "front.png").exists())
+        self.assertEqual(snap["excluded"], ["front.png"])
+        self.assertIn("holdout", snap["excluded_detail"][0]["reason"])
+        # the run's own settings record what the run could not see
+        pinned = json.loads(Path(snap["config"]).read_text(encoding="utf-8"))
+        self.assertEqual(pinned["characters"][0]["excluded_inputs"], ["front.png"])
+
+    def test_a_holdout_under_another_name_is_also_left_out(self):
+        import hashlib
+        digest = hashlib.sha256(b"IMG-front.png").hexdigest()
+        card = json.loads(json.dumps(self.card))
+        card["holdout"] = {"ids": [], "files": [], "shas": [digest], "reason": "frozen by hash"}
+        (self.chars / "renamed-copy.png").write_bytes(b"IMG-front.png")
+        snap = gen.build_snapshot(self.project, card, paths=self.paths, log=lambda *_: None)
+        names = {Path(r["src_path"]).name for r in snap["sources"]}
+        self.assertNotIn("front.png", names)
+        self.assertNotIn("renamed-copy.png", names)
+        self.assertEqual(sorted(snap["excluded"]), ["front.png", "renamed-copy.png"])
+
+    def test_an_excluded_reference_is_reported_at_plan_time(self):
+        self.config.write_text(json.dumps({
+            "comfy_url": "http://127.0.0.1:8190", "resolution": 1024, "base_seed": 1000, "seeds_per_job": 1,
+            "models": {"unet": "u", "clip": "c", "vae": "v"},
+            "characters": [{"folder": "tester", "trigger": "trg", "edit_bases": ["front.png", "side.png"]}],
+        }, ensure_ascii=False), encoding="utf-8")
+        card = json.loads(json.dumps(self.card))
+        card["holdout"] = {"ids": [], "files": ["front.png"], "shas": [], "reason": "frozen"}
+        lines = []
+        snap = gen.build_snapshot(self.project, card, paths=self.paths, log=lines.append)
+        self.assertEqual(snap["missing_references"], ["front.png"])
+        self.assertTrue(any("needs these excluded inputs" in line for line in lines))
+
+
 class WiringTests(unittest.TestCase):
     def test_the_tool_paths_come_from_the_pipeline_config(self):
         paths = gen.tool_paths({"pipeline": {"tool2": {"python": "X:/python.exe", "batch": "X:/dataset_batch.py"}}})
