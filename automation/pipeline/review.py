@@ -369,3 +369,19 @@ def serve(project, port=8195, log=print, quota_plan=None, open_browser=True):
     finally:
         server.server_close()
     return server
+
+
+def main(argv=None):
+    import argparse
+    parser = argparse.ArgumentParser(description="Serve a project's review page (accept / reject / fix)")
+    parser.add_argument("--project", required=True, help="project folder (holds project.json)")
+    parser.add_argument("--port", type=int, default=8195)
+    parser.add_argument("--no-browser", action="store_true", help="do not open a browser window")
+    args = parser.parse_args(argv)
+    project = pj.Project.open(args.project)
+    return 0 if serve(project, port=args.port, quota_plan=project.card.get("slot_quotas"),
+                      open_browser=not args.no_browser) else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

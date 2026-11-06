@@ -30,7 +30,7 @@ ROOT = AUTO.parent                                  # Fizgig_auto
 if str(AUTO) not in sys.path:
     sys.path.insert(0, str(AUTO))
 
-from pipeline import lineage, models  # noqa: E402
+from pipeline import lineage, models, project as pj  # noqa: E402
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 # Names tool2's own make_candidates/refine_anchor write into the character folder. Used only as evidence, and recorded
@@ -297,10 +297,10 @@ def tool2_manifest(out_dir, chars_dir):
 
 
 def parents_for(image_name, out_dir, chars_dir, snapshot, log=print):
-    """Source ids of the images this candidate was edited from, or [] with the reason."""
+    """(parent source ids, the reference file names, the reason when there are no parents)."""
     record = tool2_manifest(out_dir, chars_dir).get(image_name)
     if not record:
-        return [], "tool2 left no manifest record for this image"
+        return [], [], "tool2 left no manifest record for this image"
     names = list(record.get("refs") or []) or ([record["source"]] if record.get("source") else [])
     ids = []
     for name in names:
@@ -309,15 +309,110 @@ def parents_for(image_name, out_dir, chars_dir, snapshot, log=print):
         except OSError:
             log(f"  parent not found in the snapshot: {name}")
     if not ids:
-        return [], "none of the recorded parents exist in the snapshot"
-    return ids, ""
+        return [], names, "none of the recorded parents exist in the snapshot"
+    return ids, names, ""
 
 
-def import_candidates(project_dir, card, snapshot, result, log=print):
-    """Write the snapshot's provenance and the run's outputs into the project as candidates."""
+def open_project(project_dir):
+    """The project behind a folder, or None when the folder is just a working directory (the offline tests)."""
+    folder = Path(project_dir)
+    return pj.Project.open(folder) if (folder / "project.json").is_file() else None
+
+
+def merge_sources(project_dir, sources, *, snapshot_id="", log=print):
+    """Add this run's sources to the project without touching the ones it already has.
+
+    The project's `sources.jsonl` is the record of the user's own originals, including the holdout reasoning; a
+    generator run must not be able to replace it. Rows are matched by id (the content hash), so a source the project
+    already knows keeps its own row - with the original path the user's file lives at - and only new bytes are added.
+    """
+    path = Path(project_dir) / "sources.jsonl"
+    known = {r.get("id") for r in lineage.read_jsonl(path)}
+    fresh = []
+    for record in sources:
+        if record.get("id") in known:
+            continue
+        fresh.append({**record, "snapshot": snapshot_id or record.get("snapshot", "")})
+        known.add(record.get("id"))
+    written = lineage.append_jsonl(path, fresh)
+    report = {"added": written, "reused": len(sources) - written, "total": len(known)}
+    if written:
+        log(f"[gen_qwen_edit] sources: {written} added, {len(sources) - written} already in the project")
+    return report
+
+
+def model_hashes(snapshot):
+    """Quick hashes of the models this run used: once per run, not once per image.
+
+    A DiT is tens of gigabytes, so `lineage.quick_hash` (size, mtime, both ends) is the honest cheap identity; a LoRA
+    gets a full sha256. A model that is not on disk is recorded as missing rather than left out silently.
+    """
+    config = read_json(snapshot.get("config") or "")
+    comfy_dir = config.get("comfy_dir") or ""
+    out = {}
+    for name, value in (config.get("models") or {}).items():
+        path = Path(str(value))
+        if not path.is_absolute():
+            path = (Path(comfy_dir) / "models" / str(value)) if comfy_dir else path
+        entry = {"path": str(path)}
+        if not path.is_file():
+            entry["missing"] = True
+            out[name] = entry
+            continue
+        try:
+            entry["quick_hash"] = lineage.quick_hash(path)
+        except OSError as exc:
+            entry["error"] = str(exc)
+        out[name] = entry
+    return out
+
+
+def find_snapshot(project_dir, card=None, *, snapshot_id=None, exclude=(), paths=None, log=print):
+    """The snapshot an existing result belongs to: its own folder, or the one the card produces today.
+
+    Importing a run that finished after the process died needs the settings and input list of *that* run. The id is a
+    hash of exactly those, so picking the newest snapshot folder with the same character and then, if that fails,
+    rebuilding the snapshot from the card (which submits no GPU work) recovers it.
+    """
     project_dir = Path(project_dir)
+    folder = project_dir / "tool2"
+    candidates = []
+    if folder.is_dir():
+        for child in sorted(folder.iterdir()):
+            data = read_json(child / "snapshot.json")
+            if data.get("id"):
+                candidates.append(data)
+    if snapshot_id:
+        for data in candidates:
+            if data["id"] == snapshot_id:
+                return data
+    character = ((card or {}).get("tool2") or {}).get("character") or (card or {}).get("id")
+    same_character = [data for data in candidates if data.get("character") == character]
+    if same_character:
+        newest = max(same_character, key=lambda data: Path(data.get("base") or "").stat().st_mtime
+                     if Path(data.get("base") or "").exists() else 0)
+        log(f"[gen_qwen_edit] import-only: using snapshot {newest['id']}")
+        return newest
+    if not card:
+        raise ValueError(f"no snapshot under {folder} and no card to rebuild one from")
+    rebuilt = build_snapshot(project_dir, card, exclude=exclude, paths=paths, log=log)
+    log(f"[gen_qwen_edit] import-only: rebuilt snapshot {rebuilt['id']} from the card (no GPU work was submitted)")
+    return rebuilt
+
+
+def import_candidates(project_dir, card, snapshot, result, *, log=print):
+    """Write the snapshot's provenance and the run's outputs into the project as candidates.
+
+    Three things this refuses to do: replace the project's own source list (it merges), drop an image the project
+    already has (records are keyed by content hash), and record a run without saying which snapshot, graph and models
+    produced it.
+    """
+    project_dir = Path(project_dir)
+    project = open_project(project_dir)
     chars_dir, out_dir = snapshot["chars"], snapshot["out"]
-    lineage.write_jsonl(project_dir / "sources.jsonl", snapshot["sources"])
+    sources_report = merge_sources(project_dir, snapshot["sources"], snapshot_id=snapshot["id"], log=log)
+    hashes = model_hashes(snapshot)
+    manifest_records = tool2_manifest(out_dir, chars_dir)
     records, skipped = [], []
     for entry in result.get("characters") or []:
         for row in entry.get("generated") or []:
@@ -325,21 +420,34 @@ def import_candidates(project_dir, card, snapshot, result, log=print):
             if not path.is_file():
                 skipped.append({"file": str(path), "reason": "the file the result names is not on disk"})
                 continue
-            parents, why = parents_for(path.name, out_dir, chars_dir, snapshot, log)
-            train_generation, edit_depth = 1, 1     # a tool2 edit works from the originals: generation 1, depth 1
+            parents, refs, why = parents_for(path.name, out_dir, chars_dir, snapshot, log)
             record = lineage.record(
-                path, generator="qwen_edit", parent_ids=parents, train_generation=train_generation,
-                edit_depth=edit_depth, slot={"category": row.get("category") or _category_of(row.get("stem", ""))},
-                prompt=row.get("prompt", ""), seed=row.get("seed"), graph_version=f"tool2:{snapshot['graph_version']}",
-                snapshot=snapshot["id"], stem=row.get("stem"),
+                path, generator="qwen_edit", parent_ids=parents,
+                train_generation=1, edit_depth=1,          # a tool2 edit works from the originals
+                slot={"category": row.get("category") or _category_of(row.get("stem", ""))},
+                prompt=row.get("prompt", ""), seed=row.get("seed"),
+                steps=row.get("steps"), cfg=row.get("cfg"),
+                width=row.get("resolution") or row.get("width"), height=row.get("resolution") or row.get("height"),
+                graph_version=f"tool2:{snapshot['graph_version']}", snapshot=snapshot["id"],
+                stem=row.get("stem"), prompt_id=f"{snapshot['id']}:{row.get('stem') or path.stem}",
+                refs=refs, models={"family": "qwen_image21", "files": hashes,
+                                   "record": manifest_records.get(path.name) or {}},
                 allow_missing_parents=True, orphan_reason=why)
             record["caption"] = _caption_of(path)
             records.append(record)
-    written = lineage.append_jsonl(project_dir / "candidates.jsonl", records)
-    log(f"[gen_qwen_edit] {written} new candidate(s) in {project_dir / 'candidates.jsonl'}")
+    if project is not None:
+        written, project_skipped = project.import_candidates(records, log=log)
+        for item in project_skipped:
+            skipped.append({"file": item["id"], "reason": item["reason"]})
+        records = [r for r in records if r["id"] not in {s.get("id") for s in project_skipped}]
+    else:
+        written = lineage.append_jsonl(project_dir / "candidates.jsonl", records)
+        log(f"[gen_qwen_edit] {written} new candidate(s) in {project_dir / 'candidates.jsonl'}")
     if skipped:
-        log(f"[gen_qwen_edit] {len(skipped)} result row(s) named a file that is not on disk")
-    return records, skipped
+        log(f"[gen_qwen_edit] {len(skipped)} result row(s) were not imported")
+    report = {"candidates": written, "skipped": skipped, "sources": sources_report,
+              "snapshot": snapshot["id"], "records": records}
+    return records, skipped, report
 
 
 def _category_of(stem):
@@ -354,6 +462,50 @@ def _caption_of(path):
         return ""
 
 
+def restore_slots(project, exp_dir, *, apply=True, log=print):
+    """Give project candidates the slot id an experiment manifest recorded for the same bytes.
+
+    The M0 harness knew which slot every image was made for, but it only wrote the slot's *category* into
+    `candidates.jsonl`, so the project's quota board counted nothing. The manifest still has the answer keyed by the
+    image file it produced; matching that file to a candidate by content hash (not by name) recovers the slot, and an
+    image whose bytes match more than one slot is left unresolved instead of guessed.
+    """
+    exp_dir = Path(exp_dir)
+    manifest = read_json(exp_dir / "experiment.json")
+    if not manifest:
+        raise ValueError(f"no experiment.json in {exp_dir}")
+    by_file = {task.get("file"): task for task in manifest.get("tasks") or [] if task.get("file")}
+    sha_to_slots = {}
+    for record in lineage.read_jsonl(exp_dir / "candidates.jsonl"):
+        sha = record.get("sha256")
+        name = Path(str(record.get("file") or "")).name
+        task = by_file.get(record.get("file")) or by_file.get(f"images/{record.get('method')}/{name}")
+        if not sha or not task:
+            continue
+        sha_to_slots.setdefault(sha, set()).add(task.get("slot_id"))
+    restored, ambiguous, unresolved = [], [], []
+    records = project.candidates()
+    for record in records:
+        slot = dict(record.get("slot") or {})
+        if slot.get("slot_id"):
+            continue
+        wanted = sha_to_slots.get(record.get("sha256")) or set()
+        if len(wanted) > 1:
+            ambiguous.append({"id": record["id"], "slots": sorted(str(s) for s in wanted)})
+            continue
+        if not wanted:
+            unresolved.append({"id": record["id"], "reason": "no manifest task for these bytes"})
+            continue
+        slot["slot_id"] = next(iter(wanted))
+        slot["slot_source"] = f"restored from {exp_dir.name}/experiment.json"
+        record["slot"] = slot
+        restored.append({"id": record["id"], "slot_id": slot["slot_id"]})
+    if apply and restored:
+        lineage.write_jsonl(project.dir / "candidates.jsonl", records)
+    log(f"[gen_qwen_edit] slots: {len(restored)} restored, {len(ambiguous)} ambiguous, {len(unresolved)} unresolved")
+    return {"restored": restored, "ambiguous": ambiguous, "unresolved": unresolved}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Generator A: run tool2 for a project and import the candidates")
     parser.add_argument("--project", required=True, help="project folder (holds project.json or a card json)")
@@ -363,17 +515,27 @@ def main(argv=None):
     parser.add_argument("--cancel-file", help="stop when this file appears")
     parser.add_argument("--exclude", help="comma list of input file names to keep out of the snapshot (holdouts)")
     parser.add_argument("--dry-run", action="store_true", help="plan with tool2 but do not generate")
-    parser.add_argument("--import-only", metavar="RESULT_JSON", help="import an existing result without running")
+    parser.add_argument("--import-only", metavar="RESULT_JSON",
+                        help="import an existing result without running (no GPU work is submitted)")
+    parser.add_argument("--restore-slots", metavar="EXPERIMENT_DIR",
+                        help="give candidates the slot ids an experiment manifest recorded for their bytes")
     args = parser.parse_args(argv)
 
     project_dir = Path(args.project)
     card = read_json(args.card or project_dir / "project.json")
     if not card:
         raise SystemExit(f"no card found at {args.card or project_dir / 'project.json'}")
+    if args.restore_slots:
+        project = open_project(project_dir)
+        if project is None:
+            raise SystemExit("--restore-slots needs a project folder")
+        restore_slots(project, args.restore_slots)
+        return 0
     if args.import_only:
-        snapshot = read_json(project_dir / "tool2" / "snapshot.json")
-        if not snapshot:
-            raise SystemExit("import-only needs the snapshot.json a previous run wrote")
+        # The snapshot a run belongs to is `tool2/<id>/snapshot.json`; the id is a hash of the settings and the input
+        # bytes, so it can be recovered without generating anything.
+        snapshot = find_snapshot(project_dir, card,
+                                 exclude=(args.exclude or "").split(",") if args.exclude else ())
         import_candidates(project_dir, card, snapshot, read_json(args.import_only))
         return 0
     snapshot = build_snapshot(project_dir, card, exclude=(args.exclude or "").split(",") if args.exclude else ())

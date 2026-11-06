@@ -460,7 +460,9 @@ def write_candidates(exp_dir, manifest, lora_dir):
         out = Path(exp_dir) / task["file"]
         if not out.is_file():
             continue
-        slot = {"category": task["category"], "prompt": task["prompt"]}
+        # The slot id travels with the image: without it a candidate cannot be counted against the project's slot
+        # quotas, which is why an import of this manifest used to leave every quota at zero.
+        slot = {"slot_id": task["slot_id"], "category": task["category"], "prompt": task["prompt"]}
         if task["kind"] == "tool2":
             parents, reason = tool2_parents(tool2_cfg.get("dataset"), tool2_cfg.get("characters"),
                                             task.get("source_ref") or "")

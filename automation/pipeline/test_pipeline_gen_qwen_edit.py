@@ -173,7 +173,8 @@ class ImportTests(SnapshotTests):
         made.write_bytes(b"MADE")
         (Path(snap["out"]) / "manifest.jsonl").write_text(json.dumps(
             {"file": made.name, "refs": ["front.png", "side.png"], "category": "framing"}) + "\n", encoding="utf-8")
-        records, skipped = gen.import_candidates(self.project, self.card, snap, self._result(snap), log=lambda *_: None)
+        records, skipped, _report = gen.import_candidates(self.project, self.card, snap, self._result(snap),
+                                                          log=lambda *_: None)
         self.assertEqual(skipped, [])
         self.assertEqual(len(records), 1)
         record = records[0]
@@ -201,7 +202,7 @@ class ImportTests(SnapshotTests):
         snap = self.snapshot()
         made = Path(snap["out"]) / "framing_00_abcdefabcdef_s1000.png"
         made.write_bytes(b"MADE")
-        records, _skipped = gen.import_candidates(self.project, self.card, snap, self._result(snap), log=lambda *_: None)
+        records, _skipped, _report = gen.import_candidates(self.project, self.card, snap, self._result(snap), log=lambda *_: None)
         self.assertEqual(records[0]["parent_ids"], [])
         self.assertTrue(records[0]["orphan_reason"])
 
@@ -212,13 +213,14 @@ class ImportTests(SnapshotTests):
         result = {"characters": [{"folder": "tester", "generated": [
             {"stem": "framing_00_abcdefabcdef_s1000", "file": str(made), "category": "framing",
              "seed": 1003, "prompt": "Zoom in on the woman.", "steps": 25, "cfg": 1.0, "resolution": 1024}]}]}
-        records, _skipped = gen.import_candidates(self.project, self.card, snap, result, log=lambda *_: None)
+        records, _skipped, _report = gen.import_candidates(self.project, self.card, snap, result, log=lambda *_: None)
         self.assertEqual(records[0]["seed"], 1003)
         self.assertEqual(records[0]["prompt"], "Zoom in on the woman.")
 
     def test_a_result_row_whose_file_is_gone_is_reported_not_guessed(self):
         snap = self.snapshot()
-        records, skipped = gen.import_candidates(self.project, self.card, snap, self._result(snap), log=lambda *_: None)
+        records, skipped, _report = gen.import_candidates(self.project, self.card, snap, self._result(snap),
+                                                          log=lambda *_: None)
         self.assertEqual(records, [])
         self.assertEqual(len(skipped), 1)
         self.assertIn("not on disk", skipped[0]["reason"])
@@ -273,6 +275,167 @@ class HoldoutTests(SnapshotTests):
         snap = gen.build_snapshot(self.project, card, paths=self.paths, log=lines.append)
         self.assertEqual(snap["missing_references"], ["front.png"])
         self.assertTrue(any("needs these excluded inputs" in line for line in lines))
+
+
+class ProjectImportTests(SnapshotTests):
+    """T4: importing into a real project keeps what the project already had, and can be resumed."""
+
+    def setUp(self):
+        super().setUp()
+        from pipeline import project as pj
+        self.pj = pj
+        self.proj = pj.Project.create("tester", {"id": "tester", "tool2": dict(self.card["tool2"])},
+                                      folder=self.dir / "real-project")
+        # the user's own originals, imported before the generator ever runs
+        self.proj.import_sources([self.chars / "front.png", self.chars / "side.png"], log=lambda *_: None)
+        self.before = {r["id"]: r["src_path"] for r in self.proj.source_records()}
+
+    def _result(self, snap):
+        made = Path(snap["out"]) / "framing_00_abcdefabcdef_s1000.png"
+        made.write_bytes(b"MADE-BY-TOOL2")
+        (Path(snap["out"]) / "manifest.jsonl").write_text(json.dumps(
+            {"file": made.name, "refs": ["front.png", "side.png"], "category": "framing"}) + "\n", encoding="utf-8")
+        return {"graph_version": "fake@1", "characters": [{"folder": "tester", "generated": [
+            {"stem": "framing_00_abcdefabcdef_s1000", "file": str(made), "category": "framing",
+             "prompt": "Zoom in.", "seed": 1003, "steps": 25, "cfg": 1.0, "resolution": 1024}]}]}
+
+    def test_the_projects_own_sources_survive_an_import(self):
+        snap = self.snapshot()
+        gen.import_candidates(self.proj.dir, self.card, snap, self._result(snap), log=lambda *_: None)
+        after = {r["id"]: r["src_path"] for r in self.proj.source_records()}
+        for source_id, path in self.before.items():
+            self.assertEqual(after.get(source_id), path, "an existing source row must not move or vanish")
+        self.assertGreaterEqual(len(after), len(self.before))
+
+    def test_the_copy_of_the_run_lands_in_the_projects_own_candidate_folder(self):
+        snap = self.snapshot()
+        gen.import_candidates(self.proj.dir, self.card, snap, self._result(snap), log=lambda *_: None)
+        records = self.proj.candidates()
+        self.assertEqual(len(records), 1)
+        stored = Path(records[0]["file"])
+        self.assertTrue(stored.is_file())
+        self.assertEqual(stored.parent.parent.name, "qwen_edit")
+        self.assertEqual(stored.parent, self.proj.dir / "candidates" / "qwen_edit" / snap["id"][:24])
+
+    def test_the_candidate_records_the_snapshot_graph_refs_and_models(self):
+        snap = self.snapshot()
+        records, _skipped, report = gen.import_candidates(self.proj.dir, self.card, snap, self._result(snap),
+                                                          log=lambda *_: None)
+        record = records[0]
+        self.assertEqual(record["snapshot"], snap["id"])
+        self.assertEqual(report["snapshot"], snap["id"])
+        self.assertEqual(record["refs"], ["front.png", "side.png"])
+        self.assertTrue(record["prompt_id"].startswith(snap["id"]))
+        self.assertTrue(record["graph_version"].startswith("tool2:"))
+        self.assertEqual(record["steps"], 25)
+        self.assertEqual(record["width"], 1024)
+        self.assertEqual(record["models"]["family"], "qwen_image21")
+        # the snapshot's config names models; a run must say which files they were, even when they are absent
+        self.assertTrue(record["models"]["files"])
+        stored = {r["id"]: r for r in self.proj.candidates()}[record["id"]]
+        self.assertEqual(stored["snapshot"], snap["id"])
+
+    def test_importing_the_same_result_twice_adds_no_rows(self):
+        snap = self.snapshot()
+        result = self._result(snap)
+        gen.import_candidates(self.proj.dir, self.card, snap, result, log=lambda *_: None)
+        _records, skipped, report = gen.import_candidates(self.proj.dir, self.card, snap, result,
+                                                          log=lambda *_: None)
+        self.assertEqual(report["candidates"], 0)
+        self.assertEqual(len(self.proj.candidates()), 1)
+        self.assertTrue(skipped)
+        self.assertIn("already in the project", skipped[0]["reason"])
+
+    def test_an_import_can_find_its_own_snapshot_again_without_generating(self):
+        snap = self.snapshot()
+        found = gen.find_snapshot(self.proj.dir, self.card, snapshot_id=snap["id"], paths=self.paths,
+                                  log=lambda *_: None)
+        self.assertEqual(found["id"], snap["id"])
+        # and by character alone, when the exact id is not given
+        self.assertEqual(gen.find_snapshot(self.proj.dir, self.card, paths=self.paths, log=lambda *_: None)["id"],
+                         snap["id"])
+
+    def test_import_only_leaves_the_project_alone_when_the_result_is_already_in(self):
+        snap = self.snapshot()
+        result = self._result(snap)
+        result_path = self.dir / "result.json"
+        result_path.write_text(json.dumps(result), encoding="utf-8")
+        gen.import_candidates(self.proj.dir, self.card, snap, result, log=lambda *_: None)
+        before = len(self.proj.candidates())
+        code = gen.main(["--project", str(self.proj.dir), "--import-only", str(result_path)])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.proj.candidates()), before)
+        self.assertEqual(len(self.proj.candidates()), 1)
+
+
+class SlotRestoreTests(unittest.TestCase):
+    """T4: the M0 harness lost the slot id; the manifest still has it, keyed by the image it produced."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.temp.name)
+        from pipeline import project as pj
+        self.pj = pj
+        self.project = pj.Project.create("demo", {"id": "demo"}, folder=self.dir / "project")
+        self.exp = self.dir / "m0"
+        images = self.exp / "images" / "qwen_edit"
+        images.mkdir(parents=True)
+        (images / "ang_front_close__s1003.png").write_bytes(b"A-CLOSE")
+        (images / "pos_sitting__s1003.png").write_bytes(b"POSED")
+        (self.exp / "experiment.json").write_text(json.dumps({"tasks": [
+            {"slot_id": "ang_front_close", "category": "angles", "file": "images/qwen_edit/ang_front_close__s1003.png"},
+            {"slot_id": "pos_sitting", "category": "poses", "file": "images/qwen_edit/pos_sitting__s1003.png"},
+        ]}), encoding="utf-8")
+        from pipeline import lineage
+        self.lineage = lineage
+        rows = []
+        for name in ("ang_front_close__s1003.png", "pos_sitting__s1003.png"):
+            path = images / name
+            rows.append(lineage.record(path, generator="qwen_edit", parent_ids=["s_1"], train_generation=1,
+                                       edit_depth=1, slot={"category": name.split("_")[0]},
+                                       method="qwen_edit"))
+        (self.exp / "candidates.jsonl").write_text(
+            "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n", encoding="utf-8")
+        for row in rows:
+            self.project.import_candidates([row], log=lambda *_: None)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_the_slot_ids_come_back_from_the_manifest(self):
+        from pipeline import gen_qwen_edit as gen
+        report = gen.restore_slots(self.project, self.exp, log=lambda *_: None)
+        self.assertEqual(len(report["restored"]), 2)
+        slots = {r["id"]: r["slot"]["slot_id"] for r in self.project.candidates()}
+        self.assertEqual(sorted(slots.values()), ["ang_front_close", "pos_sitting"])
+        self.assertTrue(all("restored from" in r["slot"]["slot_source"] for r in self.project.candidates()))
+
+    def test_the_quota_board_counts_the_restored_slots(self):
+        from pipeline import gen_qwen_edit as gen
+        plan = {"ang_front_close": 1, "pos_sitting": 1}
+        before = self.project.quotas(plan)
+        self.assertEqual(sum(info["accepted"] for info in before.values()), 0)
+        for record in self.project.candidates():
+            self.project.decide(record["id"], "accept")
+        gen.restore_slots(self.project, self.exp, log=lambda *_: None)
+        after = self.project.quotas(plan)
+        self.assertEqual(after["ang_front_close"]["accepted"], 1)
+        self.assertEqual(after["pos_sitting"]["accepted"], 1)
+        self.assertEqual(sum(info["short"] for info in after.values()), 0)
+
+    def test_an_image_that_fits_two_slots_is_left_unresolved(self):
+        from pipeline import gen_qwen_edit as gen
+        # the manifest says the same bytes were produced for two different slots: it cannot say which one a candidate
+        # with those bytes is, so it is reported instead of guessed
+        rows = self.lineage.read_jsonl(self.exp / "candidates.jsonl")
+        rows[1]["sha256"] = rows[0]["sha256"]
+        (self.exp / "candidates.jsonl").write_text(
+            "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n", encoding="utf-8")
+        report = gen.restore_slots(self.project, self.exp, log=lambda *_: None)
+        self.assertTrue(report["ambiguous"])
+        self.assertTrue(report["unresolved"])
+        for record in self.project.candidates():
+            self.assertFalse(record["slot"].get("slot_id"))
 
 
 class WiringTests(unittest.TestCase):
