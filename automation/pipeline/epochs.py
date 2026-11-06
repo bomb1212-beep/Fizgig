@@ -237,11 +237,19 @@ def _run_state(run_folder):
 def _snapshot_of(project, run_folder):
     """Which seed snapshot this run was trained from, if the project can say.
 
-    The run folder does not record it, so it is read from the run's own config when it is there and otherwise left
-    null: guessing would put a false provenance stamp on every picture the grid produces.
+    A seed run keeps its settings in `run_config.json` but never writes the snapshot id into it, so the id is read
+    from the run's own path first: `seed_lora/<snapshot>/runs/<run>`. That is the layout `seed.train` creates, and
+    the id is only accepted when `seed_lora/<id>` really holds a snapshot, so a run placed somewhere else cannot
+    borrow a neighbouring name. Otherwise the run's config is read. When neither applies the answer stays null:
+    guessing would put a false provenance stamp on every picture the grid produces.
     """
-    for name in ("config.json", "job.json", "run.json"):
-        path = Path(run_folder) / name
+    folder = Path(run_folder)
+    if folder.parent.name == "runs" and folder.parent.parent.parent.name == "seed_lora":
+        candidate = folder.parent.parent.name
+        if (folder.parent.parent / "snapshot.json").is_file():
+            return {"id": candidate, "source": "run folder path"}
+    for name in ("run_config.json", "config.json", "job.json", "run.json"):
+        path = folder / name
         if not path.is_file():
             continue
         data = _read_json(path)

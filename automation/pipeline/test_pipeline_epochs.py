@@ -411,6 +411,45 @@ class SheetTests(unittest.TestCase):
         self.assertIn("best", html)
 
 
+class SnapshotOfTests(unittest.TestCase):
+    """A seed run keeps its snapshot only in the folder layout, so reading it must not be a guess."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.project = FakeProject(self.root / "proj")
+        self.project.dir.mkdir(parents=True)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _seed_run(self, snapshot="abc123def456", *, snapshot_json=True):
+        base = self.project.dir / "seed_lora" / snapshot
+        base.mkdir(parents=True)
+        if snapshot_json:
+            (base / "snapshot.json").write_text("{}", encoding="utf-8")
+        run = base / "runs" / "demo_seed-0123456789abcdef"
+        run.mkdir(parents=True)
+        return run
+
+    def test_the_snapshot_is_read_from_the_seed_run_layout(self):
+        run = self._seed_run()
+        self.assertEqual(epochs._snapshot_of(self.project, run)["id"], "abc123def456")
+
+    def test_a_folder_that_only_looks_like_a_seed_run_is_not_trusted(self):
+        # Without snapshot.json the name is just a folder name; a stray directory must not become provenance.
+        run = self._seed_run(snapshot_json=False)
+        self.assertIsNone(epochs._snapshot_of(self.project, run))
+
+    def test_a_run_config_still_wins_when_the_path_says_nothing(self):
+        run = self.root / "elsewhere" / "demo_seed-0123456789abcdef"
+        run.mkdir(parents=True)
+        (run / "run_config.json").write_text('{"snapshot": "fromconfig12"}', encoding="utf-8")
+        found = epochs._snapshot_of(self.project, run)
+        self.assertEqual(found["id"], "fromconfig12")
+        self.assertEqual(found["source"], "run_config.json")
+
+
 class FindRunTests(unittest.TestCase):
     """Which run to evaluate: only ever one that was actually found."""
 
