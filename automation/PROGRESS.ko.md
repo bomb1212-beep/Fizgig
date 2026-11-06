@@ -1334,3 +1334,55 @@ paused: the remaining cells are still pending, so this command continues them
   실패할 수 있다. 그 경우도 "실패 (종료 코드 N)"으로 표시된다.
 - **미확인**: 에포크를 고르는 버튼(`choose`)과 홀드아웃 평가는 탭에 없다. 선택은 근거(런 ID·SHA·snapshot)를
   함께 적어야 하는 판단이라 CLI에 남겨 두었다.
+
+## 28. 새 시드 런 학습 — 실행 경로가 없어서 먼저 만들었다 (2026-11-06 20:40~21:20)
+
+사용자 지시("시작")로 새 시드 런을 학습했다. 시작 전 점검에서 **학습을 띄우는 운영 진입점이 없다**는 것이
+드러났다: `seed.train()`은 함수로는 존재하지만 `test_pipeline_seed.py`에서만 호출되고, `pipeline.seed`의 CLI는
+스냅샷 빌드까지만 했다. 이전 런은 아마 손으로 띄운 것으로 보인다. 재현할 수 없는 실행은 다음 사람이 다시 못 하므로
+`--train`을 CLI에 붙였다.
+
+```
+python -m pipeline.seed --project projects\suamom --build --train --epochs 30 [--rank N] [--learning-rate X] [--megapixels Y]
+```
+
+- `--train`은 `--build` 없이는 거부한다(`parser.error`, 종료 코드 2). 학습할 스냅샷을 추측하지 않는다.
+- `--build`만 주면 GPU를 쓰지 않는다. 스냅샷을 만들다 실패한 경우에 학습이 시작되면 안 되기 때문이다.
+- `--epochs`는 `target_steps = 이미지 수 × epochs`로 환산된다(27장 × 30 = 810스텝). "에포크"가 실제 패스 수가
+  되도록 하는 계산이고, 테스트가 이 관계를 확인한다.
+
+### 28.1 시작 전 점검 (모두 통과)
+
+| 항목 | 결과 |
+| --- | --- |
+| `queue.lock` | 없음(깨끗) |
+| VRAM | **26 GB 사용 중 → `/free` 호출로 4.2 GB로 확보**(28 GB 여유) |
+| 계보 | 후보 14장 모두 `generation=1`, `edit_depth=1`, `lineage_ids`·`decision_by` 기록됨 |
+| 입력 | **27장 = 원본 13 + 합성 14**(이전 기록의 "13장, 합성 0%"에서 늘어난 것은 사용자가 후보를 채택했기 때문) |
+| 캡션 | 27장 모두 존재, `caption_policy: preserve`(덮어쓰지 않음) |
+| 이전 런 | `090d024339ee` 그대로 — 손대지 않음 |
+
+### 28.2 설정
+
+`family=krea2, rank=8, lr=2e-4 (adaptive 2e-4~4e-4), megapixels=0.5, target_steps=810,
+save_every=27스텝(=1에포크마다 체크포인트), max_images_per_job=50`.
+
+### 28.3 실제 진행
+
+`suamom_seed-ad6f22f0225b794e`, 스냅샷 `2346944560f7`.
+
+- Cache Preparation → Text Encoder Caching → Training 순으로 진행.
+- `torch.compile`이 켜져 있어(`810 steps on the INT8 path ... compile pays back within ~600 steps`) 첫 스텝 전
+  **Triton 커널 컴파일**에 몇 분이 걸렸다. 이 동안 GPU 사용률 0%·스텝 0이었고, 컴파일이 끝나자 82~99%로 올라갔다.
+  **이 구간을 멈춤으로 오판하면 안 된다.**
+- 측정된 속도 **2.08 s/it** → 810스텝 ≈ 28분(이전 런은 1.52 s/it였는데, 이미지가 31→27장으로 줄고 rank·해상도는
+  같아도 컴파일 경로가 달라 단정하지 않는다).
+
+### 28.4 확인된 것 / 확인되지 않은 것
+
+- **확인**: `--train` 경로가 실제로 학습을 시작함, 새 런 폴더·체크포인트가 1에포크마다 저장됨, VRAM 28 GB로
+  충분함, 이전 런·스냅샷 무변경. 툴1 **544 통과**(540 → 544, CLI 테스트 4개 추가).
+- **미확인(중요)**: **학습이 끝난 뒤의 품질**은 사람이 봐야 한다. 에포크별 비교 시트(`pipeline.epochs sheet`)와
+  검수 페이지로 확인할 수 있지만, "이 캐릭터가 맞는가"는 자동 판정하지 않는다.
+- **미확인**: 이 런의 체크포인트도 **ComfyUI `models/loras` 밖**에 있으므로, 에포크 평가 그리드를 돌리려면
+  경로를 맞춰야 한다(§27.5의 환경 문제와 동일).

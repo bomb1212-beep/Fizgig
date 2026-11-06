@@ -1,4 +1,4 @@
-"""Tests for the project folder, the review page and the seed snapshot (spec 3.1, 4 M3-1/M4 core, tasks T1-T3)."""
+﻿"""Tests for the project folder, the review page and the seed snapshot (spec 3.1, 4 M3-1/M4 core, tasks T1-T3)."""
 import json
 import sys
 import tempfile
@@ -938,6 +938,51 @@ class SeedSnapshotTests(Base):
             seed.train(self.project, snapshot, config=config, python=sys.executable, log=lambda *_: None,
                        on_event=events.append)
         self.assertEqual([e["stage"] for e in events], ["Training"])
+
+
+class SeedCommandLineTests(Base):
+    """`--train` is the only reproducible way to start a seed run, so its guards are checked here."""
+
+    def setUp(self):
+        super().setUp()
+        # `--build` needs at least one eligible image; these tests are about the wiring, not about what qualifies.
+        self.project.import_sources([self.original("a.png"), self.original("b.png")], log=lambda *_: None)
+
+    def test_train_without_build_is_refused_before_anything_runs(self):
+        # Training a snapshot nobody built would need a fallback that does not exist; refuse rather than guess which
+        # snapshot was meant.
+        with self.assertRaises(SystemExit) as caught:
+            seed.main(["--project", str(self.project.dir), "--train"])
+        self.assertEqual(caught.exception.code, 2)
+
+    def test_build_alone_does_not_start_a_run(self):
+        import pipeline.seed as seed_module
+        trained = []
+        with _patched(seed_module, "train", lambda *a, **k: trained.append(k)):
+            seed.main(["--project", str(self.project.dir), "--build"])
+        self.assertEqual(trained, [], "--build must not spend GPU time on its own")
+
+    def test_build_train_passes_the_settings_through(self):
+        import pipeline.seed as seed_module
+        trained = []
+        with _patched(seed_module, "train", lambda _project, snapshot, **k: trained.append({"snapshot": snapshot, **k}) or self.root / "runs"):
+            seed.main(["--project", str(self.project.dir), "--build", "--train", "--epochs", "7",
+                       "--rank", "16", "--learning-rate", "0.0003", "--megapixels", "0.6"])
+        self.assertEqual(len(trained), 1)
+        config = trained[0]["config"]
+        self.assertEqual(config["rank"], 16)
+        self.assertAlmostEqual(config["learning_rate"], 0.0003)
+        self.assertAlmostEqual(config["megapixels"], 0.6)
+        # target_steps = images x epochs is what makes --epochs mean a real number of passes rather than a guess.
+        self.assertEqual(config["target_steps"], len(trained[0]["snapshot"]["inputs"]) * 7)
+
+    def test_the_default_epoch_count_is_stated_not_implied(self):
+        import pipeline.seed as seed_module
+        trained = []
+        with _patched(seed_module, "train", lambda _project, snapshot, **k: trained.append({"snapshot": snapshot, **k}) or self.root / "runs"):
+            seed.main(["--project", str(self.project.dir), "--build", "--train"])
+        self.assertEqual(trained[0]["config"]["target_steps"],
+                         len(trained[0]["snapshot"]["inputs"]) * 30)
 
 
 class _patched:

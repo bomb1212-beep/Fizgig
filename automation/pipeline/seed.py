@@ -695,7 +695,16 @@ def main(argv=None):
     parser.add_argument("--migrate-review", action="store_true", help="tag review history and move stated reasons")
     parser.add_argument("--apply", action="store_true", help="with --freeze-holdout/--migrate-review: really write")
     parser.add_argument("--build", action="store_true", help="build the snapshot")
+    parser.add_argument("--train", action="store_true",
+                        help="with --build: train the LoRA on the new snapshot once it is published")
+    parser.add_argument("--epochs", type=int, default=30,
+                        help="with --train: passes over the snapshot (target_steps = images x epochs)")
+    parser.add_argument("--rank", type=int, help="with --train: override the LoRA rank")
+    parser.add_argument("--learning-rate", type=float, help="with --train: override the learning rate")
+    parser.add_argument("--megapixels", type=float, help="with --train: override the training resolution budget")
     args = parser.parse_args(argv)
+    if args.train and not args.build:
+        parser.error("--train needs --build: it trains the snapshot that command writes")
 
     project = pj.Project.open(args.project)
     if args.migrate_review:
@@ -721,6 +730,15 @@ def main(argv=None):
     if args.build:
         snapshot = build_snapshot(project)
         print(f"snapshot {snapshot['id']} base={snapshot['base']} reused={snapshot['reused']}")
+        if args.train:
+            # Training needs the snapshot to exist first, and reuses it when it is already published and intact, so a
+            # rerun after a crash trains the same images rather than rebuilding them under a new id.
+            config = runner_config(project, snapshot, epochs=args.epochs, rank=args.rank,
+                                   learning_rate=args.learning_rate, megapixels=args.megapixels)
+            print(f"training {config['id']}: {len(snapshot['inputs'])} image(s) x {args.epochs} epochs "
+                  f"= {config['target_steps']} steps, save every ~{config['save_every_steps_approx']}")
+            runs = train(project, snapshot, config=config)
+            print(f"run folder {runs}")
     return 0
 
 
