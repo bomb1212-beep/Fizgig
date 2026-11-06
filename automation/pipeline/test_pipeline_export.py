@@ -383,6 +383,79 @@ class EvaluateTests(unittest.TestCase):
         with self.assertRaises(evaluate.EvalError):
             evaluate.holdout_family_report("krea2", {"scorer": "x", "rows": []}, references=[])
 
+
+class HoldoutDrawTests(unittest.TestCase):
+    """`--draw` is what turns the holdout from a printed plan into an actual measurement."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_a_family_the_draw_does_not_cover_is_refused_by_name(self):
+        # Drawing Qwen with a Krea2 graph would produce a plausible-looking wrong answer, so it must refuse.
+        class _Any:
+            card = {}
+
+        with self.assertRaises(evaluate.EvalError) as caught:
+            evaluate.draw_holdout(_Any(), family="qwen_image21", log=lambda *_: None)
+        self.assertIn("qwen_image21", str(caught.exception))
+
+    def test_the_holdout_folder_is_per_family(self):
+        # One folder for every family would mix a Krea2 draw with a Qwen draw and average two different scorers.
+        class _P:
+            dir = self.root
+
+        self.assertNotEqual(evaluate.holdout_dir(_P(), "krea2"), evaluate.holdout_dir(_P(), "qwen_image21"))
+
+    def test_an_already_drawn_cell_is_reused_rather_than_redrawn(self):
+        class _P:
+            dir = self.root
+            card = {}
+
+            def holdout_entry(self):
+                return {"ids": ["s_abc"]}
+
+            def index(self):
+                return {"s_abc": {"file": "abc.png"}}
+
+        folder = evaluate.holdout_dir(_P(), "krea2")
+        folder.mkdir(parents=True)
+        (folder / "s_abc__s7001.png").write_bytes(b"PNG")
+
+        drawn_calls = []
+
+        class _Client:
+            url = "http://test"
+
+            def ping(self):
+                return True
+
+            def name_for(self, kind, path):
+                return kind
+
+        # Reaching the graph builder would mean a redraw; the reuse path must return before that.
+        import pipeline.krea2_gen as gen_mod
+
+        class _Boom:
+            def build(self, *a, **k):
+                drawn_calls.append(1)
+                raise AssertionError("a cell that exists must not be redrawn")
+
+        saved = gen_mod.build
+        gen_mod.build = _Boom().build
+        try:
+            drawn, skipped, failed = evaluate.draw_holdout(
+                _P(), family="krea2", seeds=(7001,), client=_Client(), log=lambda *_: None)
+        finally:
+            gen_mod.build = saved
+        self.assertEqual(len(drawn), 1)
+        self.assertEqual(skipped, 1)
+        self.assertEqual(failed, [])
+        self.assertEqual(drawn_calls, [])
+
     def test_comparing_families_warns_when_the_scorers_differ(self):
         reports = [{"family": "krea2", "scorer": "clip_vision", "images": 2, "max": .9, "mean": .8, "median": .8},
                    {"family": "qwen_image21", "scorer": "arcface", "images": 2, "max": .5, "mean": .5, "median": .5}]

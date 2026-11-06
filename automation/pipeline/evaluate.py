@@ -298,6 +298,92 @@ def holdout_scores(project, generated, *, family, scorer="clip_vision", embedder
     return scores, refs, {"family": family}
 
 
+def holdout_dir(project, family):
+    return project.dir / "experiments" / "holdout" / family
+
+
+def draw_holdout(project, *, family="krea2", seeds=(7001, 7002), seeds_always=True, client=None, log=print,
+                 cancel=None):
+    """Draw the holdout prompts with the chosen final LoRA, for one family.
+
+    This is the half the CLI used to leave to the operator. It reuses the same graph the epoch grid uses, so a holdout
+    picture is drawn exactly the way a training-set picture is - the only difference is that the prompt was never
+    trained on. A cell that is already on disk is kept, so a rerun after a crash does not redraw what exists.
+    """
+    from . import batch_gen, krea2_gen, epochs as epochs_mod, models
+
+    if family != "krea2":
+        raise EvalError(f"the holdout draw is only wired for krea2 so far; asked for {family!r}")
+    prompts = holdout_prompts(project)
+    if not prompts:
+        raise EvalError("no holdout is frozen for this project")
+    out_dir = holdout_dir(project, family)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    size = (project.card.get("krea2_inference") or {}).get("size") or {}
+    width = int(size.get("width") or 1024)
+    height = int(size.get("height") or 1536)
+
+    drawn, skipped, failed = [], 0, []
+
+    def _existing():
+        found = []
+        for row in prompts:
+            for seed in seeds:
+                out = out_dir / f'{row["id"]}__s{seed}.png'
+                if out.is_file():
+                    found.append((f'{row["id"]}__s{seed}', out))
+        return found
+
+    # Everything asked for may already be on disk; then no LoRA is looked up at all, so a rerun after choosing a
+    # different epoch cannot be blocked by a project that no longer has one.
+    present = _existing()
+    if len(present) == len(prompts) * len(seeds):
+        return present, len(present), failed
+
+    lora_path = batch_gen.character_lora_path(project)
+    client = client or epochs_mod.make_client(None)
+    if not client.ping():
+        raise EvalError(f"ComfyUI is not answering at {client.url}")
+
+    resolved = models.resolve(family)
+    names = {
+        "b_unet": client.name_for("unet", resolved["krea2_raw_dit"]),
+        "speed_lora": client.name_for("lora", resolved["krea2_turbo_lora"]),
+        "clip": client.name_for("clip", resolved["krea2_text_encoder"]),
+        "vae": client.name_for("vae", resolved["krea2_vae"]),
+        "character_lora": client.name_for("lora", str(lora_path)),
+    }
+
+    for row in prompts:
+        for seed in seeds:
+            out = out_dir / f'{row["id"]}__s{seed}.png'
+            if out.is_file():
+                drawn.append((f'{row["id"]}__s{seed}', out))
+                skipped += 1
+                continue
+            if cancel is not None and cancel():
+                log("cancelled")
+                return drawn, skipped, failed
+            try:
+                graph = krea2_gen.build(
+                    "b", unet=names["b_unet"], clip=names["clip"], vae=names["vae"], prompt=row["prompt"],
+                    width=width, height=height, seed=seed, character_lora=names["character_lora"],
+                    speed_lora=names["speed_lora"],
+                    filename_prefix=f"pipeline_holdout/{row['id']}_s{seed}",
+                )
+                client.run(graph, out, slot_id=row["id"], method="krea2_b_holdout", seed=seed)
+                drawn.append((f'{row["id"]}__s{seed}', out))
+                log(f'  {row["id"]} s{seed}: drawn')
+            except Exception as exc:  # noqa: BLE001 - one failed cell must not lose the others
+                failed.append({"id": row["id"], "seed": seed, "error": f"{type(exc).__name__}: {exc}"})
+                log(f'  {row["id"]} s{seed}: FAILED {exc}')
+    return drawn, skipped, failed
+
+
+def _fmt(value):
+    return "—" if value is None else f"{value:.4f}"
+
+
 def main(argv=None):
     import argparse
     import sys
@@ -307,6 +393,11 @@ def main(argv=None):
     parser.add_argument("--project", required=True)
     parser.add_argument("--scores", help="path to the M0 scores.csv for the agreement report")
     parser.add_argument("--automatic", help="path to a scores.json from pipeline.score")
+    parser.add_argument("--family", default="krea2", help="which family to draw and score (holdout)")
+    parser.add_argument("--seeds", default="7001,7002", help="comma-separated seeds (holdout)")
+    parser.add_argument("--draw", action="store_true", help="really draw the holdout prompts (needs ComfyUI)")
+    parser.add_argument("--score", action="store_true", help="score what was drawn against the holdout originals")
+    parser.add_argument("--comfy", default=None)
     parser.add_argument("--out", help="where to write the report")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
@@ -315,17 +406,48 @@ def main(argv=None):
 
     if args.command == "holdout":
         prompts = holdout_prompts(project)
-        if args.json:
+        if args.json and not (args.draw or args.score):
             print(json.dumps(prompts, ensure_ascii=False, indent=1))
             return 0
         if not prompts:
             print("no holdout is frozen for this project")
             return 0
-        print(f"{len(prompts)} holdout original(s); draw these prompts with the final LoRA of each family:")
-        for row in prompts:
-            print(f'  {row["id"]}  {Path(row["file"]).name}')
-        print(f'  prompt: {prompts[0]["prompt"]}')
-        print("\nscoring needs the drawn pictures, so run this once a final LoRA exists")
+
+        drawn, skipped, failed = [], 0, []
+        if args.draw:
+            seeds = tuple(int(s) for s in str(args.seeds).split(",") if s.strip())
+            drawn, skipped, failed = draw_holdout(project, family=args.family, seeds=seeds,
+                                                  client=None if not args.comfy else _client(args.comfy))
+            print(f"holdout draw: {len(drawn)} image(s), {skipped} already present, {len(failed)} failed")
+            for row in failed:
+                print(f'  FAILED {row["id"]} s{row["seed"]}: {row["error"][:160]}')
+            if failed and not drawn:
+                return 1
+        if not args.score:
+            if not args.draw:
+                print(f"{len(prompts)} holdout original(s); draw these prompts with the final LoRA of each family:")
+                for row in prompts:
+                    print(f'  {row["id"]}  {Path(row["file"]).name}')
+                print(f'  prompt: {prompts[0]["prompt"]}')
+                print("\nadd --draw to draw them, or --score to score what is already drawn")
+            return 0
+
+        folder = holdout_dir(project, args.family)
+        on_disk = sorted(folder.glob("*.png")) if folder.is_dir() else []
+        pairs = [(path.stem, path) for path in on_disk]
+        if not pairs:
+            raise EvalError(f"nothing drawn in {folder}; run again with --draw")
+        scores, refs, _meta = holdout_scores(project, pairs, family=args.family)
+        report = holdout_family_report(args.family, scores, references=refs)
+        print(f'{args.family}: {report["images"]} image(s) scored, max {_fmt(report["max"])}, '
+              f'mean {_fmt(report["mean"])}, median {_fmt(report["median"])}')
+        if report["unscored"]:
+            print(f'  {len(report["unscored"])} image(s) carry no score: {", ".join(report["unscored"][:5])}')
+        if args.out:
+            path = write_report(args.out, {"families": [report]}, title=f"{args.family} holdout evaluation")
+            print(f"wrote {path}")
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False, indent=1, default=str))
         return 0
 
     if not args.scores or not args.automatic:
@@ -340,6 +462,11 @@ def main(argv=None):
     if args.json:
         print(json.dumps({k: v for k, v in report.items() if k != "pairs"}, ensure_ascii=False, indent=1))
     return 0
+
+
+def _client(url):
+    from . import epochs as epochs_mod
+    return epochs_mod.make_client(url)
 
 
 if __name__ == "__main__":
