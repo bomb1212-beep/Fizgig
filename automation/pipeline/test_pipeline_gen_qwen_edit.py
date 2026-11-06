@@ -276,6 +276,40 @@ class HoldoutTests(SnapshotTests):
         self.assertEqual(snap["missing_references"], ["front.png"])
         self.assertTrue(any("needs these excluded inputs" in line for line in lines))
 
+    def test_the_snapshot_entry_no_longer_names_the_excluded_file(self):
+        """tool2 refuses to plan when a listed reference is absent, so the snapshot's own entry must not list it."""
+        self.config.write_text(json.dumps({
+            "comfy_url": "http://127.0.0.1:8190", "resolution": 1024, "base_seed": 1000, "seeds_per_job": 1,
+            "models": {"unet": "u", "clip": "c", "vae": "v"},
+            "characters": [{"folder": "tester", "trigger": "trg",
+                            "edit_bases": ["front.png", "side.png"],
+                            "figure_refs": ["front.png"],
+                            "sheet_face": "front.png"}],
+        }, ensure_ascii=False), encoding="utf-8")
+        card = json.loads(json.dumps(self.card))
+        card["holdout"] = {"ids": [], "files": ["front.png"], "shas": [], "reason": "frozen"}
+        snap = gen.build_snapshot(self.project, card, paths=self.paths, log=lambda *_: None)
+        entry = json.loads(Path(snap["config"]).read_text(encoding="utf-8"))["characters"][0]
+        self.assertEqual(entry["edit_bases"], ["side.png"])
+        self.assertNotIn("figure_refs", entry, "a reference key with nothing left is removed, not left empty")
+        self.assertNotIn("sheet_face", entry)
+        self.assertEqual({row["key"] for row in snap["dropped_references"]},
+                         {"edit_bases", "figure_refs", "sheet_face"})
+        # the real tool2 config is untouched
+        self.assertIn("front.png", json.loads(self.config.read_text(encoding="utf-8"))["characters"][0]["edit_bases"])
+
+    def test_the_snapshot_id_does_not_move_when_references_are_scrubbed(self):
+        """Dropping a name from the entry must not split one run into two snapshot folders."""
+        before = self.snapshot()
+        card = json.loads(json.dumps(self.card))
+        card["holdout"] = {"ids": [], "files": ["front.png"], "shas": [], "reason": "frozen"}
+        after = gen.build_snapshot(self.project, card, paths=self.paths, log=lambda *_: None)
+        self.assertNotEqual(before["id"], after["id"],
+                            "the input set really did change here, so a new snapshot is correct")
+        # same input set, different entry wording: the id follows the bytes, not the reference lists
+        again = gen.build_snapshot(self.project, card, paths=self.paths, log=lambda *_: None)
+        self.assertEqual(after["id"], again["id"])
+
 
 class ProjectImportTests(SnapshotTests):
     """T4: importing into a real project keeps what the project already had, and can be resumed."""
@@ -436,6 +470,89 @@ class SlotRestoreTests(unittest.TestCase):
         self.assertTrue(report["unresolved"])
         for record in self.project.candidates():
             self.assertFalse(record["slot"].get("slot_id"))
+
+
+class SlotAssignTests(unittest.TestCase):
+    """T4: a new run's images must be counted by the same slot vocabulary the project already uses."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.temp.name)
+        from pipeline import project as pj
+        self.project = pj.Project.create("demo", {"id": "demo"}, folder=self.dir / "project")
+        self.added = []
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def candidate(self, name, prompt, category="expressions"):
+        from pipeline import lineage
+        path = self.dir / name
+        path.write_bytes(("IMAGE-" + name).encode())
+        record = lineage.record(path, generator="qwen_edit", parent_ids=["s_1"], train_generation=1, edit_depth=1,
+                                slot={"category": category}, prompt=prompt, stem=Path(name).stem)
+        self.project.import_candidates([record], log=lambda *_: None)
+        self.added.append(record["id"])
+        return record["id"]
+
+    def test_a_smile_and_a_classroom_get_their_slots(self):
+        from pipeline import gen_qwen_edit as gen
+        # tool2's own wording: "smiling", "classroom" (the slot table has to recognise both)
+        smile = self.candidate("expressions_00.png", "suamom, korean webtoon style, smiling, closed eyes, happy")
+        room = self.candidate("backgrounds_00.png", "suamom, korean webtoon style, classroom, indoors, day",
+                              category="backgrounds")
+        report = gen.assign_slots(self.project, log=lambda *_: None)
+        slots = {row["id"]: row["slot_id"] for row in report["assigned"]}
+        self.assertEqual(slots[smile], "exp_smile")
+        self.assertEqual(slots[room], "bg_classroom")
+        stored = {r["id"]: r["slot"]["slot_id"] for r in self.project.candidates()}
+        self.assertEqual(stored[smile], "exp_smile")
+
+    def test_an_image_that_fits_no_slot_is_left_without_one(self):
+        from pipeline import gen_qwen_edit as gen
+        vague = self.candidate("expressions_99.png", "suamom, korean webtoon style")
+        report = gen.assign_slots(self.project, log=lambda *_: None)
+        self.assertEqual([row["id"] for row in report["unmatched"]], [vague])
+        self.assertNotIn("slot_id", self.project.candidate_by_id(vague)["slot"])
+
+    def test_a_frame_word_does_not_move_a_background_into_an_angle_slot(self):
+        """A background edit keeps the original frame, so its caption says "from above, upper body"."""
+        from pipeline import gen_qwen_edit as gen
+        rooftop = self.candidate(
+            "backgrounds_04.png",
+            "Replace the background with a school rooftop. suamom, korean webtoon style, rooftop, sunset, upper body, "
+            "from above, leaning forward, looking at viewer", category="backgrounds")
+        room = self.candidate(
+            "backgrounds_00.png",
+            "Replace the background with a classroom. suamom, korean webtoon style, classroom, upper body, from above",
+            category="backgrounds")
+        report = gen.assign_slots(self.project, log=lambda *_: None)
+        slots = {row["id"]: row["slot_id"] for row in report["assigned"]}
+        self.assertEqual(slots[room], "bg_classroom")
+        self.assertEqual([row["id"] for row in report["unmatched"]], [rooftop],
+                         "a rooftop has no slot in the plan; it must not be filed as an angle")
+
+    def test_two_images_for_one_slot_are_reported_not_resolved(self):
+        from pipeline import gen_qwen_edit as gen
+        first = self.candidate("expressions_00.png", "suamom, korean webtoon style, smiling")
+        second = self.candidate("expressions_01.png", "suamom, korean webtoon style, smiling, closed eyes")
+        report = gen.assign_slots(self.project, log=lambda *_: None)
+        self.assertEqual(len(report["assigned"]), 2)
+        self.assertEqual(report["shared"], {"exp_smile": 2})
+        self.assertEqual({self.project.candidate_by_id(first)["slot"]["slot_id"],
+                          self.project.candidate_by_id(second)["slot"]["slot_id"]}, {"exp_smile"})
+
+    def test_a_candidate_that_already_has_a_slot_is_left_alone(self):
+        from pipeline import gen_qwen_edit as gen
+        self.candidate("expressions_00.png", "suamom, korean webtoon style, smiling")
+        gen.assign_slots(self.project, log=lambda *_: None)
+        record = self.project.candidates()[0]
+        record["slot"]["slot_source"] = "kept"
+        from pipeline import lineage
+        lineage.write_jsonl(self.project.dir / "candidates.jsonl", [record])
+        report = gen.assign_slots(self.project, log=lambda *_: None)
+        self.assertEqual(report["assigned"], [])
+        self.assertEqual(self.project.candidates()[0]["slot"]["slot_source"], "kept")
 
 
 class WiringTests(unittest.TestCase):

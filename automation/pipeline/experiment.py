@@ -67,7 +67,9 @@ SLOTS = [
     {"id": "frm_from_above", "category": "framing", "prompt": "from above, full body, looking down",
      "match": [["from above"]]},
     {"id": "exp_smile", "category": "expressions", "prompt": "smile, looking at viewer",
-     "match": [["smile"]]},
+     # tool2's own caption for this job is "smiling", which does not contain "smile": the vocabulary has to cover both
+     # spellings or the slot cannot recognise the picture it asked for.
+     "match": [["smile", "smiling"]]},
     {"id": "exp_angry", "category": "expressions", "prompt": "angry expression, clenched teeth, looking at viewer",
      "match": [["angry"]]},
     {"id": "exp_sad", "category": "expressions", "prompt": "crying, tear drop, looking down",

@@ -324,7 +324,9 @@ class Project:
     """One character's folder: its card, its sources, its candidates and its review decisions."""
 
     def __init__(self, folder, card):
-        self.dir = Path(folder)
+        # Absolute from the start: a record written with a relative path means something different in every process
+        # that opens the project, and `file` values are recorded for whoever opens it later.
+        self.dir = Path(folder).resolve()
         self.card = card
 
     # ------------------------------------------------------------------ opening
@@ -623,6 +625,42 @@ class Project:
         return num, skipped
 
     # ------------------------------------------------------------------ migration
+    def normalize_paths(self, *, apply=True, log=print):
+        """Rewrite recorded file paths to absolute ones, so a record stops depending on the working directory.
+
+        Records were written three ways over the project's life: relative to the project, relative to `automation/`,
+        and absolute. `resolve_file` reads all three, but a new record should not add a fourth interpretation to the
+        pile; this rewrites what exists and reports what it could not resolve instead of guessing.
+        """
+        records = self.candidates()
+        changed, unresolved = [], []
+        for record in records:
+            raw = str(record.get("file") or "")
+            if not raw:
+                continue
+            resolved = self.resolve_file(raw)
+            if resolved is None or not resolved.is_file():
+                unresolved.append({"id": record["id"], "file": raw})
+                continue
+            if raw != str(resolved):
+                record["file"] = str(resolved)
+                changed.append({"id": record["id"], "from": raw, "to": str(resolved)})
+        sources = self.source_records()
+        for record in sources:
+            raw = str(record.get("file") or "")
+            if not raw:
+                continue
+            resolved = self.resolve_file(raw)
+            if resolved is not None and resolved.is_file() and raw != str(resolved):
+                record["file"] = str(resolved)
+                changed.append({"id": record["id"], "from": raw, "to": str(resolved)})
+        log(f"[paths] {len(changed)} record(s) made absolute, {len(unresolved)} unresolved")
+        if apply and changed:
+            with self.guard():
+                lineage.write_jsonl(self.dir / "candidates.jsonl", records)
+                lineage.write_jsonl(self.dir / "sources.jsonl", sources)
+        return {"changed": changed, "unresolved": unresolved}
+
     def review_plan(self):
         """What the review history would look like after the migration, and why (reported before it is written).
 

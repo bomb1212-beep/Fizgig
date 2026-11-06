@@ -50,6 +50,37 @@ def holdout_from_card(card):
             "shas": list(holdout.get("shas") or []), "reason": holdout.get("reason", "")}
 
 
+def scrub_references(entry, dropped_names):
+    """The character entry with the excluded files taken out of every reference it names.
+
+    Removing a holdout from the copied folder is not enough: tool2's entry names its edit bases, figure references and
+    sheet face by file name, and `pick()` refuses to plan when a named file is absent. So the snapshot's own copy of
+    the entry drops those names too - the real `dataset_jobs.json` is never edited - and a key that loses all of its
+    names is removed so tool2 falls back to its documented default instead of being handed an empty list.
+    """
+    scrubbed = dict(entry)
+    removed = []
+    for key in REFERENCE_KEYS:
+        value = scrubbed.get(key)
+        if isinstance(value, str):
+            if value in dropped_names:
+                scrubbed.pop(key)
+                removed.append({"key": key, "removed": [value]})
+            continue
+        if not isinstance(value, (list, tuple)):
+            continue
+        gone = [str(item) for item in value if item in dropped_names]
+        if not gone:
+            continue
+        kept = [item for item in value if item not in dropped_names]
+        removed.append({"key": key, "removed": gone})
+        if kept:
+            scrubbed[key] = kept
+        else:
+            scrubbed.pop(key)
+    return scrubbed, removed
+
+
 def named_references(entry):
     """The input file names a character entry points at, whichever of the reference keys it uses."""
     out = []
@@ -132,18 +163,20 @@ def build_snapshot(project_dir, card, *, exclude=(), holdout=None, tool2_config=
     Both the copied folder and the snapshot's own settings record the exclusion, so which images a run could see is
     answerable afterwards from either one.
     """
-    project_dir = Path(project_dir)
+    project_dir = Path(project_dir).resolve()
     char = card.get("tool2") or {}
     folder = char.get("character") or card.get("id")
     if not folder:
         raise ValueError("the card has no tool2.character and no id to fall back to")
-    config_path = Path(tool2_config or char.get("config") or "")
+    # Every path that travels to tool2 is absolute: tool2 runs with its own folder as the working directory, so a
+    # relative `--project` would hand it a config path it cannot find.
+    config_path = Path(tool2_config or char.get("config") or "").resolve()
     tool2_cfg = read_json(config_path)
     if not tool2_cfg:
         raise ValueError(f"tool2's config could not be read: {config_path}")
     entry = character_in(tool2_cfg, folder)
     paths = paths or tool_paths()
-    batch = Path(paths.get("batch") or "")
+    batch = Path(paths.get("batch") or "").resolve()
     if not batch.is_file():
         raise ValueError(f"tool2's CLI is missing: {batch or '(not configured)'}")
     graph_version = tool_graph_version(batch)
@@ -178,6 +211,9 @@ def build_snapshot(project_dir, card, *, exclude=(), holdout=None, tool2_config=
     if missing_references:
         log(f"[gen_qwen_edit] warning: the character needs these excluded inputs as references: "
             f"{', '.join(missing_references)}; the run cannot show what it was asked for without them")
+    snapshot_entry, dropped_references = scrub_references(entry, {row["name"] for row in dropped})
+    for row in dropped_references:
+        log(f"[gen_qwen_edit] {row['key']}: dropped excluded reference(s) {', '.join(row['removed'])}")
 
     sources = []
     for path in kept:
@@ -197,14 +233,15 @@ def build_snapshot(project_dir, card, *, exclude=(), holdout=None, tool2_config=
         if not dest.exists():
             shutil.copy2(path, dest)               # bytes, not a link: the snapshot must not follow a later edit
     snapshot_cfg = dict(tool2_cfg)
-    snapshot_cfg["characters"] = [{**entry, "excluded_inputs": sorted({row["name"] for row in dropped})}]
+    snapshot_cfg["characters"] = [{**snapshot_entry, "excluded_inputs": sorted({row["name"] for row in dropped})}]
     (base / "config.json").write_text(json.dumps(snapshot_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
     result = {
         "id": ident, "base": str(base), "config": str(base / "config.json"), "chars": str(chars_dir),
         "out": str(out_dir), "result_json": str(base / "result.json"), "character": folder,
         "graph_version": graph_version, "tool2_batch": str(batch), "tool2_python": paths.get("python") or sys.executable,
         "tool2_config": str(config_path), "excluded": sorted({row["name"] for row in dropped}),
-        "excluded_detail": dropped, "missing_references": missing_references, "holdout": holdout,
+        "excluded_detail": dropped, "missing_references": missing_references,
+        "dropped_references": dropped_references, "holdout": holdout,
         "sources": sources, "source_hashes": {r["src_path"]: r["sha256"] for r in sources},
     }
     (base / "snapshot.json").write_text(json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -440,6 +477,9 @@ def import_candidates(project_dir, card, snapshot, result, *, log=print):
         for item in project_skipped:
             skipped.append({"file": item["id"], "reason": item["reason"]})
         records = [r for r in records if r["id"] not in {s.get("id") for s in project_skipped}]
+        if records:
+            # The run's slot vocabulary is the project's: a new image is counted by the quota board the moment it lands.
+            assign_slots(project, [record["id"] for record in records], log=log)
     else:
         written = lineage.append_jsonl(project_dir / "candidates.jsonl", records)
         log(f"[gen_qwen_edit] {written} new candidate(s) in {project_dir / 'candidates.jsonl'}")
@@ -506,6 +546,68 @@ def restore_slots(project, exp_dir, *, apply=True, log=print):
     return {"restored": restored, "ambiguous": ambiguous, "unresolved": unresolved}
 
 
+def slot_for(record, slots):
+    """The project slot a candidate was asked for, from the prompt and caption it carries, or None.
+
+    tool2's own job category (`expressions_*`, `backgrounds_*`, ...) is the first word of the stem and its vocabulary is
+    exactly the project's slot categories, so it decides which slots are even candidates: a background edit's caption
+    mentions "from above" and "upper body" because that is the frame it was asked to keep, and letting those words pick
+    an angle slot would file the picture under a job nobody asked for. Within the category the rule is the M0 harness's
+    (`experiment.match_slot`): the text has to satisfy every alternative group and the strongest match wins.
+    """
+    lowered = " ".join(str(part or "") for part in (record.get("prompt"), record.get("caption"),
+                                                    record.get("stem"))).lower()
+    if not lowered.strip():
+        return None
+    category = (record.get("slot") or {}).get("category") or _category_of(record.get("stem", "")) or ""
+    pool = [slot for slot in slots if slot["category"] == category] or slots
+    best, best_score = None, 0
+    for slot in pool:
+        if not all(any(alt.lower() in lowered for alt in group) for group in slot["match"]):
+            continue
+        hits = sum(1 for group in slot["match"] for alt in group if alt.lower() in lowered)
+        if hits > best_score:
+            best, best_score = slot, hits
+    return best
+
+
+def assign_slots(project, candidate_ids=None, *, apply=True, log=print):
+    """Give new candidates the project's slot ids, so the quota board counts them like the older ones.
+
+    Old candidates get theirs from the manifest (`restore_slots`); a new run's candidate has to be read from what was
+    asked for. Several images can land on one slot (a seed each, a stricter prompt), which is reported, not resolved:
+    the reviewer is the one who picks.
+    """
+    from pipeline import experiment
+
+    slots = experiment.SLOTS
+    records = project.candidates()
+    wanted = set(candidate_ids) if candidate_ids is not None else None
+    assigned, unmatched = [], []
+    for record in records:
+        if wanted is not None and record["id"] not in wanted:
+            continue
+        slot = dict(record.get("slot") or {})
+        if slot.get("slot_id"):
+            continue
+        match = slot_for(record, slots)
+        if match is None:
+            unmatched.append({"id": record["id"], "category": slot.get("category")})
+            continue
+        record["slot"] = {**slot, "slot_id": match["id"], "category": match.get("category", slot.get("category")),
+                          "slot_source": "matched from the prompt against the project's slot table"}
+        assigned.append({"id": record["id"], "slot_id": match["id"]})
+    if apply and assigned:
+        lineage.write_jsonl(project.dir / "candidates.jsonl", records)
+    counts = {}
+    for row in assigned:
+        counts[row["slot_id"]] = counts.get(row["slot_id"], 0) + 1
+    shared = {slot: count for slot, count in counts.items() if count > 1}
+    log(f"[gen_qwen_edit] slots: {len(assigned)} assigned, {len(unmatched)} without a slot"
+        + (f"; slots with more than one candidate: {shared}" if shared else ""))
+    return {"assigned": assigned, "unmatched": unmatched, "shared": shared}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Generator A: run tool2 for a project and import the candidates")
     parser.add_argument("--project", required=True, help="project folder (holds project.json or a card json)")
@@ -519,12 +621,20 @@ def main(argv=None):
                         help="import an existing result without running (no GPU work is submitted)")
     parser.add_argument("--restore-slots", metavar="EXPERIMENT_DIR",
                         help="give candidates the slot ids an experiment manifest recorded for their bytes")
+    parser.add_argument("--assign-slots", action="store_true",
+                        help="give candidates the project slot id their own prompt asks for (no GPU work)")
     args = parser.parse_args(argv)
 
     project_dir = Path(args.project)
     card = read_json(args.card or project_dir / "project.json")
     if not card:
         raise SystemExit(f"no card found at {args.card or project_dir / 'project.json'}")
+    if args.assign_slots:
+        project = open_project(project_dir)
+        if project is None:
+            raise SystemExit("--assign-slots needs a project folder")
+        assign_slots(project)
+        return 0
     if args.restore_slots:
         project = open_project(project_dir)
         if project is None:

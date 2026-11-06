@@ -264,6 +264,34 @@ class ProjectTests(Base):
                   "generator": "qwen_edit"}
         self.assertEqual(self.project.resolve_file(record["file"]).name, "abc.png")
 
+    def test_recorded_paths_become_absolute(self):
+        """A record must not mean something different in every process that opens the project."""
+        record = self.candidate("a.png")
+        stored = self.project.dir / "candidates" / "qwen_edit" / "manual"
+        stored.mkdir(parents=True, exist_ok=True)
+        import shutil
+        shutil.copy2(self.project.candidate_by_id(record["id"])["file"], stored / "abc.png")
+        from pipeline import lineage
+        rows = [dict(r) for r in self.project.candidates()]
+        rows[0]["file"] = "candidates/qwen_edit/manual/abc.png"      # the way an early run wrote it
+        lineage.write_jsonl(self.project.dir / "candidates.jsonl", rows)
+        self.assertFalse(Path(rows[0]["file"]).is_absolute())
+        report = self.project.normalize_paths(log=lambda *_: None)
+        self.assertEqual(len(report["changed"]), 1)
+        fixed = self.project.candidate_by_id(record["id"])["file"]
+        self.assertTrue(Path(fixed).is_absolute())
+        self.assertTrue(Path(fixed).is_file())
+
+    def test_a_new_project_keeps_absolute_paths_even_when_opened_relatively(self):
+        import os
+        here = os.getcwd()
+        try:
+            os.chdir(self.root)
+            project = pj.Project.open("demo")
+            self.assertTrue(project.dir.is_absolute())
+        finally:
+            os.chdir(here)
+
     def test_the_lock_refuses_a_second_owner_and_only_its_owner_releases_it(self):
         with self.project.lock():
             lock_path = self.project.dir / "pipeline.lock"
