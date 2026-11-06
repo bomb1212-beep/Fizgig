@@ -325,7 +325,13 @@ def plan(project, *, slots=None, seeds=None, source_ids=None, force=False, log=p
 
 
 def run(project, manifest, *, client, log=print, cancel=None):
-    """Draw every pending task. A task whose file exists is skipped, so re-running submits nothing twice."""
+    """Draw every pending task. Re-running submits nothing new - and reuses nothing it cannot vouch for.
+
+    Before a task is submitted its source is re-checked against the sha the plan pinned: a parent whose bytes changed
+    since planning fails that task instead of editing pixels nobody recorded (spec R4). A task whose file exists is
+    skipped only when the file decodes and hashes to the sha recorded when it was drawn; anything else - a truncated
+    write, a picture left by a plan that named a different parent - is drawn again.
+    """
     folder = manifest_path(project).parent
     names = ph3_gen.resolve_names(client)
     # LoadImage cannot open a local path; the reference has to be uploaded first and referred to by the returned name.
@@ -333,7 +339,7 @@ def run(project, manifest, *, client, log=print, cancel=None):
     done = skipped = failed = 0
     for task in manifest["tasks"]:
         out = folder / task["file"]
-        if out.is_file():
+        if out.is_file() and _reusable(out, task, log):
             task["status"] = "done"
             skipped += 1
             continue
@@ -343,6 +349,9 @@ def run(project, manifest, *, client, log=print, cancel=None):
         started = time.time()
         try:
             path = task["source_path"]
+            pinned_sha = task.get("source_sha256")
+            if pinned_sha and lineage.sha256_file(path) != pinned_sha:
+                raise EditError(f"the source picture changed since the plan pinned it: {task['source_id']}")
             if path not in upload_cache:
                 upload_cache[path] = client.upload(path)
             graph = ph3_gen.build(
@@ -355,6 +364,7 @@ def run(project, manifest, *, client, log=print, cancel=None):
             out.parent.mkdir(parents=True, exist_ok=True)
             client.run(graph, out, slot_id=task["slot_id"], method=METHOD, seed=task["seed"])
             task["status"] = "done"
+            task["sha256"] = lineage.sha256_file(out)
             done += 1
             log(f"  {task['slot_id']} s{task['seed']}: {time.time() - started:.0f}s")
         except Exception as exc:  # noqa: BLE001 - one failed edit must not end the batch
@@ -369,6 +379,17 @@ def run(project, manifest, *, client, log=print, cancel=None):
     write_manifest(project, manifest)
     log(f"done {done}, skipped {skipped} already present, failed {failed}")
     return manifest
+
+
+def _reusable(path, task, log):
+    """Is the file at a task's path the output that task recorded? Anything else is drawn again."""
+    if not lineage.image_decodes(path):
+        log(f"  {task['slot_id']} s{task['seed']}: the file on disk does not decode; drawing it again")
+        return False
+    recorded = task.get("sha256")
+    if not recorded:
+        return False               # no recorded bytes: an earlier plan's file, or a crashed write - redraw
+    return lineage.sha256_file(path) == recorded
 
 
 def _child_shape(project, task):
@@ -401,6 +422,8 @@ def records_of(project, manifest):
         out = folder / task["file"]
         if not out.is_file():
             continue
+        if task.get("sha256") and lineage.sha256_file(out) != task["sha256"]:
+            continue               # the file on disk is not the bytes the plan recorded: not this plan's output
         generation, depth = _child_shape(project, task)
         slot = {"slot_id": task["slot_id"], "category": task["category"], "prompt": task["instruction"]}
         records.append(lineage.record(

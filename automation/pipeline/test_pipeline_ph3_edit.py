@@ -284,6 +284,90 @@ class RecordTests(_Base):
         self.assertEqual(excluded.get(record["id"]), "generator_not_eligible")
 
 
+class RunTests(_Base):
+    """The draw loop's resume rules, exercised with a fake ComfyUI client (spec R4)."""
+
+    def client(self):
+        class Fake:
+            def __init__(self):
+                self.uploads, self.runs = [], []
+
+            def name_for(self, kind, name):
+                return name
+
+            def upload(self, path):
+                self.uploads.append(str(path))
+                return Path(path).name
+
+            def run(self, graph, out, slot_id=None, method=None, seed=None):
+                self.runs.append({"slot_id": slot_id, "seed": seed})
+                from PIL import Image
+                Path(out).parent.mkdir(parents=True, exist_ok=True)
+                Image.new("RGB", (8, 8), (5, 10, 15)).save(out)
+                return out
+
+        return Fake()
+
+    def manifest_with_one_task(self, source_path, source_sha):
+        return {
+            "kind": "ph3_edit", "steps": 8, "status": "planned",
+            "tasks": [{"slot_id": "frm_back", "category": "framing", "seed": 7001,
+                       "instruction": "show the back", "source_id": "s_1", "source_path": str(source_path),
+                       "source_sha256": source_sha, "generation": 1, "edit_depth": 1,
+                       "file": "frm_back_s7001.png", "status": "pending", "sha256": None}],
+        }
+
+    def test_a_source_that_changed_since_planning_fails_the_task_without_submitting(self):
+        self.import_two_originals()
+        first = self.project.source_records()[0]
+        resolved = self.project.resolve_file(first.get("file") or first.get("src_path"))
+        resolved.write_bytes(b"\x89PNG\r\n\x1a\nswapped-bytes")
+        client = self.client()
+        manifest = self.manifest_with_one_task(resolved, first["sha256"])
+        ph3_edit.run(self.project, manifest, client=client, log=lambda *_: None)
+        self.assertEqual(client.runs, [], "a parent whose bytes moved is not edited")
+        self.assertEqual(manifest["tasks"][0]["status"], "failed")
+        self.assertIn("changed since the plan pinned it", manifest["tasks"][0]["error"])
+
+    def test_a_drawn_task_records_its_sha_and_a_rerun_skips_it(self):
+        self.import_two_originals()
+        first = self.project.source_records()[0]
+        resolved = self.project.resolve_file(first.get("file") or first.get("src_path"))
+        client = self.client()
+        manifest = self.manifest_with_one_task(resolved, first["sha256"])
+        ph3_edit.run(self.project, manifest, client=client, log=lambda *_: None)
+        self.assertEqual(len(client.runs), 1)
+        self.assertTrue(manifest["tasks"][0].get("sha256"))
+        second = self.client()
+        ph3_edit.run(self.project, manifest, client=second, log=lambda *_: None)
+        self.assertEqual(second.runs, [], "the recorded output is reused, not redrawn")
+
+    def test_a_file_that_does_not_decode_is_drawn_again(self):
+        self.import_two_originals()
+        first = self.project.source_records()[0]
+        resolved = self.project.resolve_file(first.get("file") or first.get("src_path"))
+        client = self.client()
+        manifest = self.manifest_with_one_task(resolved, first["sha256"])
+        ph3_edit.run(self.project, manifest, client=client, log=lambda *_: None)
+        out = ph3_edit.manifest_path(self.project).parent / manifest["tasks"][0]["file"]
+        out.write_bytes(b"\x89PNG\r\n\x1a\ntruncated")
+        second = self.client()
+        ph3_edit.run(self.project, manifest, client=second, log=lambda *_: None)
+        self.assertEqual(len(second.runs), 1, "a file that does not decode is not an output")
+
+    def test_records_skip_a_file_whose_bytes_stopped_matching_the_plan(self):
+        self.import_two_originals()
+        first = self.project.source_records()[0]
+        resolved = self.project.resolve_file(first.get("file") or first.get("src_path"))
+        client = self.client()
+        manifest = self.manifest_with_one_task(resolved, first["sha256"])
+        ph3_edit.run(self.project, manifest, client=client, log=lambda *_: None)
+        out = ph3_edit.manifest_path(self.project).parent / manifest["tasks"][0]["file"]
+        out.write_bytes(b"\x89PNG\r\n\x1a\nreplaced")
+        self.assertEqual(ph3_edit.records_of(self.project, manifest), [],
+                         "the plan records the bytes it drew; a changed file is not that output")
+
+
 class ShortSlotTests(_Base):
     """The decision that matters, tested without a snapshot or a GPU.
 

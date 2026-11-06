@@ -178,11 +178,23 @@ def short_slots(project, *, log=None):
 
 
 def plan(project, *, seeds_per_slot=SEEDS_PER_SLOT, log=print):
-    """Write the work list for the short slots. Returns the manifest, which `run()` then executes."""
+    """Write the work list for the short slots. Returns the manifest, which `run()` then executes.
+
+    The plan pins every input the pictures will be drawn with - the chosen run and checkpoint by sha256, the seed
+    snapshot and generation, the graph version, the prompts, the size and the seeds (spec R4): a run or an import may
+    happen hours later, and it must draw and record exactly what the plan said, not whatever the card says by then. The
+    manifest a plan replaces is archived first, so the manifest that drew already-imported pictures survives.
+    """
     training = training_of(project)
     draw, waiting = short_slots(project, log=log)
     prompts = (project.card.get("krea2_inference") or {})
     size = dict(prompts.get("size") or {"width": 1024, "height": 1536})
+    chosen = epochs_mod.chosen(project)
+    checkpoint = None
+    if chosen:
+        checkpoint = {"run_id": chosen.get("run_id"), "epoch": chosen.get("epoch"),
+                      "checkpoint_path": chosen.get("checkpoint_path"),
+                      "checkpoint_sha256": chosen.get("checkpoint_sha256")}
     tasks = []
     for entry in draw:
         for n in range(seeds_per_slot):
@@ -191,15 +203,18 @@ def plan(project, *, seeds_per_slot=SEEDS_PER_SLOT, log=print):
                 "slot_id": entry["slot"], "category": entry["category"], "seed": seed,
                 "prompt": prompt_for(project.card, entry["slot"]),
                 "file": f"images/{entry['slot']}__s{seed}.png",
-                "status": "pending",
+                "status": "pending", "sha256": None,
             })
     manifest = {
         "kind": "batch_b",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "plan_id": os.urandom(4).hex(),
         "project": project.card.get("id"),
         "training": training,
         "generation": training["generation"],
         "trained_on_snapshot": training["trained_on_snapshot"],
+        "checkpoint": checkpoint,
+        "graph_version": krea2_gen.GRAPH_VERSION["b"],
         "inference": {k: (prompts.get(k)) for k in ("variant", "steps", "cfg", "sampler", "scheduler")},
         "size": size,
         "slots": draw,
@@ -210,7 +225,8 @@ def plan(project, *, seeds_per_slot=SEEDS_PER_SLOT, log=print):
     }
     write_manifest(manifest_path(project), manifest)
     log(f"[batch_b] generation {manifest['generation']} from snapshot {manifest['trained_on_snapshot']}: "
-        f"{len(tasks)} image(s) over {len(draw)} slot(s)")
+        f"{len(tasks)} image(s) over {len(draw)} slot(s)"
+        + (f", checkpoint {checkpoint['checkpoint_sha256'][:12]}" if checkpoint else ", no epoch chosen yet"))
     for row in waiting:
         log(f"  waiting on review: {row['slot']} (short {row['short']}, {row['waiting']} pending)")
     return manifest
@@ -266,21 +282,68 @@ def plan_proof(project, record):
 
 
 def write_manifest(path, manifest):
+    """Write the plan manifest, archiving the one it replaces when that one holds drawn work.
+
+    `batch.json` is the current plan's pointer and is rewritten by every plan; the manifest that actually drew
+    already-imported pictures is the lineage's evidence (spec R4), so a plan with drawn or failed tasks is kept beside
+    it under its own timestamp instead of being overwritten into silence.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_file():
+        try:
+            previous = _read_json(path)
+        except ValueError:
+            previous = None
+        same_plan = previous.get("plan_id") == manifest.get("plan_id")
+        drawn = bool(previous) and any(
+            task.get("status") in ("done", "failed") for task in previous.get("tasks") or [])
+        if drawn and not same_plan:
+            stamp = str(previous.get("created_at") or "unknown").replace(":", "").replace("-", "")
+            archive = path.with_name(f"batch.json.at-{stamp}.json")
+            if not archive.exists():
+                archive.write_text(json.dumps(previous, ensure_ascii=False, indent=1), encoding="utf-8")
     temp = path.with_name(path.name + ".tmp-" + os.urandom(4).hex())
     temp.write_text(json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8")
     os.replace(temp, path)
 
 
+def pinned_checkpoint(manifest):
+    """The checkpoint the plan pinned, verified against its recorded sha256.
+
+    A plan may be run or imported hours after it was written; the card's chosen epoch can move in that time, and
+    drawing or recording with a different checkpoint than the plan pinned would attach the wrong provenance to every
+    picture (spec R4). Returns None for a manifest written before pinning existed - the caller decides the fallback.
+    """
+    pin = manifest.get("checkpoint") or {}
+    if not pin.get("checkpoint_path"):
+        return None
+    path = Path(pin["checkpoint_path"])
+    if not path.is_file():
+        raise BatchError(f"the plan's checkpoint is gone: {path}")
+    actual = lineage.sha256_file(path)
+    if actual != pin.get("checkpoint_sha256"):
+        raise BatchError(f"the checkpoint changed since the plan pinned it ({pin['checkpoint_path']}): "
+                         f"pinned {str(pin.get('checkpoint_sha256'))[:12]}, disk {actual[:12]}; "
+                         "re-plan rather than drawing with a different model than the plan names")
+    return path
+
+
 def run(project, manifest, *, client, names, log=print, cancel=None):
-    """Draw the pending cells. A cell whose file exists is skipped, so running the same plan twice submits nothing."""
+    """Draw the pending cells. Re-running the same plan submits nothing new - and reuses nothing it cannot vouch for.
+
+    A task whose file exists is skipped only when the file is a decodable image and still hashes to the sha the plan
+    recorded when it was drawn; a truncated file from a crashed run, or a picture left by a different plan under the
+    same name, is drawn again rather than imported (spec R4). The drawn bytes' sha is recorded per task, so a resume
+    can tell its own outputs from anything else. The checkpoint the plan pinned is verified before the first submit.
+    """
     exp = manifest_path(project).parent
+    pinned_checkpoint(manifest)
     assert_variant(manifest)
     done = skipped = failed = 0
     for task in manifest["tasks"]:
         out = exp / task["file"]
-        if out.is_file():
+        if out.is_file() and _reusable(out, task, log):
             if task["status"] != "done":
                 task["status"] = "done"
             skipped += 1
@@ -300,6 +363,7 @@ def run(project, manifest, *, client, names, log=print, cancel=None):
             out.parent.mkdir(parents=True, exist_ok=True)
             client.run(graph, out, slot_id=task["slot_id"], method="krea2_b", seed=task["seed"])
             task["status"] = "done"
+            task["sha256"] = lineage.sha256_file(out)
             done += 1
             log(f"  {task['slot_id']} s{task['seed']}: {time.time() - started:.0f}s")
         except Exception as exc:  # noqa: BLE001 - one failed picture must not end the batch
@@ -316,6 +380,17 @@ def run(project, manifest, *, client, names, log=print, cancel=None):
     return done, skipped, failed
 
 
+def _reusable(path, task, log):
+    """Is the file at a task's path the output that task recorded? Anything else is drawn again."""
+    if not lineage.image_decodes(path):
+        log(f"  {task['slot_id']} s{task['seed']}: the file on disk does not decode; drawing it again")
+        return False
+    recorded = task.get("sha256")
+    if not recorded:
+        return False               # no recorded bytes: an earlier plan's file, or a crashed write - redraw
+    return lineage.sha256_file(path) == recorded
+
+
 def assert_variant(manifest):
     """Batch B is the (b) configuration: RAW DiT + Turbo LoRA + the character LoRA, the one M0 chose."""
     variant = (manifest.get("inference") or {}).get("variant") or "b"
@@ -329,15 +404,20 @@ def candidates_of(project, manifest):
 
     Generation and snapshot are recorded separately on purpose: `train_generation` says how far down the chain this
     picture sits, and `trained_on_snapshot` says which images taught the LoRA that drew it. Collapsing them would make a
-    picture from a rebuilt seed look like it came from the old one.
+    picture from a rebuilt seed look like it came from the old one. The checkpoint is the plan's pin, verified by sha -
+    never the card's current choice (spec R4): importing under a checkpoint the plan did not draw with would attach
+    provenance to the wrong model.
     """
     exp = manifest_path(project).parent
-    lora = character_lora_path(project)
+    pinned = pinned_checkpoint(manifest)
+    lora = pinned or character_lora_path(project)
     records = []
     for task in manifest["tasks"]:
         out = exp / task["file"]
         if not out.is_file():
             continue
+        if task.get("sha256") and lineage.sha256_file(out) != task["sha256"]:
+            continue              # the file on disk is not the bytes the plan recorded: not this plan's output
         slot = {"slot_id": task["slot_id"], "category": task["category"], "prompt": task["prompt"]}
         record = lineage.record(
             out, generator="krea2_lora", parent_ids=[], train_generation=int(manifest["generation"]),
@@ -349,8 +429,8 @@ def candidates_of(project, manifest):
             prompt=task["prompt"], seed=task["seed"],
             steps=krea2_gen.SAMPLING["steps"], cfg=krea2_gen.SAMPLING["cfg"],
             width=manifest["size"]["width"], height=manifest["size"]["height"],
-            graph_version=krea2_gen.GRAPH_VERSION["b"],
-            method="krea2_b", batch="batch_b",
+            graph_version=manifest.get("graph_version") or krea2_gen.GRAPH_VERSION["b"],
+            method="krea2_b", batch="batch_b", plan_created_at=manifest.get("created_at"),
         )
         records.append(record)
     return records

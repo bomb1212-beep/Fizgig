@@ -42,6 +42,25 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
+def image_decodes(path):
+    """Can this file actually be opened as an image?
+
+    A generator writes a PNG and records it; a crash between those two steps can leave a truncated file whose name
+    looks finished. A training set never reads bytes it cannot decode, so a file that does not open is not an output,
+    whatever its name says.
+    """
+    try:
+        from PIL import Image
+    except ImportError:                          # pragma: no cover - the pipeline already needs Pillow elsewhere
+        return True
+    try:
+        with Image.open(path) as image:
+            image.verify()
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def quick_hash(path):
     """A model file's identity that is cheap enough to compute every run.
 

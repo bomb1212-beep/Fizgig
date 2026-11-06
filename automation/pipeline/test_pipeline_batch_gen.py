@@ -261,7 +261,8 @@ class RunTests(unittest.TestCase):
             def run(self, graph, out, slot_id=None, method=None, seed=None):
                 self.runs.append({"graph": graph, "method": method})
                 Path(out).parent.mkdir(parents=True, exist_ok=True)
-                Path(out).write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 32)
+                from PIL import Image
+                Image.new("RGB", (8, 8), (10, 20, 30)).save(out)
                 return out
 
         return Fake()
@@ -325,6 +326,41 @@ class RunTests(unittest.TestCase):
         after = batch_gen.run(self.project, self.manifest, client=self.client(), names=self.names(),
                               log=lambda *_: None)
         self.assertEqual(after[0], 1, "the drawn cell is skipped and the other is drawn")
+
+    def test_a_file_that_no_longer_decodes_is_drawn_again(self):
+        client = self.client()
+        batch_gen.run(self.project, self.manifest, client=client, names=self.names(), log=lambda *_: None)
+        exp = batch_gen.manifest_path(self.project).parent
+        (exp / self.manifest["tasks"][0]["file"]).write_bytes(b"\x89PNG\r\n\x1a\ntruncated")
+        done, skipped, _failed = batch_gen.run(self.project, self.manifest, client=client, names=self.names(),
+                                               log=lambda *_: None)
+        self.assertEqual(done, 1, "a file that does not decode is not an output, whatever its name says")
+        self.assertEqual(skipped, 1)
+        self.assertEqual(len(client.runs), 3, "two drawn up front, one redrawn for the file that stopped decoding")
+
+    def test_a_file_from_another_plan_is_drawn_again(self):
+        # A task with no recorded sha has no output this plan can vouch for: the file at its path could be anything.
+        client = self.client()
+        exp = batch_gen.manifest_path(self.project).parent
+        for task in self.manifest["tasks"]:
+            (exp / task["file"]).parent.mkdir(parents=True, exist_ok=True)
+            (exp / task["file"]).write_bytes(b"\x89PNG\r\n\x1a\nold-plan-bytes")
+        done, _skipped, failed = batch_gen.run(self.project, self.manifest, client=client, names=self.names(),
+                                               log=lambda *_: None)
+        self.assertEqual(done, len(self.manifest["tasks"]))
+        self.assertEqual(len(client.runs), len(self.manifest["tasks"]))
+
+    def test_a_replan_archives_the_manifest_that_drew_work(self):
+        # The manifest that drew already-imported pictures is the lineage's evidence (spec R4): a new plan keeps it
+        # beside itself instead of overwriting it into silence.
+        client = self.client()
+        batch_gen.run(self.project, self.manifest, client=client, names=self.names(), log=lambda *_: None)
+        batch_gen.plan(self.project, log=lambda *_: None)
+        archives = list(batch_gen.manifest_path(self.project).parent.glob("batch.json.at-*.json"))
+        self.assertEqual(len(archives), 1)
+        archived = json.loads(archives[0].read_text(encoding="utf-8"))
+        self.assertTrue(all(task["status"] == "done" for task in archived["tasks"]))
+        self.assertTrue(all(task.get("sha256") for task in archived["tasks"]))
 
     def test_another_configuration_is_refused_before_anything_is_drawn(self):
         self.manifest["inference"]["variant"] = "a"
@@ -400,6 +436,33 @@ class CandidatesTests(unittest.TestCase):
         with self.assertRaises(batch_gen.BatchError) as caught:
             batch_gen.character_lora_path(self.project)
         self.assertIn("is gone", str(caught.exception))
+
+    def test_a_file_whose_bytes_changed_is_not_recorded_as_the_plans_output(self):
+        records = batch_gen.candidates_of(self.project, self.manifest)
+        self.assertEqual(len(records), len(self.manifest["tasks"]))
+        for record, task in zip(records, self.manifest["tasks"]):
+            task["sha256"] = record["sha256"]
+        exp = batch_gen.manifest_path(self.project).parent
+        task = self.manifest["tasks"][0]
+        (exp / task["file"]).write_bytes(b"\x89PNG\r\n\x1a\nreplaced-bytes")
+        self.assertEqual(len(batch_gen.candidates_of(self.project, self.manifest)), len(self.manifest["tasks"]) - 1,
+                         "the plan records the bytes it drew; a changed file is not that output")
+
+    def test_a_checkpoint_changed_after_planning_refuses_the_run(self):
+        self.manifest["checkpoint"]["checkpoint_sha256"] = "0" * 64
+        with self.assertRaises(batch_gen.BatchError) as caught:
+            batch_gen.pinned_checkpoint(self.manifest)
+        self.assertIn("changed since the plan pinned it", str(caught.exception))
+
+    def test_the_plan_pins_the_chosen_checkpoint(self):
+        chosen = epochs.chosen(self.project)
+        self.assertEqual(self.manifest["checkpoint"]["checkpoint_sha256"], chosen["checkpoint_sha256"])
+        self.assertEqual(self.manifest["checkpoint"]["run_id"], chosen["run_id"])
+
+    def test_an_older_manifest_without_a_pin_reads_the_card_as_before(self):
+        del self.manifest["checkpoint"]
+        records = batch_gen.candidates_of(self.project, self.manifest)
+        self.assertEqual(len(records), len(self.manifest["tasks"]))
 
 
 if __name__ == "__main__":
