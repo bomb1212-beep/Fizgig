@@ -49,9 +49,12 @@ def targets(project):
     for record in project.candidates():
         path = project.resolve_file(record.get("file"))
         if path and Path(path).is_file():
+            slot = record.get("slot") or {}
             out.append({"id": record["id"], "path": str(path),
                         "sha256": record.get("sha256"),
-                        "slot": (record.get("slot") or {}).get("id") or "",
+                        # The plan's vocabulary is `slot_id`; the older `id` key is honoured so a record written
+                        # before the rename still lands in its slot (spec R7).
+                        "slot": slot.get("slot_id") or slot.get("id") or "",
                         "method": record.get("method") or ""})
     out.sort(key=lambda row: row["id"])
     return out

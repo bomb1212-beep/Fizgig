@@ -110,6 +110,22 @@ class TargetTests(unittest.TestCase):
         rows = score.targets(self.project)
         self.assertEqual(rows[0]["slot"], "frm_face")
 
+    def test_a_legacy_slot_key_still_lands_in_its_slot(self):
+        # Records written before the rename carry `slot.id`; dropping them left every saved score with an empty slot
+        # (spec R7) - the reader honours both keys.
+        legacy = FakeProject(
+            self.root,
+            candidates=[{"id": "c_1", "file": "a.png", "sha256": "s1", "slot": {"id": "frm_face"}, "method": "qwen"},
+                        {"id": "c_2", "file": "b.png", "sha256": "s2", "slot": {"id": "frm_legacy"},
+                         "method": "qwen"}],
+            sources=[{"id": "s_1", "file": "a.png", "origin": "user"},
+                     {"id": "s_2", "file": "b.png", "origin": "user"}],
+        )
+        rows = score.targets(legacy)
+        by_id = {row["id"]: row for row in rows}
+        self.assertEqual(by_id["c_1"]["slot"], "frm_face")
+        self.assertEqual(by_id["c_2"]["slot"], "frm_legacy")
+
 
 class PickTests(unittest.TestCase):
     def test_a_missing_scorer_is_none(self):

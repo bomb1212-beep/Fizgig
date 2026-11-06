@@ -32,7 +32,9 @@ def make_project(automation, name, *, card=None, candidates=0, decisions=None, e
         write(folder / "candidates.jsonl",
               "\n".join(json.dumps({"id": f"c_{i}"}) for i in range(candidates)))
     if decisions is not None:
-        write(folder / "review.json", {"decisions": decisions})
+        # The format  writes: {candidate_id: {decision, ...}} (spec R7 - the old wrapper shape
+        # kept the tab testing a fiction the product never wrote).
+        write(folder / "review.json", decisions)
     if scores is not None:
         write(folder / "experiments" / "scores.json", {"targets": scores})
     return folder
@@ -90,6 +92,63 @@ class ProjectDiscoveryTests(unittest.TestCase):
         self.assertEqual(dataset_tab.project_summary(folder)["id"], "broken")
 
 
+class ProductApiSummaryTests(unittest.TestCase):
+    """R7: the header's numbers come from the product API's own fixture, not a hand-made file."""
+
+    def setUp(self):
+        import tempfile
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        from pipeline import lineage, project as pj
+        lineage_record = lineage.record
+        card = {"id": "fx", "trigger": "fx", "caption_base": "style",
+                "final_families": ["qwen_image21", "krea2"],
+                "holdout": {"ids": []}}
+        self.project = pj.Project.create("fx", card, folder=self.root / "proj")
+        # The real project's shape, at its own counts: 104 candidates, 32 accepted, 37 rejected, 8 marked for a
+        # correction, 27 still waiting (spec R7).
+        incoming = self.root / "incoming"
+        incoming.mkdir(parents=True)
+        for n in range(104):
+            path = incoming / f"c{n}.png"
+            path.write_bytes(b"IMG-" + str(n).encode())
+            record = lineage_record(path, generator="qwen_edit", parent_ids=["s_x"], train_generation=1,
+                                    edit_depth=1, slot={"slot_id": f"frm_{n}"}, prompt="p")
+            self.project.import_candidates([record], log=lambda *_: None)
+        candidates = self.project.candidates()
+        for record in candidates[:32]:
+            self.project.decide(record["id"], "accept")
+        for record in candidates[32:69]:
+            self.project.decide(record["id"], "reject")
+        for record in candidates[69:77]:
+            self.project.decide(record["id"], "fix")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_the_summary_matches_the_real_aggregate(self):
+        summary = dataset_tab.project_summary(self.project.dir)
+        self.assertEqual(summary["candidates"], 104)
+        self.assertEqual(summary["accepted"], 32)
+        self.assertEqual(summary["undecided"], 27)
+
+    def test_the_chosen_export_reports_what_it_holds_and_refused(self):
+        import hashlib
+        export_id = "abc123def456"
+        base = self.project.dir / "exports" / export_id
+        base.mkdir(parents=True)
+        image = base / "abcdef.png"
+        image.write_bytes(b"PNG-BYTES")
+        manifest = {"id": export_id, "policy": "export-v2",
+                    "counts": {"images": 33, "refused": 20}}
+        (base / "export_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        self.project.card["export"] = {"selected": export_id}
+        self.project.save()
+        summary = dataset_tab.project_summary(self.project.dir)
+        self.assertEqual(summary["export_counts"],
+                         {"images": 33, "refused": 20, "policy": "export-v2"})
+
+
 class CommandTests(unittest.TestCase):
     """The argv a click builds must be the argv the CLI documents."""
 
@@ -139,7 +198,7 @@ class CommandTests(unittest.TestCase):
         # A label saying "그리기" over a `plan` command would misreport whether GPU time had been spent.
         for key, label, spec, _hint in dataset_tab.STAGES:
             if "그리기" in label or "실행" in label:
-                self.assertIn(spec[-1], ("run", "--run"), f"{key} is labelled as a draw")
+                self.assertIn(spec[-1], ("run", "--run", "--draw"), f"{key} is labelled as a draw")
 
     def test_every_stage_has_a_distinct_key(self):
         keys = [key for key, *_ in dataset_tab.STAGES]

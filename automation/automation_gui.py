@@ -1155,6 +1155,12 @@ class App(tk.Tk):
         self.destroy()
 
     def destroy(self):
+        # The dataset tab owns scheduled callbacks of its own; they must be cancelled before this interpreter dies,
+        # or Tk fires them against a destroyed widget and logs "invalid command name" (spec R7).
+        try:
+            self.dataset_view.destroy()
+        except tk.TclError:
+            pass
         if self.after_id:
             try:
                 self.after_cancel(self.after_id)

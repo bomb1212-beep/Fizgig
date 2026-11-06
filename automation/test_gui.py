@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import tempfile
 import time
+import tkinter as tk
 import unittest
 from unittest.mock import patch
 
@@ -66,10 +67,38 @@ print('fixture completed',flush=True)
         if self.app.busy:
             self.app.pause()
             self.wait_for(lambda: not self.app.busy)
-        self.app.destroy()
+        try:
+            self.app.destroy()
+        except tk.TclError:
+            pass                    # a test that closed the app itself has nothing left to destroy
         for item in reversed(self.patches):
             item.stop()
         self.temp.cleanup()
+
+    def test_closing_the_app_cancels_the_dataset_tabs_callbacks(self):
+        # The tab schedules a poll every 150ms; a callback that fires after the interpreter dies is the
+        # "invalid command name ..._poll" warning on close (spec R7). The app's close path runs the tab's destroy
+        # before the interpreter goes away, and nothing is scheduled after it.
+        tab = self.app.dataset_view
+        self.assertTrue(tab.after_ids, "the poll is scheduled while the app lives")
+        observed = []
+        original = tab.destroy
+
+        def spy():
+            original()
+            observed.append(list(tab.after_ids))
+
+        tab.destroy = spy
+        self.app.destroy()
+        self.assertEqual(observed, [[]], "the app's close must cancel the tab's callbacks first")
+        tab._schedule_poll()
+        self.assertEqual(tab.after_ids, [], "no callback may be scheduled on a dead interpreter")
+
+    def test_the_dataset_tab_poll_drains_events_before_the_app_closes(self):
+        tab = self.app.dataset_view
+        tab.events.put(("line", "drain me"))
+        tab._poll()
+        self.assertEqual(tab.events.empty(), True)
 
     def test_tabs_preview_and_caption_save_preserve_original(self):
         # Four tabs since M5 added "데이터셋 생성"; the three original tabs and their behaviour are unchanged.

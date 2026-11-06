@@ -34,6 +34,12 @@ from tkinter import messagebox, ttk
 # wrong about whether any GPU time had been spent.
 STAGES = (
     ("audit", "감사·스냅샷", ("seed", "--build"), "검수 이력과 계보를 검사하고 학습 스냅샷을 만듭니다"),
+    ("seed_train", "시드 학습", ("seed", "--build", "--train"), "스냅샷을 만들고 시드 LoRA를 학습합니다(GPU, 몇 시간)"),
+    ("gen_a", "생성 A", ("gen_qwen_edit",), "툴2로 편집을 실행하고 결과를 후보로 등록합니다(GPU)"),
+    ("gen_ph3", "P-H3 편집", ("ph3_edit",), "P-H3로 부족 슬롯을 편집해 등록합니다(GPU)"),
+    ("batch_import", "배치 B 등록", ("batch_gen", "import"), "그려진 배치 B를 후보로 등록합니다(제출 없음)"),
+    ("holdout_draw", "홀드아웃 그리기", ("evaluate", "holdout", "--draw"), "홀드아웃 프롬프트를 선택 LoRA로 그립니다(GPU)"),
+    ("holdout_score", "홀드아웃 평가", ("evaluate", "holdout", "--score"), "그려진 셀을 채점해 family별 보고서를 냅니다"),
     ("review", "검수 열기", ("review",), "브라우저에서 검수 페이지를 엽니다(서버는 계속 실행)"),
     ("fix", "보정 C 실행", ("fix", "--run"), "보정 표시된 후보를 툴2로 다시 그립니다"),
     ("epochs_list", "에포크 목록", ("epochs", "list"), "학습된 체크포인트를 파일 헤더로 검증해 나열합니다"),
@@ -101,9 +107,14 @@ def project_summary(folder):
         pass
     try:
         review = json.loads((folder / "review.json").read_text(encoding="utf-8"))
-        decisions = review.get("decisions") if isinstance(review, dict) else None
+        # `Project.decide` writes {candidate_id: {decision, ...}}; honour the older {"decisions": {...}} shape too,
+        # so a file written before that format existed still counts (spec R7).
+        decisions = review
+        if isinstance(review, dict) and isinstance(review.get("decisions"), dict):
+            decisions = review["decisions"]
         if isinstance(decisions, dict):
-            out["accepted"] = sum(1 for state in decisions.values() if (state or {}).get("decision") == "accept")
+            out["accepted"] = sum(1 for state in decisions.values()
+                                  if isinstance(state, dict) and state.get("decision") == "accept")
             out["undecided"] = max(0, (out["candidates"] or 0) - len(decisions))
     except (OSError, ValueError):
         pass
@@ -115,6 +126,37 @@ def project_summary(folder):
     exports = folder / "exports"
     if exports.is_dir():
         out["export_count"] = len([p for p in exports.iterdir() if p.is_dir() and not p.name.startswith(".")])
+    chosen = out.get("export")
+    if not chosen and out.get("export_count"):
+        # Nothing is recorded as chosen yet; the newest published export is what a re-run would compare against,
+        # so its counts are what the header shows (spec R7).
+        newest = None
+        for child in sorted(exports.iterdir()):
+            manifest = child / "export_manifest.json"
+            if not manifest.is_file():
+                continue
+            try:
+                data = json.loads(manifest.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if newest is None or str(data.get("created_at") or "") > str(newest[0]):
+                newest = (str(data.get("created_at") or ""), data)
+        if newest:
+            chosen = newest[1].get("id")
+            counts = newest[1].get("counts") or {}
+            out["export_counts"] = {"images": counts.get("images"), "refused": counts.get("refused"),
+                                    "policy": newest[1].get("policy"), "id": chosen}
+    if chosen:
+        manifest = exports / str(chosen) / "export_manifest.json"
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            counts = data.get("counts") or {}
+            # What the reviewer can actually export, and what the rules refused - the two numbers a person checks
+            # against the quota board before publishing (spec R7).
+            out["export_counts"] = {"images": counts.get("images"), "refused": counts.get("refused"),
+                                    "policy": data.get("policy")}
+        except (OSError, ValueError):
+            out["export_counts"] = None
     return out
 
 
@@ -209,8 +251,41 @@ class DatasetTab:
         self.log.configure(yscrollcommand=scroll.set)
 
     def _schedule_poll(self):
+        # A callback that fires after the app is torn down is the "invalid command name ..._poll" warning; stop
+        # scheduling once the interpreter is going away (spec R7).
+        try:
+            if not self.parent.winfo_exists():
+                return
+        except tk.TclError:
+            return
         job = self.parent.after(150, self._poll)
         self.after_ids.append(job)
+
+    def _poll(self):
+        try:
+            alive = self.parent.winfo_exists()
+        except tk.TclError:
+            return
+        if not alive:
+            return
+        self._drain_events()
+        self._schedule_poll()
+
+    def _drain_events(self):
+        finished = None
+        for _ in range(200):
+            try:
+                kind, payload = self.events.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "line":
+                self._append(payload)
+            elif kind == "process":
+                self.process = payload
+            elif kind == "finished":
+                finished = payload
+        if finished is not None:
+            self._finish(finished)
 
     def destroy(self):
         for job in self.after_ids:
@@ -393,23 +468,6 @@ class DatasetTab:
         self._append("… 취소 요청: 즉시 종료합니다\n")
         self.status.set("취소 중")
         self.cancel_button.configure(state="disabled")
-
-    def _poll(self):
-        finished = None
-        for _ in range(200):
-            try:
-                kind, payload = self.events.get_nowait()
-            except queue.Empty:
-                break
-            if kind == "line":
-                self._append(payload)
-            elif kind == "process":
-                self.process = payload
-            elif kind == "finished":
-                finished = payload
-        if finished is not None:
-            self._finish(finished)
-        self._schedule_poll()
 
     def _finish(self, code):
         key = self.running
