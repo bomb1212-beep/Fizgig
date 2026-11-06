@@ -101,16 +101,19 @@ def tool_paths(cfg=None):
     return {key: models.resolve_path(value) if value else "" for key, value in paths.items()}
 
 
-def tool_graph_version(batch_path):
-    """tool2's own graph version, read from its source.
+def tool_graph_version(batch_path, models=None):
+    """tool2's own graph version for these models, read from its source.
 
-    Reading one constant is what keeps a snapshot honest about which generator wrote its images; the module is plain
-    standard library, so it can be loaded without tool2's interpreter. A failure is reported, never guessed.
+    Reading it is what keeps a snapshot honest about which generator wrote its images; the module is plain standard
+    library, so it can be loaded without tool2's interpreter. A failure is reported, never guessed.
     """
     try:
         spec = importlib.util.spec_from_file_location("tool2_dataset_batch_for_version", batch_path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        by_models = getattr(module, "graph_version", None)
+        if models is not None and callable(by_models):
+            return str(by_models(models)) or "unknown"
         return str(getattr(module, "GRAPH_VERSION", "")) or "unknown"
     except Exception as exc:                        # noqa: BLE001 - a missing version must not stop a run
         return f"unknown ({type(exc).__name__})"
@@ -276,7 +279,7 @@ def build_snapshot(project_dir, card, *, exclude=(), holdout=None, sections=None
     batch = Path(paths.get("batch") or "").resolve()
     if not batch.is_file():
         raise ValueError(f"tool2's CLI is missing: {batch or '(not configured)'}")
-    graph_version = tool_graph_version(batch)
+    graph_version = tool_graph_version(batch, tool2_cfg.get("models") or {})
 
     chars_root = Path(char.get("characters") or (config_path.parent / "characters" / folder))
     if not chars_root.is_dir():
@@ -492,6 +495,8 @@ def model_hashes(snapshot):
     comfy_dir = config.get("comfy_dir") or ""
     out = {}
     for name, value in (config.get("models") or {}).items():
+        if name == "backend":                       # a setting that sits with the model names, not a file
+            continue
         path = Path(str(value))
         if not path.is_absolute():
             path = (Path(comfy_dir) / "models" / str(value)) if comfy_dir else path
