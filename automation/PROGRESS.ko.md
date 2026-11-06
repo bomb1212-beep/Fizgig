@@ -1664,3 +1664,37 @@ batch_gen의 P-H3 대응. 새로 그리는 게 아니라 **이미 캐릭터가 �
   엔진을 따른다. `skipped` 보정은 sidecar가 입력 바이트와 그래프를 여전히 증명할 때만 회수한다. 역사적 Qwen
   결과는 그대로 읽힌다 — 실데이터 읽기 전용 확인: 저장된 result 2건이 각자의 스냅샷으로 해석(match=True).
 - **테스트**: 툴1 678 OK(653 → 678: 엔진·회수·서명·핀·아카이브 25개 추가), 툴2 99 OK.
+
+### 31.6 R5 — 홀드아웃 측정은 핀된 셀 위에서, agreement는 그림으로 잇는다 (2026-11-07 03:10~04:00)
+
+- **재현(명세 그대로)**: `evaluate holdout --json`과 `evaluate agreement --json`이 json import 누락으로 NameError
+  (evaluate.py 410·456행). agreement는 사람 시트(task 키)와 자동 점수(후보 id 키)를 직접 대조해 구조적으로 짝 0개.
+- **수정** (`pipeline/evaluate.py`): json import. agreement의 결합을 **실험 manifest 경유**로 바꿨다 — 시트 행의
+  슬롯·방법·시드가 manifest 태스크를, 태스크가 이미지 파일을, 그 **sha256이 프로젝트 후보(같은 바이트)**를 연결한다.
+  모든 짝이 candidate id + sha 근거를 갖고, 못 잇는 행은 사유별로 카운트된다. `--experiment`(기본: scores.csv
+  옆 experiment.json 자동 발견), `--score-field` 옵션. CLI는 --json일 때 짝 근거를 포함한 전체 보고서만 내보낸다.
+- **홀드아웃**: `draw_holdout`이 체크포인트 핀 + 셀별 바이트 SHA를 manifest(`experiments/holdout/<family>/holdout.json`)
+  에 기록한다. 같은 계획 재실행은 제출 0, **선택 체크포인트가 바뀌면 공유 측정을 거부**, manifest가 없는 폴더의
+  파일은 출처를 증명할 수 없어 거부, `--score`는 manifest가 보증하는 셀만 채점하고 누락·불량·변조·미등록·
+  동일 픽셀 셀을 수치와 별도로 이름대고, 홀드아웃 프롬프트는 캡션 출처(tool2 검증 캡션 / 카드 문구-미검증)를 명시.
+- **실측**: 툴1 690 OK. 실데이터 — `holdout --json`: 홀드아웃 2장에 tool2 검증 캡션 출처 표시.
+  `agreement`: **93행 중 20쌍 매칭**(짝마다 candidate+SHA), 미매칭 사유 카운트(프로젝트에 없는 바이트 72 —
+  M0의 krea2 후보는 프로젝트로 들어오지 않은 것이 사실 — 이미지 부재 3), overall/easy/hard 분리
+  (spearman 0.6938 / 0.7409 / -0.2108), 기각 고득점 집계 포함. 0.7696/0.6197 과거 기록은 그대로 보존.
+
+### 31.7 R6 — 학습과 생성이 한 카드를 두고 경합하지 않는다 (2026-11-07 04:10~04:50)
+
+- **양방향 게이트** (`pipeline/gpu.py` 신설): 생성 CLI(batch B·P-H3 편집·홀드아웃 draw)는 제출 구간에
+  기계 단위 클레임(`gpu.lock`)을 잡고, 잡기 전에 학습 러너의 `queue.lock` 소유자가 살아 있으면 거부한다.
+  `runner.main`은 큐를 잡기 전에 생성 클레임을 검사한다. 뒤에 들어온 작업의 GPU 제출 0건 — 양방향 모두.
+  클레임은 pid 기록 + 생존 확인이라 죽은 실행의 오래된 파일은 대체된다. **실제 자식 프로세스로 경합 재현**
+  (sleeper pid를 락에 기록): 훈련 생존 → 생성 클레임 GpuBusy, 생성 생존 → 또 다른 생성·학습 시작 거부.
+  두 Comfy 설정이 같은 GPU를 쓰는 경우도 같은 게이트가 막는다(클레임은 URL이 아니라 기계 단위).
+- **학습 전 메모리 반환**: `runner.free_comfy_before_training` — Comfy가 응답하고 **외부 요청이 없을 때**(idle)만
+  `/free`. 요청 실행 중이면 가로채지 않고, 응답 없으면 건너뛴다(학습이 Comfy에 의존하지 않는다).
+- **저널 회수** (`pipeline/comfy.py`): 제출 전 **intent** 기록(client_id) → POST 성공 시 prompt 레코드로 전환.
+  응답 유실 시 `recover()`가 큐·히스토리를 client_id로 뒤져 채택하고, 흔적이 없으면 "unconfirmed" 실패로 기록
+  — 재제출하지 않는다. 완료됐는데 이미지 다운로드가 안 끝난 셀은 기록된 출력을 다시 내려받는다(재제출 아님).
+  서버 거부 그래프는 닫힌 intent로 남아 미해결 스캔에 걸리지 않는다.
+- **취소·서버**: 취소는 자기 prompt_id만(기존 동작 유지), 사용자가 띄운 서버를 끝내는 경로는 없다.
+- **실측**: 툴1 **707 OK**(690 → 707: gpu 7 + comfy 회수 6 + free 4). 실기 강제 종료·재개는 별도 실기 항목으로 남는다.
