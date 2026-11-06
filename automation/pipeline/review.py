@@ -49,9 +49,10 @@ def image_url(row, prefix="/image"):
     return f"{prefix}/{row['id']}{row.get('suffix') or '.png'}"
 
 
-def candidate_rows(project, *, decision=None, generator=None, slot=None):
+def candidate_rows(project, *, decision=None, generator=None, slot=None, images_prefix="/image"):
     """The candidates as page rows, newest first, each with its decision and whether it can still be corrected."""
     review = project.review()
+    index = project.index()
     rows = []
     for record in reversed(project.candidates()):
         state = review.get(record["id"]) or {}
@@ -65,6 +66,15 @@ def candidate_rows(project, *, decision=None, generator=None, slot=None):
         if slot and slot_id != slot:
             continue
         path = project.resolve_file(record.get("file"))
+        before = None
+        fix_of = record.get("fix_of") or next((p for p in (record.get("parent_ids") or [])
+                                               if p.startswith("c_")), None) if record.get("edit_depth") else None
+        if fix_of and fix_of in index:
+            before_path = project.resolve_file(index[fix_of].get("file"))
+            before = {"id": fix_of, "url": f"{images_prefix}/{fix_of}"
+                                           f"{(before_path.suffix.lower() if before_path else '.png')}",
+                      "exists": bool(before_path and before_path.is_file()),
+                      "decision": (review.get(fix_of) or {}).get("decision")}
         rows.append({
             "id": record["id"],
             "file": record.get("file"),
@@ -83,6 +93,8 @@ def candidate_rows(project, *, decision=None, generator=None, slot=None):
             "by": state.get("by"),
             "note": state.get("note", ""),
             "fixable": fixable(state),
+            "fix_of": fix_of,
+            "before": before,
         })
     return rows
 
@@ -123,17 +135,26 @@ def _cell(row, images_prefix):
         ("" if row["fixable"] else "보정 불가"),
         (f"결정: {escape(str(row['by']))}" if row["by"] else ""),
     ) if text)
+    before = row.get("before")
+    pair = ""
+    if before is not None:
+        # A correction is only judgeable next to what it corrected: same card, the original on the left.
+        thumb = (f'<img loading="lazy" src="{escape(before["url"])}" alt="{escape(before["id"])}">'
+                 if before["exists"] else '<div class="ph small">원본 파일 없음</div>')
+        pair = (f'<div class="pair"><div class="side"><a href="{escape(before["url"])}" target="_blank">{thumb}</a>'
+                f'<div class="id">원본 {escape(before["id"])}</div></div>'
+                f'<div class="arrow">→</div></div>')
     return (f'<div class="card" data-id="{row["id"]}" data-decision="{row["decision"] or ""}" '
             f'data-reason="{escape(row["reason"] or "")}" '
             f'data-keys="{KEYS["accept"]}{KEYS["reject"]}{KEYS["fix"]}D">'
-            f'{body}{meta}<div class="id">{escape(row["id"])}</div>'
+            f'{pair}{body}{meta}<div class="id">{escape(row["id"])}</div>'
             f'<div class="caption">{escape((row["caption"] or "")[:120])}</div>'
             f'{flags}<div class="buttons">{buttons}</div></div>')
 
 
 def write_page(project, destination, *, images_prefix="/image", quota_plan=None, log=print):
     """Render the review page. Decisions are posted back, so it is meant to be served, not opened from disk."""
-    rows = candidate_rows(project)
+    rows = candidate_rows(project, images_prefix=images_prefix)
     quotas = project.quotas(quota_plan or _plan_from_card(project.card))
     short = {slot: info for slot, info in quotas.items() if info["short"]}
     counts = {name: sum(1 for r in rows if r["decision"] == name) for name in pj.DECISIONS}
@@ -199,6 +220,10 @@ _TEMPLATE = """<!doctype html>
  .buttons button.on[data-decision=fix] {{ background: #6b5a1f; border-color: #b09a3a; }}
  .buttons button.reason.on {{ background: #5c2244; border-color: #b0508c; }}
  .card[data-decision=reject] img {{ opacity: .45; }}
+ .card .pair {{ display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }}
+ .card .pair img {{ width: 74px; height: auto; display: block; border: 1px solid #333; }}
+ .card .pair .ph.small {{ width: 74px; height: 60px; font-size: 10px; }}
+ .card .pair .arrow {{ color: #789; font-size: 14px; }}
  #state {{ position: sticky; bottom: 0; background: #1b1b1b; border-top: 1px solid #333; padding: 6px 10px; }}
 </style></head><body>
 <h1>{title}</h1>
