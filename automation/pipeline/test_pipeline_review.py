@@ -158,5 +158,68 @@ class PageTests(unittest.TestCase):
             self.assertNotIn(leftover, html)
 
 
+class KeyboardScopeTests(unittest.TestCase):
+    """R1: the keyboard decides only what the reviewer can see.
+
+    The page's judgement code is JavaScript and was exercised in a real browser against a throwaway project (the run
+    is recorded in PROGRESS); what is pinned here are the invariants a future edit must not silently drop, read from
+    the page the server actually renders.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import tempfile
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.root = Path(cls.temp.name)
+        write_png(cls.root / "c_1.png")
+        cls.project = FakeProject(cls.root, [candidate("c_1", "frm_face"), candidate("c_2", "frm_back")])
+        cls.html = review.write_page(cls.project, cls.root / "review.html", log=lambda *_: None).read_text(
+            encoding="utf-8")
+        cls.script = cls.html.split("<script>")[1].split("</script>")[0]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temp.cleanup()
+
+    def script_includes(self, *snippets):
+        return all(snippet in self.script for snippet in snippets)
+
+    def test_cards_reads_only_the_visible_cards(self):
+        # A filter hides a card from the eye, so it must hide it from the keyboard too.
+        self.assertTrue(self.script_includes(
+            "function cards()",
+            "filter(c => c.style.display !== 'none')"))
+
+    def test_the_cursor_and_the_decision_keys_share_one_visible_list(self):
+        self.assertTrue(self.script_includes(
+            "const list = cards();",
+            "const card = list[Math.min(cursor, list.length - 1)];"))
+
+    def test_a_filter_control_that_owns_the_keyboard_silences_the_keys(self):
+        self.assertTrue(self.script_includes(
+            "document.getElementById('controls').contains(document.activeElement)"))
+
+    def test_zero_visible_cards_means_no_decision(self):
+        self.assertTrue(self.script_includes("else if (list.length) {"))
+
+    def test_a_stored_decision_re_applies_the_view(self):
+        # Under the undecided filter a decided card must leave the list the moment its decision lands.
+        self.assertTrue(self.script_includes("applyView();\n}\nfunction setCursor"))
+
+    def test_the_view_change_re_syncs_the_cursor(self):
+        self.assertTrue(self.script_includes("syncCursor();\n}"))
+
+    def test_clicking_a_card_syncs_the_cursor_to_it(self):
+        self.assertTrue(self.script_includes(
+            "const at = cards().indexOf(card);",
+            "if (at >= 0) setCursor(at);"))
+
+    def test_the_decision_write_keeps_the_target_element_alive(self):
+        # The decision is written into its own span: overwriting the state bar's textContent would destroy the
+        # cursor's target element and break the next re-sync (found in the browser run).
+        self.assertTrue(self.script_includes("getElementById('last').textContent"))
+        self.assertIn('<span id="target"></span><span id="last"></span>', self.html)
+
+
 if __name__ == "__main__":
     unittest.main()

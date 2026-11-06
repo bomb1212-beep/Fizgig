@@ -13,7 +13,10 @@ Two things the page and the API agree on:
   so a picture that is shown in the page is a picture the server can actually deliver;
 * a decision may carry a structured `reason`. `different_character` is the one reason that also limits what else may
   be done with the image: it may only be rejected, because correcting another person's picture only produces another
-  person. The page, the API and the correction stage all read that one field.
+  person. The page, the API and the correction stage all read that one field;
+* the keyboard decides only what the reviewer can see. The cursor, the movement and the A/R/F/D keys all read the
+  visible cards in the same order, a filter control that owns the keyboard silences them, zero visible cards mean no
+  decision, and a decision that no longer matches the active filter removes its card from the view at once (R1).
 """
 from __future__ import annotations
 
@@ -264,6 +267,7 @@ _TEMPLATE = """<!doctype html>
  .buttons button.on[data-decision=fix] {{ background: #6b5a1f; border-color: #b09a3a; }}
  .buttons button.reason.on {{ background: #5c2244; border-color: #b0508c; }}
  .card[data-decision=reject] img {{ opacity: .45; }}
+ .card.cursor {{ outline: 2px solid #4a9ed9; outline-offset: 1px; }}
  .card .pair {{ display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }}
  .card .pair img {{ width: 74px; height: auto; display: block; border: 1px solid #333; }}
  .card .pair .ph.small {{ width: 74px; height: 60px; font-size: 10px; }}
@@ -306,13 +310,18 @@ _TEMPLATE = """<!doctype html>
  <span id="shown" style="color:#789;font-size:12px"></span>
 </div>
 <div class="grid" id="grid">{cards}</div>
-<div id="state">이미지를 클릭하면 확대, A=채택 · R=기각 · F=보정 · D=다른 캐릭터.
+<div id="state"><span id="target"></span><span id="last"></span>이미지를 클릭하면 확대, A=채택 · R=기각 · F=보정 · D=다른 캐릭터.
 결정은 review.json에 바로 기록됩니다.</div>
 <script>
 const KEYS = {keys};
 const REASON_KEYS = {reason_keys};
 let cursor = 0;
-function cards() {{ return Array.from(document.querySelectorAll('.card')); }}
+let cursorCard = null;
+// Only the cards the reviewer can see are reviewable: a filter hides a card from the eye, so it must hide it from
+// the keyboard too. The cursor, the movement and the decision keys all read this one list, in the same order.
+function cards() {{
+  return Array.from(document.querySelectorAll('#grid .card')).filter(c => c.style.display !== 'none');
+}}
 function paint(card, decision, reason) {{
   card.dataset.decision = decision || '';
   card.dataset.reason = reason || '';
@@ -331,12 +340,41 @@ async function send(card, decision, reason) {{
   const response = await fetch('/decide', {{method: 'POST', headers: {{'Content-Type': 'application/json'}},
                                           body: JSON.stringify(payload)}});
   const data = await response.json();
-  if (!response.ok) {{ document.getElementById('state').textContent = data.error || 'failed'; return; }}
+  if (!response.ok) {{ document.getElementById('last').textContent = data.error || 'failed'; return; }}
   paint(card, data.decision, data.reason);
-  document.getElementById('state').textContent = card.dataset.id + ' → ' + (data.decision || '미검수')
+  // Written into its own span, not over the state bar: the state bar carries the cursor's target element, and
+  // overwriting it would destroy that element and break the next view re-sync.
+  document.getElementById('last').textContent = card.dataset.id + ' → ' + (data.decision || '미검수')
     + (data.reason ? ' (' + data.reason + ')' : '');
+  // A card whose decision no longer matches the filter must leave the view at once - under the undecided filter a
+  // decided card is gone the moment its decision lands - so the view is re-applied after every stored decision.
+  applyView();
+}}
+function setCursor(index) {{
+  const list = cards();
+  if (cursorCard) cursorCard.classList.remove('cursor');
+  const target = document.getElementById('target');
+  if (!list.length) {{
+    cursorCard = null;
+    if (target) target.textContent = '대상 없음 (표시된 카드 0장)';
+    return;
+  }}
+  cursor = Math.max(0, Math.min(index, list.length - 1));
+  cursorCard = list[cursor];
+  cursorCard.classList.add('cursor');
+  if (target) target.textContent = '대상 ' + cursorCard.dataset.id + ' · ';
+}}
+function syncCursor() {{
+  const list = cards();
+  if (cursorCard && list.includes(cursorCard)) {{ cursor = list.indexOf(cursorCard); return; }}
+  setCursor(cursor);
 }}
 document.addEventListener('click', e => {{
+  const card = e.target.closest('.card');
+  if (card) {{
+    const at = cards().indexOf(card);
+    if (at >= 0) setCursor(at);
+  }}
   const button = e.target.closest('.dec');
   if (button && !button.disabled) {{
     send(button.closest('.card'), button.dataset.decision, button.dataset.reason);
@@ -344,17 +382,29 @@ document.addEventListener('click', e => {{
 }});
 document.addEventListener('keydown', e => {{
   const list = cards();
-  if (e.key === 'j' || e.key === 'ArrowDown') {{ cursor = Math.min(cursor + 1, list.length - 1); }}
-  else if (e.key === 'k' || e.key === 'ArrowUp') {{ cursor = Math.max(cursor - 1, 0); }}
-  else {{
-    const key = e.key.toUpperCase();
-    for (const [decision, wanted] of Object.entries(KEYS)) {{
-      if (key === wanted && list[cursor]) {{ send(list[cursor], decision, ''); return; }}
-    }}
-    if (REASON_KEYS[key] && list[cursor]) {{ send(list[cursor], 'reject', REASON_KEYS[key]); }}
-    return;
+  // A filter control that owns the keyboard must never let a letter decide a picture: arrows stay with the control
+  // and A/R/F/D do nothing until the reviewer clicks back into the grid.
+  if (document.activeElement && document.getElementById('controls').contains(document.activeElement)) return;
+  if (e.key === 'j' || e.key === 'ArrowDown') {{
+    e.preventDefault();
+    setCursor(cursor + 1);
+    if (cursorCard) cursorCard.scrollIntoView({{block: 'center'}});
   }}
-  list[cursor].scrollIntoView({{block: 'center'}});
+  else if (e.key === 'k' || e.key === 'ArrowUp') {{
+    e.preventDefault();
+    setCursor(cursor - 1);
+    if (cursorCard) cursorCard.scrollIntoView({{block: 'center'}});
+  }}
+  else if (list.length) {{
+    // With nothing visible there is nothing to decide, and cursor always names a visible card.
+    const card = list[Math.min(cursor, list.length - 1)];
+    const key = e.key.toUpperCase();
+    if (!card) return;
+    for (const [decision, wanted] of Object.entries(KEYS)) {{
+      if (key === wanted) {{ send(card, decision, ''); return; }}
+    }}
+    if (REASON_KEYS[key]) {{ send(card, 'reject', REASON_KEYS[key]); }}
+  }}
 }});
 cards()[0]?.setAttribute('tabindex', '0');
 
@@ -399,6 +449,8 @@ function applyView() {{
   allCards.forEach(card => {{ card.style.display = 'none'; }});
   visible.forEach(card => {{ card.style.display = ''; grid.appendChild(card); }});
   document.getElementById('shown').textContent = visible.length + ' / ' + allCards.length + '장 표시';
+  // Every view change re-syncs the cursor, so the highlighted card is always one the reviewer can actually see.
+  syncCursor();
 }}
 ['sort', 'slot', 'status', 'scored'].forEach(id =>
   document.getElementById(id).addEventListener('change', applyView));
