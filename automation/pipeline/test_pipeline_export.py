@@ -10,9 +10,16 @@ The properties the spec names, each with its own group:
   and the distributions a person checks before training.
 """
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+AUTO = Path(__file__).resolve().parents[1]
+ROOT = AUTO.parent
+for _entry in (str(ROOT / "src"), str(AUTO)):
+    if _entry not in sys.path:
+        sys.path.insert(0, _entry)      # models.resolve reads the fizgig family registry, which lives in src/
 
 from pipeline import export, evaluate
 from pipeline.scorers import common
@@ -422,7 +429,9 @@ class HoldoutDrawTests(unittest.TestCase):
 
         self.assertNotEqual(evaluate.holdout_dir(_P(), "krea2"), evaluate.holdout_dir(_P(), "qwen_image21"))
 
-    def test_an_already_drawn_cell_is_reused_rather_than_redrawn(self):
+    def test_cells_on_disk_without_a_manifest_are_refused(self):
+        # The old behaviour - "a file exists, reuse it" - is exactly what cannot be vouched for: nothing can say which
+        # checkpoint drew it (spec R5). The operator decides what to do with the folder.
         class _P:
             dir = self.root
             card = {}
@@ -436,11 +445,66 @@ class HoldoutDrawTests(unittest.TestCase):
         folder = evaluate.holdout_dir(_P(), "krea2")
         folder.mkdir(parents=True)
         (folder / "s_abc__s7001.png").write_bytes(b"PNG")
+        with self.assertRaises(evaluate.EvalError) as caught:
+            evaluate.draw_holdout(_P(), family="krea2", seeds=(7001,), log=lambda *_: None)
+        self.assertIn("no holdout manifest records", str(caught.exception))
 
-        drawn_calls = []
+    def test_scoring_refuses_cells_no_manifest_records(self):
+        class _P:
+            dir = self.root
+            card = {}
 
+        folder = evaluate.holdout_dir(_P(), "krea2")
+        folder.mkdir(parents=True)
+        (folder / "s_abc__s7001.png").write_bytes(b"PNG")
+        with self.assertRaises(evaluate.EvalError) as caught:
+            evaluate.holdout_cells(_P(), "krea2")
+        self.assertIn("no holdout manifest", str(caught.exception))
+
+
+class HoldoutManifestTests(unittest.TestCase):
+    """The draw's pin-and-record contract, with a fake ComfyUI client (spec R5).
+
+    A holdout cell is evidence about the one checkpoint that drew it and about nothing else: the manifest records the
+    pin and each cell's bytes, a rerun submits nothing, a changed checkpoint refuses, and a scoring pass reads only
+    cells the manifest can vouch for.
+    """
+
+    def setUp(self):
+        import hashlib
+        import tempfile
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.checkpoint = self.root / "char-000030.safetensors"
+        self.checkpoint.write_bytes(b"safetensors-bytes")
+        self.sha = hashlib.sha256(self.checkpoint.read_bytes()).hexdigest()
+        card = {"id": "fx", "trigger": "fx", "caption_base": "style", "caption_traits": "omit",
+                "krea2_inference": {"selected": {"run_id": "fx_seed-r1", "epoch": 30,
+                                                 "checkpoint_path": str(self.checkpoint),
+                                                 "checkpoint_sha256": self.sha}},
+                "holdout": {"ids": []}}
+        from pipeline import project as pj
+        self.project = pj.Project.create("fx", card, folder=self.root / "proj")
+        incoming = self.root / "incoming"
+        incoming.mkdir(parents=True)
+        for name in ("hold_a.png", "hold_b.png", "plain.png"):
+            path = incoming / name
+            path.write_bytes(b"IMG-" + name.encode())
+        self.project.import_sources(sorted(incoming.iterdir()), log=lambda *_: None)
+        records = {r["id"]: r for r in self.project.source_records()}
+        holdouts = [r["id"] for r in records.values() if Path(r["src_path"]).name.startswith("hold_")]
+        self.project.card["holdout"] = {"ids": holdouts}
+        self.project.save()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def client(self, identical=False):
         class _Client:
             url = "http://test"
+
+            def __init__(self):
+                self.runs = 0
 
             def ping(self):
                 return True
@@ -448,25 +512,116 @@ class HoldoutDrawTests(unittest.TestCase):
             def name_for(self, kind, path):
                 return kind
 
-        # Reaching the graph builder would mean a redraw; the reuse path must return before that.
-        import pipeline.krea2_gen as gen_mod
+            def run(self, graph, out, slot_id=None, method=None, seed=None):
+                self.runs += 1
+                from PIL import Image
+                Path(out).parent.mkdir(parents=True, exist_ok=True)
+                Image.new("RGB", (8, 8), (9, 9, 9) if identical else (9, 9, seed % 200)).save(out)
+                return out
 
-        class _Boom:
-            def build(self, *a, **k):
-                drawn_calls.append(1)
-                raise AssertionError("a cell that exists must not be redrawn")
+        return _Client()
 
-        saved = gen_mod.build
-        gen_mod.build = _Boom().build
-        try:
-            drawn, skipped, failed = evaluate.draw_holdout(
-                _P(), family="krea2", seeds=(7001,), client=_Client(), log=lambda *_: None)
-        finally:
-            gen_mod.build = saved
-        self.assertEqual(len(drawn), 1)
-        self.assertEqual(skipped, 1)
+    def test_a_draw_pins_the_checkpoint_and_records_every_cell(self):
+        client = self.client()
+        drawn, _skipped, failed = evaluate.draw_holdout(self.project, family="krea2", seeds=(7001,),
+                                                        client=client, log=lambda *_: None)
+        self.assertEqual(len(drawn), 2)
         self.assertEqual(failed, [])
-        self.assertEqual(drawn_calls, [])
+        manifest = evaluate.read_holdout_manifest(self.project, "krea2")
+        self.assertEqual(manifest["pin"]["checkpoint_sha256"], self.sha)
+        self.assertEqual(len(manifest["cells"]), 2)
+        self.assertTrue(all(cell["sha256"] for cell in manifest["cells"]))
+        self.assertTrue(all("caption_source" in p for p in manifest["prompts"]))
+
+    def test_the_same_draw_again_submits_nothing(self):
+        evaluate.draw_holdout(self.project, family="krea2", seeds=(7001,), client=self.client(),
+                              log=lambda *_: None)
+        again = self.client()
+        drawn, skipped, _failed = evaluate.draw_holdout(self.project, family="krea2", seeds=(7001,),
+                                                        client=again, log=lambda *_: None)
+        self.assertEqual(len(drawn), 2)
+        self.assertEqual(skipped, 2)
+        self.assertEqual(again.runs, 0)
+
+    def test_a_changed_checkpoint_refuses_the_draw(self):
+        evaluate.draw_holdout(self.project, family="krea2", seeds=(7001,), client=self.client(),
+                              log=lambda *_: None)
+        self.checkpoint.write_bytes(b"a different model")
+        with self.assertRaises(evaluate.EvalError) as caught:
+            evaluate.draw_holdout(self.project, family="krea2", seeds=(7001,), client=self.client(),
+                                  log=lambda *_: None)
+        self.assertIn("cannot share a measurement", str(caught.exception))
+
+    def test_a_cell_whose_bytes_changed_is_drawn_again(self):
+        evaluate.draw_holdout(self.project, family="krea2", seeds=(7001,), client=self.client(),
+                              log=lambda *_: None)
+        folder = evaluate.holdout_dir(self.project, "krea2")
+        next(folder.glob("*.png")).write_bytes(b"truncated")
+        client = self.client()
+        _drawn, skipped, _failed = evaluate.draw_holdout(self.project, family="krea2", seeds=(7001,),
+                                                         client=client, log=lambda *_: None)
+        self.assertEqual(client.runs, 1)
+        self.assertEqual(skipped, 1)
+
+    def test_scoring_reads_only_vouched_cells_and_names_the_rest(self):
+        evaluate.draw_holdout(self.project, family="krea2", seeds=(7001,), client=self.client(),
+                              log=lambda *_: None)
+        folder = evaluate.holdout_dir(self.project, "krea2")
+        cells = sorted(folder.glob("*.png"))
+        from PIL import Image
+        Image.new("RGB", (8, 8), (77, 77, 77)).save(cells[0])   # a valid picture that is not the one recorded
+        cells[1].unlink()                                       # a missing cell
+        (folder / "someone-elses.png").write_bytes(b"stray")    # a file no manifest lists
+        pairs, audit = evaluate.holdout_cells(self.project, "krea2")
+        self.assertEqual(pairs, [])
+        self.assertEqual(len(audit["changed"]), 1)
+        self.assertEqual(len(audit["missing"]), 1)
+        self.assertEqual(audit["unlisted"], ["someone-elses.png"])
+        self.assertEqual(audit["pin"]["checkpoint_sha256"], self.sha)
+
+    def test_identical_cells_are_counted_once_and_named_as_duplicates(self):
+        evaluate.draw_holdout(self.project, family="krea2", seeds=(7001,), client=self.client(identical=True),
+                              log=lambda *_: None)
+        pairs, audit = evaluate.holdout_cells(self.project, "krea2")
+        self.assertEqual(len(pairs), 1, "one picture is one measurement")
+        self.assertEqual(len(audit["duplicate_pixels"]), 1)
+
+    def test_prompts_carry_their_caption_provenance(self):
+        prompts = evaluate.holdout_prompts(self.project)
+        self.assertTrue(all(p["caption_source"] for p in prompts))
+        self.assertTrue(all("no verified caption" in p["caption_source"] for p in prompts))
+        # tool2's caption for the same bytes takes over when it exists.
+        from pipeline import seed as seed_mod
+        dataset = self.root / "dataset"
+        dataset.mkdir()
+        for record in self.project.source_records():
+            if record["id"] in self.project.card["holdout"]["ids"]:
+                src = Path(record["src_path"])
+                (dataset / (record["sha256"][:16] + src.suffix)).write_bytes(src.read_bytes())
+                (dataset / (record["sha256"][:16] + ".txt")).write_text("verified words", encoding="utf-8")
+        self.project.card["tool2"] = {"dataset": str(dataset)}
+        prompts = evaluate.holdout_prompts(self.project)
+        self.assertEqual([p["caption_source"] for p in prompts],
+                         ["tool2's caption for the same image"] * len(prompts))
+        self.assertTrue(all(p["prompt"].startswith("verified words") for p in prompts))
+
+    def test_drawing_without_a_chosen_epoch_refuses_by_name(self):
+        folder = self.root / "fresh"
+        stub_card = {"holdout": {"ids": self.project.card["holdout"]["ids"]}, "krea2_inference": {}}
+
+        class _P:
+            dir = folder
+            card = stub_card
+
+            def holdout_entry(self):
+                return {"ids": stub_card["holdout"]["ids"]}
+
+            def index(self):
+                return {}
+
+        with self.assertRaises(evaluate.EvalError) as caught:
+            evaluate.draw_holdout(_P(), family="krea2", seeds=(7001,), log=lambda *_: None)
+        self.assertIn("no epoch has been chosen", str(caught.exception))
 
     def test_comparing_families_warns_when_the_scorers_differ(self):
         reports = [{"family": "krea2", "scorer": "clip_vision", "images": 2, "max": .9, "mean": .8, "median": .8},
@@ -479,6 +634,120 @@ class HoldoutDrawTests(unittest.TestCase):
         reports = [{"family": "a", "scorer": "clip_vision", "images": 1, "max": .9, "mean": .9, "median": .9},
                    {"family": "b", "scorer": "clip_vision", "images": 1, "max": .8, "mean": .8, "median": .8}]
         self.assertIsNone(evaluate.compare_families(reports)["note"])
+
+
+class EvaluateCliTests(unittest.TestCase):
+    """The two CLI reports the spec names, end to end on fixtures (spec R5).
+
+    The CLI used to crash with a NameError the moment --json was asked for, and the agreement report matched a human
+    sheet keyed by task against automatic scores keyed by candidate id - zero pairs, always. The holdout branch now
+    prints its prompts, and the agreement join runs through the experiment manifest's slot, method, seed and image
+    sha256, with every unmatched row counted and its reason named.
+    """
+
+    def setUp(self):
+        import tempfile
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        from pipeline import project as pj, lineage
+        card = {"id": "fx", "trigger": "fx", "caption_base": "style", "caption_traits": "omit",
+                "holdout": {"min_sources": 3, "count": 1, "pick": []}}
+        self.project = pj.Project.create("fx", card, folder=self.root / "proj")
+        incoming = self.root / "incoming"
+        incoming.mkdir(parents=True)
+        for name in ("a.png", "b.png", "c.png"):
+            (incoming / name).write_bytes(b"IMG-" + name.encode())
+        self.project.import_sources(sorted(incoming.iterdir()), log=lambda *_: None)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_holdout_json_prints_prompts(self):
+        import contextlib
+        import io as io_mod
+        record = self.project.source_records()[0]
+        self.project.card["holdout"] = {"ids": [record["id"]]}
+        self.project.save()
+        out = io_mod.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = evaluate.main(["holdout", "--project", str(self.project.dir), "--json"])
+        self.assertEqual(code, 0)
+        prompts = json.loads(out.getvalue())
+        self.assertEqual(len(prompts), 1)
+        self.assertTrue(prompts[0]["caption_source"])
+        self.assertTrue(prompts[0]["prompt"])
+
+    def _experiment_fixture(self, matched=4):
+        """`matched` joined pairs and one row whose bytes are not in the project, so both sides of the join show."""
+        import csv as csv_mod
+        from pipeline import lineage
+        exp_dir = self.root / "experiment"
+        (exp_dir / "images" / "qwen_edit").mkdir(parents=True)
+        tasks, csv_rows, score_rows = [], [], []
+        for n in range(matched):
+            slot = f"frm_{n}"
+            image = exp_dir / "images" / "qwen_edit" / f"{slot}__s100{n}.png"
+            image.write_bytes(b"IMG-CANDIDATE-" + str(n).encode())
+            record = lineage.record(image, generator="qwen_edit", parent_ids=["s_a"], train_generation=1,
+                                    edit_depth=1, slot={"slot_id": slot}, prompt="p")
+            self.project.import_candidates([record], log=lambda *_: None)
+            tasks.append({"slot_id": slot, "category": "framing", "method": "qwen_edit", "seed": 1000 + n,
+                          "file": f"images/qwen_edit/{slot}__s100{n}.png", "status": "done"})
+            csv_rows.append({"slot": slot, "method": "qwen_edit", "seed": str(1000 + n),
+                             "task": f"{slot}__qwen_edit__s100{n}", "identity": "5", "instruction": "4",
+                             "quality": "3", "error": "rejected" if n == 0 else "", "note": ""})
+            # the rejected row scores high on purpose: the report must name it (spec R5, rejected-high)
+            score_rows.append({"id": record["id"], "clip_max_cosine": 0.95 if n == 0 else 0.5 + n / 10})
+        other = exp_dir / "images" / "qwen_edit" / "frm_y__s1004.png"
+        other.write_bytes(b"IMG-NOT-IN-PROJECT")
+        tasks.append({"slot_id": "frm_y", "category": "framing", "method": "qwen_edit", "seed": 1004,
+                      "file": "images/qwen_edit/frm_y__s1004.png", "status": "done"})
+        csv_rows.append({"slot": "frm_y", "method": "qwen_edit", "seed": "1004",
+                         "task": "frm_y__qwen_edit__s1004", "identity": "2", "instruction": "2",
+                         "quality": "2", "error": "", "note": ""})
+        (exp_dir / "experiment.json").write_text(json.dumps({"kind": "m0", "tasks": tasks}), encoding="utf-8")
+        scores_csv = exp_dir / "scores.csv"
+        with open(scores_csv, "w", encoding="utf-8", newline="") as handle:
+            writer = csv_mod.DictWriter(handle, fieldnames=("slot", "method", "seed", "task", "identity",
+                                                           "instruction", "quality", "error", "note"))
+            writer.writeheader()
+            writer.writerows(csv_rows)
+        scores_json = exp_dir / "scores.json"
+        scores_json.write_text(json.dumps({"rows": score_rows + [
+            {"id": "c_nobody", "clip_max_cosine": 0.4}]}), encoding="utf-8")
+        return scores_csv, scores_json
+
+    def test_agreement_matches_through_the_manifest_and_names_the_basis(self):
+        import contextlib
+        import io as io_mod
+        scores_csv, scores_json = self._experiment_fixture()
+        out = io_mod.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = evaluate.main(["agreement", "--project", str(self.project.dir), "--scores", str(scores_csv),
+                                  "--automatic", str(scores_json), "--json"])
+        self.assertEqual(code, 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["paired"], 4)
+        self.assertEqual(report["matching"]["basis"],
+                         "experiment manifest: slot, method, seed, image sha256")
+        self.assertEqual(report["matching"]["unmatched"].get("the task's bytes are not in the project"), 1)
+        self.assertIn("top_quartile_agreement", report["overall"])
+        self.assertTrue(all(pair["match"]["candidate"] for pair in report["pairs"]))
+
+    def test_the_agreement_output_names_the_unmatched_reasons(self):
+        import contextlib
+        import io as io_mod
+        scores_csv, scores_json = self._experiment_fixture()
+        report_path = self.root / "agreement.md"
+        out = io_mod.StringIO()
+        with contextlib.redirect_stdout(out):
+            evaluate.main(["agreement", "--project", str(self.project.dir), "--scores", str(scores_csv),
+                           "--automatic", str(scores_json), "--out", str(report_path)])
+        text = out.getvalue() + report_path.read_text(encoding="utf-8")
+        self.assertIn("paired 4", text)
+        self.assertIn("the task's bytes are not in the project", text)
+        self.assertIn("top-quartile agreement", text)
+        self.assertIn("rejected but scored high", text)
 
 
 def write_minimal_export(base):
