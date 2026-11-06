@@ -23,7 +23,10 @@ from pathlib import Path
 HEAD_BYTES = 4 * 1024 * 1024          # a quick hash reads this much at each end of a large model file
 SMALL_FILE = 8 * 1024 * 1024          # below this, a plain sha256 of the whole file is cheaper than three reads
 
-GENERATORS = ("user", "qwen_edit", "krea2_lora", "krea2_lora+qwen_fix")
+# Every engine that can have produced a picture. `ph3_edit` is recorded so a P-H3 edit can be described truthfully;
+# whether it may also *enter a seed set* is a separate question answered by seed.POLICY_GENERATORS, because that
+# depends on the policy a snapshot was written under.
+GENERATORS = ("user", "qwen_edit", "ph3_edit", "krea2_lora", "krea2_lora+qwen_fix")
 DEFAULT_LINEAGE = {"max_train_generation": 2, "seed_max_generation": 1, "max_edit_depth": 1}
 
 

@@ -1,4 +1,4 @@
-﻿"""Tests for the project folder, the review page and the seed snapshot (spec 3.1, 4 M3-1/M4 core, tasks T1-T3)."""
+"""Tests for the project folder, the review page and the seed snapshot (spec 3.1, 4 M3-1/M4 core, tasks T1-T3)."""
 import json
 import sys
 import tempfile
@@ -634,6 +634,33 @@ class SeedEligibilityTests(Base):
         made = self.candidate("lora.png", generator="krea2_lora", parents=())
         self.project.decide(made["id"], "accept")
         self.assertEqual(self.codes(seed.audit(self.project))[made["id"]], "generator_not_eligible")
+
+    def test_a_ph3_edit_is_eligible_under_v2_and_not_under_v1(self):
+        # The same picture, read under two policies, must give two answers - otherwise raising the policy changed
+        # nothing, or silently changed what the older snapshots meant.
+        by_name = self.import_originals(4)
+        made = self.candidate("ph3.png", generator="ph3_edit", parents=(by_name["o1.png"],))
+        self.project.decide(made["id"], "accept")
+        v2 = self.codes(seed.audit(self.project, policy="seed-v2"))
+        self.assertNotIn(made["id"], v2, f"ph3_edit should be eligible under v2, got {v2.get(made['id'])}")
+        v1 = self.codes(seed.audit(self.project, policy="seed-v1"))
+        self.assertEqual(v1[made["id"]], "generator_not_eligible")
+
+    def test_the_default_policy_is_the_one_running(self):
+        # A snapshot must be written under the policy the module declares, or the audit and the identity disagree.
+        self.assertEqual(seed.SEED_POLICY, "seed-v2")
+        self.assertIn("ph3_edit", seed.POLICY_GENERATORS[seed.SEED_POLICY])
+
+    def test_an_unknown_policy_is_refused_instead_of_falling_back_to_the_newest(self):
+        self.import_originals(2)
+        with self.assertRaises(pj.ProjectError) as caught:
+            seed.audit(self.project, policy="seed-v9")
+        self.assertIn("seed-v9", str(caught.exception))
+
+    def test_a_v1_snapshot_keeps_its_own_generator_list(self):
+        # The point of recording the policy is that an old snapshot is not re-judged by new rules.
+        self.assertEqual(seed.POLICY_GENERATORS["seed-v1"], ("qwen_edit",))
+        self.assertNotIn("ph3_edit", seed.POLICY_GENERATORS["seed-v1"])
 
     def test_a_missing_parent_a_cycle_and_a_deep_generation_are_each_named(self):
         by_name = self.import_originals(4)

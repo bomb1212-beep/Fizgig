@@ -47,8 +47,17 @@ INSTRUCTION_FILES = ("caption_instructions.txt", "caption_instructions_anime.txt
 
 # The rules below are part of a snapshot's identity: change one, and old snapshots stay valid under the old policy
 # while new ones are written under this tag.
-SEED_POLICY = "seed-v1"
-SEED_GENERATORS = ("qwen_edit",)
+SEED_POLICY = "seed-v2"
+# v2 adds P-H3 edits alongside Qwen edits. Both are single-image editors whose output is a real picture of the
+# character, so both are eligible; the generator is still recorded per candidate, so a snapshot can always say which
+# engine made each of its synthetic images and a v1 snapshot keeps meaning what it meant.
+SEED_GENERATORS = ("qwen_edit", "ph3_edit")
+# The policy each recorded snapshot was written under. A v1 snapshot is *not* re-evaluated under v2: its identity
+# already commits to the old generator list, and re-reading it would silently change what its pictures mean.
+POLICY_GENERATORS = {
+    "seed-v1": ("qwen_edit",),
+    "seed-v2": ("qwen_edit", "ph3_edit"),
+}
 
 # Exclusion reasons: code -> (category for the report, why it happened, what to do about it)
 EXCLUSIONS = {
@@ -178,7 +187,7 @@ def _reason(code, detail=""):
     return {"code": code, "category": category, "reason": why + (f" ({detail})" if detail else ""), "fix": fix}
 
 
-def audit(project, *, caps=None, log=None):
+def audit(project, *, caps=None, log=None, policy=None):
     """Every source and candidate with its verdict, the reason for it, and the counts that follow.
 
     The result is a report as well as a plan: `kept` (deduplicated by content, with every lineage id that shares the
@@ -186,6 +195,12 @@ def audit(project, *, caps=None, log=None):
     and `shortfall`. Nothing here writes to the project.
     """
     caps = caps or lineage.caps(project.card.get("lineage"))
+    # Which generators count is a property of the policy the snapshot is written under, so an old snapshot keeps the
+    # rule it was built with. An unknown policy is refused rather than defaulting to the newest list.
+    policy = policy or SEED_POLICY
+    if policy not in POLICY_GENERATORS:
+        raise pj.ProjectError(f"unknown seed policy {policy!r} (known: {', '.join(sorted(POLICY_GENERATORS))})")
+    generators = POLICY_GENERATORS[policy]
     holdout = project.holdout_entry()
     holdout_ids = set(holdout["ids"])
     holdout_shas = set(holdout["shas"])
@@ -251,7 +266,7 @@ def audit(project, *, caps=None, log=None):
         if reason == "different_character":
             refuse(record, "different_character")
             continue
-        if record.get("generator") not in SEED_GENERATORS:
+        if record.get("generator") not in generators:
             refuse(record, "generator_not_eligible", str(record.get("generator")))
             continue
         generation = int(record.get("train_generation") or 0)
@@ -396,9 +411,9 @@ def kept_candidates(kept, project, slot):
     return out
 
 
-def plan_inputs(project, *, log=print):
-    """(kept, excluded, holdout entry) for the seed set, under the current eligibility policy."""
-    report = audit(project, log=log)
+def plan_inputs(project, *, log=print, policy=SEED_POLICY):
+    """(kept, excluded, holdout entry) for the seed set, under the given eligibility policy."""
+    report = audit(project, log=log, policy=policy)
     if log:
         counts = report["counts"]
         log(f"[seed] {report['policy']}: kept {counts['kept']} "
@@ -477,7 +492,7 @@ def validate_snapshot(base):
 
 def build_snapshot(project, *, log=print, policy=SEED_POLICY):
     """Write the seed training set and return what describes it (verifying and reusing an existing one)."""
-    report = audit(project)
+    report = audit(project, policy=policy)
     kept = report["kept"]
     caps = report["caps"]
     holdout = report["holdout"]
