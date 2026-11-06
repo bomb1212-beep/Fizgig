@@ -104,7 +104,9 @@ class JournalTests(unittest.TestCase):
         self.assertEqual(prompt_id, "p-123")
         self.assertTrue((self.dir / "journal" / "p-123.json").is_file())
 
-    def test_a_refused_graph_raises_and_records_nothing(self):
+    def test_a_refused_graph_leaves_no_unresolved_record(self):
+        # The server refused the graph, so nothing was submitted; the closed intent says so instead of dangling
+        # (spec R6) - and an unresolved scan must not mistake it for a submission in flight.
         def boom(_req, timeout=None):
             raise comfy.urllib.error.HTTPError("http://x/prompt", 400, "bad", {}, None)
         fake = FakeComfy({})
@@ -112,7 +114,10 @@ class JournalTests(unittest.TestCase):
         with patch.object(client, "_open", side_effect=boom):
             with self.assertRaises(comfy.ComfyError):
                 client.submit({"1": {}})
-        self.assertEqual(list((self.dir / "journal").glob("*.json")), [])
+        self.assertEqual(client.journal.unresolved(), [])
+        intents = [e for e in client.journal.entries() if e.get("status") == "failed"]
+        self.assertEqual(len(intents), 1)
+        self.assertIn("refused", intents[0]["error"])
 
     def test_wait_marks_done_and_returns_outputs(self):
         fake = FakeComfy({"/history/p1": {"p1": {"status": {"status_str": "success"},
@@ -167,6 +172,113 @@ class JournalTests(unittest.TestCase):
         client.journal.record("p1")
         client.recover()
         self.assertEqual(client.journal.read("p1")["status"], comfy.Journal.SUBMITTED)
+
+
+class RecoveryTests(unittest.TestCase):
+    """R6: a lost answer, a failed download and a crash mid-manifest recover without submitting twice."""
+
+    def setUp(self):
+        import tempfile
+        self.temp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def make(self, fake):
+        return comfy.Comfy("http://127.0.0.1:9", journal=self.dir / "journal", opener=fake, timeout=1)
+
+    def test_the_intent_is_on_disk_before_the_post(self):
+        seen = []
+        journal_dir = self.dir / "journal"
+
+        class Watching(FakeComfy):
+            def __call__(self, req, timeout=None):
+                if getattr(req, "data", None) and not seen:
+                    seen.extend(journal_dir.glob("intent-*.json"))
+                return super().__call__(req, timeout)
+
+        client = self.make(Watching({"/prompt": {"prompt_id": "p-123"}}))
+        client.submit({"1": {}}, slot_id="frm_x", seed=1)
+        self.assertEqual(len(seen), 1, "the intent exists while the POST is in flight")
+        self.assertFalse(list((self.dir / "journal").glob("intent-*.json")),
+                         "the answered intent became the prompt's record")
+        record = client.journal.entries()[0]
+        self.assertEqual(record["status"], "submitted")
+        self.assertEqual(record["slot_id"], "frm_x")
+
+    def test_a_lost_answer_is_adopted_from_the_queue_by_client_id(self):
+        client_id = "abc123"
+        fake = FakeComfy({"/queue": {"queue_running": [[0, "p-lost", {}, {"client_id": client_id}, []]],
+                                     "queue_pending": []},
+                          "/history/p-lost": {"p-lost": {"status": {"status_str": "success"},
+                                                         "outputs": {"1": {"images": [
+                                                             {"filename": "x.png", "subfolder": "", "type": "output"}]}}}}})
+        client = self.make(fake)
+        client.journal.record_intent(client_id, slot_id="frm_x", seed=7)
+        settled = client.recover()
+        self.assertIn("p-lost", settled)
+        record = client.journal.read("p-lost")
+        self.assertEqual(record["status"], "done")
+        self.assertEqual(record["slot_id"], "frm_x")
+        self.assertEqual(client.journal.read_intent(client_id), None)
+
+    def test_a_lost_answer_is_adopted_from_history_when_the_queue_forgot_it(self):
+        client_id = "abc123"
+        fake = FakeComfy({
+            "/queue": {"queue_running": [], "queue_pending": []},
+            "/history": {"p-done": {"status": {"status_str": "success"},
+                                    "outputs": {"1": {"images": [
+                                        {"filename": "x.png", "subfolder": "", "type": "output"}]}},
+                                    "prompt": [0, "p-done", {}, {"client_id": client_id}]}},
+            "/history/p-done": {"p-done": {"status": {"status_str": "success"},
+                                           "outputs": {"1": {"images": [
+                                               {"filename": "x.png", "subfolder": "", "type": "output"}]}}}}})
+        client = self.make(fake)
+        client.journal.record_intent(client_id, slot_id="frm_x", seed=7)
+        settled = client.recover()
+        self.assertIn("p-done", settled)
+        self.assertEqual(client.journal.read("p-done")["status"], "done")
+
+    def test_an_untraceable_intent_is_recorded_unconfirmed_not_resubmitted(self):
+        fake = FakeComfy({"/queue": {"queue_running": [], "queue_pending": []}})
+        client = self.make(fake)
+        client.journal.record_intent("gone", slot_id="frm_x", seed=7)
+        client.recover()
+        intents = [e for e in client.journal.entries() if e.get("client_id") == "gone"]
+        self.assertEqual(intents[0]["status"], "failed")
+        self.assertIn("unconfirmed", intents[0]["error"])
+        self.assertEqual(fake.posted(), [], "recovery never submits anything")
+
+    def test_a_done_cell_whose_image_never_landed_is_fetched_not_resubmitted(self):
+        from PIL import Image
+        import io as io_mod
+        buffer = io_mod.BytesIO()
+        Image.new("RGB", (4, 4), (1, 2, 3)).save(buffer, format="PNG")
+        png = buffer.getvalue()
+        fake = FakeComfy({"/view": png})
+        client = self.make(fake)
+        client.journal.record("p1", slot_id="frm_back", method="krea2_b", seed=2000)
+        client.journal.update("p1", "done", images=[{"filename": "f.png", "subfolder": "", "type": "output"}])
+        out = self.dir / "out.png"
+        data = client.run({"1": {}}, out, slot_id="frm_back", method="krea2_b", seed=2000)
+        self.assertEqual(data, png)
+        self.assertTrue(out.is_file())
+        self.assertEqual(fake.posted(), [], "the recorded output is fetched, not generated again")
+
+    def test_a_done_record_for_a_present_file_is_ignored(self):
+        fake = FakeComfy({"/prompt": {"prompt_id": "p2"},
+                          "/history/p2": {"p2": {"status": {"status_str": "success"},
+                                                 "outputs": {"1": {"images": [
+                                                     {"filename": "f.png", "subfolder": "",
+                                                      "type": "output"}]}}}}})
+        client = self.make(fake)
+        client.journal.record("p1", slot_id="frm_back", method="krea2_b", seed=2000)
+        client.journal.update("p1", "done", images=[{"filename": "f.png", "subfolder": "", "type": "output"}])
+        out = self.dir / "out.png"
+        out.write_bytes(b"already here")
+        client.run({"1": {}}, out, slot_id="frm_back", method="krea2_b", seed=2000)
+        self.assertEqual(len(fake.posted()), 1, "the file exists: this is a normal draw, not a recovery")
 
 
 class AtomicWriteTests(unittest.TestCase):

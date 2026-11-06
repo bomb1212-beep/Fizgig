@@ -58,10 +58,12 @@ class Journal:
     """One small JSON file per submitted prompt, written atomically.
 
     A file per prompt keeps the record independent of append ordering: a crash can only lose the prompt whose file
-    was being written, and that prompt was never submitted (the record is written before the POST).
+    was being written, and that prompt was never submitted (the record is written before the POST). The submit itself
+    is preceded by an *intent* record keyed by client id - the prompt id does not exist until ComfyUI answers, so the
+    intent is what makes a lost response recoverable instead of a silent double submission (spec R6).
     """
 
-    SUBMITTED, DONE, FAILED, CANCELLED = "submitted", "done", "failed", "cancelled"
+    SENDING, SUBMITTED, DONE, FAILED, CANCELLED = "sending", "submitted", "done", "failed", "cancelled"
 
     def __init__(self, folder):
         self.folder = Path(folder)
@@ -69,10 +71,40 @@ class Journal:
     def path(self, prompt_id):
         return self.folder / (prompt_id + ".json")
 
+    def intent_path(self, client_id):
+        return self.folder / f"intent-{client_id}.json"
+
     def record(self, prompt_id, **meta):
         data = {"prompt_id": prompt_id, "status": self.SUBMITTED, "at": time.time(), **meta}
         _atomic_write(self.path(prompt_id), json.dumps(data, ensure_ascii=False, indent=1).encode())
         return data
+
+    def record_intent(self, client_id, **meta):
+        """The submit's intent, on disk before the POST: enough to know a submission may be in flight."""
+        data = {"client_id": client_id, "status": self.SENDING, "at": time.time(), **meta}
+        _atomic_write(self.intent_path(client_id), json.dumps(data, ensure_ascii=False, indent=1).encode())
+        return data
+
+    def commit_intent(self, client_id, prompt_id, **meta):
+        """The POST answered: the intent becomes the prompt's own record and the intent file goes away."""
+        intent = self.read_intent(client_id) or {}
+        carried = {k: v for k, v in intent.items() if k not in ("status", "at", "updated_at")}
+        self.record(prompt_id, **{**carried, **meta, "client_id": client_id})
+        self.intent_path(client_id).unlink(missing_ok=True)
+        return self.read(prompt_id)
+
+    def drop_intent(self, client_id, status=FAILED, **extra):
+        """A submit that never happened (the server refused the graph): the intent is closed, not left dangling."""
+        intent = self.read_intent(client_id) or {}
+        data = {**intent, "status": status, "updated_at": time.time(), **extra}
+        _atomic_write(self.intent_path(client_id), json.dumps(data, ensure_ascii=False, indent=1).encode())
+        return data
+
+    def read_intent(self, client_id):
+        try:
+            return json.loads(self.intent_path(client_id).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
 
     def update(self, prompt_id, status, **extra):
         data = self.read(prompt_id) or {"prompt_id": prompt_id, "at": time.time()}
@@ -98,8 +130,17 @@ class Journal:
         return out
 
     def unresolved(self):
-        """Prompts whose outcome is still unknown: submitted, and never marked done, failed or cancelled."""
-        return [e for e in self.entries() if e.get("status") == self.SUBMITTED]
+        """Prompts whose outcome is still unknown: submitted, or sending when the answer was lost."""
+        return [e for e in self.entries() if e.get("status") in (self.SUBMITTED, self.SENDING)]
+
+    def find_done(self, meta):
+        """The done record whose metadata matches this cell, or None - the anchor for a download recovery."""
+        for entry in self.entries():
+            if entry.get("status") != self.DONE or not (entry.get("images") or []):
+                continue
+            if all(entry.get(key) == value for key, value in meta.items()):
+                return entry
+        return None
 
 
 class Comfy:
@@ -235,20 +276,31 @@ class Comfy:
 
     # ------------------------------------------------------------------ prompts
     def submit(self, graph, **meta):
-        """Queue a graph and return its prompt_id, with the id already on disk when this returns."""
+        """Queue a graph and return its prompt_id, with the id already on disk when this returns.
+
+        The intent is on disk *before* the POST (spec R6): a crash between the request and its answer leaves a record
+        that says a submission may be in flight, which `recover` can then settle by client id instead of the caller
+        submitting the same graph twice.
+        """
         client_id = uuid.uuid4().hex
+        if self.journal:
+            self.journal.record_intent(client_id, **meta)
         body = json.dumps({"prompt": graph, "client_id": client_id}).encode()
         req = urllib.request.Request(self.url + "/prompt", body, {"Content-Type": "application/json"})
         try:
             answer = json.loads(self._open(req).read())
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode(errors="replace")[:2000]
+            if self.journal:
+                self.journal.drop_intent(client_id, error=f"refused: {detail}")
             raise ComfyError(f"ComfyUI refused the graph: {detail}") from exc
         prompt_id = answer.get("prompt_id")
         if not prompt_id:
+            if self.journal:
+                self.journal.drop_intent(client_id, error=f"no prompt_id in {answer}")
             raise ComfyError(f"ComfyUI answered without a prompt_id: {answer}")
         if self.journal:
-            self.journal.record(prompt_id, client_id=client_id, **meta)
+            self.journal.commit_intent(client_id, prompt_id, **meta)
         return prompt_id
 
     def history(self, prompt_id):
@@ -306,7 +358,20 @@ class Comfy:
                 pass
 
     def run(self, graph, out_path=None, cancel=None, timeout=None, **meta):
-        """Submit, wait, and return the first output image's bytes (written to `out_path` atomically if given)."""
+        """Submit, wait, and return the first output image's bytes (written to `out_path` atomically if given).
+
+        A done journal record for the same cell whose image never landed on disk is a download failure, not a job to
+        run again: its output is fetched from the recorded entry instead of submitting the graph a second time
+        (spec R6).
+        """
+        if out_path and self.journal:
+            done = self.journal.find_done(meta)
+            if done and not Path(out_path).is_file():
+                image = (done.get("images") or [None])[0]
+                if image:
+                    data = self.image_bytes(image)
+                    _atomic_write(out_path, data)
+                    return data
         prompt_id = self.submit(graph, **meta)
         outputs = self.wait(prompt_id, timeout=timeout, cancel=cancel)
         image = next((i for o in outputs.values() for i in (o.get("images") or [])), None)
@@ -317,18 +382,52 @@ class Comfy:
             _atomic_write(out_path, data)
         return data
 
+    def _clients_in_flight(self):
+        """{client_id: prompt_id} for everything queued or recorded in history, so a lost answer can be adopted."""
+        in_flight = {}
+        try:
+            for item in list(self.queue().get("queue_running") or []) + list(self.queue().get("queue_pending") or []):
+                if isinstance(item, list) and len(item) > 3:
+                    client_id = (item[3] or {}).get("client_id")
+                    if client_id:
+                        in_flight[client_id] = item[1]
+        except (OSError, ComfyError):
+            pass
+        try:
+            history = json.loads(self._get("/history?max_items=500"))
+            for prompt_id, entry in (history or {}).items():
+                prompt = entry.get("prompt") or []
+                extra = prompt[3] if len(prompt) > 3 else {}
+                client_id = (extra or {}).get("client_id")
+                if client_id:
+                    in_flight.setdefault(client_id, prompt_id)
+        except (OSError, ComfyError, ValueError):
+            pass
+        return in_flight
+
     def recover(self, cancel=None):
         """Give every journalled prompt whose outcome is unknown a verdict, using /history.
 
         Returns {prompt_id: entry} for the ones this call settled. A prompt ComfyUI does not know about any more has
-        been lost with the server's process, so it is recorded failed rather than left dangling.
+        been lost with the server's process, so it is recorded failed rather than left dangling. A *sending* intent -
+        the record of a submit whose answer was lost - is settled by client id: adopted when the queue or the history
+        still knows it, and recorded failed when the server has no trace at all (spec R6).
         """
         settled = {}
         if not self.journal:
             return settled
         queued = set(self.queued_ids())
+        in_flight = self._clients_in_flight()
         for record in self.journal.unresolved():
-            prompt_id = record["prompt_id"]
+            prompt_id = record.get("prompt_id")
+            if record.get("status") == Journal.SENDING and not prompt_id:
+                prompt_id = in_flight.get(record.get("client_id"))
+                if not prompt_id:
+                    self.journal.drop_intent(record["client_id"], status=Journal.FAILED,
+                                             error="unconfirmed: the answer was lost and the server has no trace")
+                    settled[f"intent-{record.get('client_id')}"] = None
+                    continue
+                self.journal.commit_intent(record["client_id"], prompt_id)
             entry = self.history(prompt_id)
             if entry is None:
                 if prompt_id in queued:

@@ -94,6 +94,13 @@ def queue_owner_running():
 def read_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8-sig"))
 
+
+def _pid_of_lock(path):
+    try:
+        return int(Path(path).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
 def write_json(path, obj):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -666,6 +673,13 @@ def main():
             raise ValueError("Environment check failed: " + "; ".join(failures))
         return
     lock = AUTO / "queue.lock"
+    # The other direction of the same gate (spec R6): a generation CLI that is submitting work holds the GPU claim,
+    # and training starting under it would contend for the same card.
+    from pipeline import gpu as pipeline_gpu
+    if pipeline_gpu.generation_claim_active(AUTO):
+        from pipeline import gpu
+        raise ValueError("a generation run holds the GPU claim (automation/gpu.lock); training would contend for "
+                         f"the same GPU - wait for it to finish (pid {_pid_of_lock(AUTO / gpu.GENERATION_LOCK)})")
     try:
         with lock.open("x", encoding="utf-8") as handle:
             handle.write(str(os.getpid()))
@@ -692,9 +706,35 @@ def main():
                                                        "files": result.files})
                 print("Plan saved:", run / "launch_plan.json")
             if args.command == "run":
+                free_comfy_before_training(cfg)
                 execute(run, cfg, len(images))
     finally:
         lock.unlink(missing_ok=True)
+
+
+def free_comfy_before_training(cfg, *, client=None, log=print):
+    """Return the generation server's VRAM before training starts, when nothing is running on it.
+
+    Training and the generation server share one GPU, and ComfyUI holds its loaded weights until it is asked to let
+    go (spec R6). The release happens only when the server answers and has no request running: freeing under a live
+    request would yank models out from under it. An unreachable server is skipped, not an error - training does not
+    depend on it.
+    """
+    url = ((cfg.get("comfy") or {}).get("url")) or ""
+    if not url:
+        log("no ComfyUI server in the config; skipping the VRAM release")
+        return False
+    from pipeline.comfy import Comfy
+    client = client or Comfy(str(url))
+    if not client.ping():
+        log(f"ComfyUI at {url} is not reachable; skipping the VRAM release")
+        return False
+    if not client.idle():
+        log(f"ComfyUI at {url} has requests running; not freeing VRAM mid-flight")
+        return False
+    client.free()
+    log(f"ComfyUI at {url} released its VRAM for training")
+    return True
 
 if __name__ == "__main__":
     try:

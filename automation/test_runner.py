@@ -244,3 +244,49 @@ class RunnerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FreeBeforeTrainingTests(unittest.TestCase):
+    """R6: training asks the generation server for its VRAM back, but only when nothing is running on it."""
+
+    def setUp(self):
+        self.calls = []
+
+    def client(self, *, answers_ping=True, answers_idle=True):
+        class FakeComfy:
+            def ping(self):
+                return answers_ping
+
+            def idle(self):
+                return answers_idle
+
+            def free(self):
+                self.calls.append("free")
+                return {}
+
+        fake = FakeComfy()
+        fake.calls = self.calls
+        return fake
+
+    def cfg(self, url="http://127.0.0.1:8190"):
+        return {"comfy": {"url": url}}
+
+    def test_an_idle_server_frees_its_vram(self):
+        fake = self.client()
+        self.assertTrue(runner.free_comfy_before_training(self.cfg(), client=fake, log=lambda *_: None))
+        self.assertEqual(fake.calls, ["free"])
+
+    def test_a_busy_server_is_not_interrupted(self):
+        fake = self.client(answers_idle=False)
+        self.assertFalse(runner.free_comfy_before_training(self.cfg(), client=fake, log=lambda *_: None))
+        self.assertEqual(fake.calls, [], "freeing under a live request would yank its models")
+
+    def test_an_unreachable_server_is_skipped(self):
+        fake = self.client(answers_ping=False)
+        self.assertFalse(runner.free_comfy_before_training(self.cfg(), client=fake, log=lambda *_: None))
+        self.assertEqual(fake.calls, [])
+
+    def test_no_server_in_the_config_is_skipped(self):
+        self.assertFalse(runner.free_comfy_before_training({"comfy": {}}, client=self.client(),
+                                                          log=lambda *_: None))
+        self.assertEqual(self.calls, [])

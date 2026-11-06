@@ -668,8 +668,14 @@ def main(argv=None):
         drawn, skipped, failed = [], 0, []
         if args.draw:
             seeds = tuple(int(s) for s in str(args.seeds).split(",") if s.strip())
-            drawn, skipped, failed = draw_holdout(project, family=args.family, seeds=seeds,
-                                                  client=None if not args.comfy else _client(args.comfy))
+            from . import gpu
+            claim = gpu.claim_generation(what="the holdout draw")
+            try:
+                with claim:
+                    drawn, skipped, failed = draw_holdout(project, family=args.family, seeds=seeds,
+                                                          client=None if not args.comfy else _client(args.comfy))
+            finally:
+                claim.release()
             print(f"holdout draw: {len(drawn)} image(s), {skipped} already present, {len(failed)} failed")
             for row in failed:
                 print(f'  FAILED {row["id"]} s{row["seed"]}: {row["error"][:160]}')

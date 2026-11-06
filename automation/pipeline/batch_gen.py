@@ -501,16 +501,22 @@ def main(argv=None):
         if not manifest["tasks"]:
             print("[batch_b] nothing to draw: every short slot is waiting on review")
             return 0
-        client = epochs_mod.make_client(args.comfy)
-        if not client.ping():
-            raise BatchError(f"ComfyUI is not answering at {client.url}")
-        problems = models.problems("krea2", require_optional=("krea2_turbo_lora",))
-        if problems:
-            raise BatchError("model problems: " + "; ".join(problems))
-        names = epochs_mod.resolve_names(client)
-        names["character_lora"] = client.name_for("lora", character_lora_path(project))
-        cancel = make_cancel(args.cancel_file)
-        done, skipped, failed = run(project, manifest, client=client, names=names, cancel=cancel)
+        from . import gpu
+        claim = gpu.claim_generation(what="batch B")
+        try:
+            with claim:
+                client = epochs_mod.make_client(args.comfy)
+                if not client.ping():
+                    raise BatchError(f"ComfyUI is not answering at {client.url}")
+                problems = models.problems("krea2", require_optional=("krea2_turbo_lora",))
+                if problems:
+                    raise BatchError("model problems: " + "; ".join(problems))
+                names = epochs_mod.resolve_names(client)
+                names["character_lora"] = client.name_for("lora", character_lora_path(project))
+                cancel = make_cancel(args.cancel_file)
+                done, skipped, failed = run(project, manifest, client=client, names=names, cancel=cancel)
+        finally:
+            claim.release()
         if cancel is not None and cancel():
             print("paused: the remaining cells are still pending, so this command continues them")
         # The exit code tells the truth about partial work: a run that drew some cells and failed others did not

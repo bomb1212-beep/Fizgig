@@ -498,9 +498,15 @@ def main(argv=None):
             if args.json:
                 print(json.dumps({"planned": 0, "gaps": len(manifest["gaps"])}, ensure_ascii=False))
             return 0
-        client = epochs_mod.make_client(args.comfy)
-        cancel = (lambda: Path(args.cancel_file).is_file()) if args.cancel_file else None
-        run(project, manifest, client=client, cancel=cancel)
+        from . import gpu
+        claim = gpu.claim_generation(what="the P-H3 edit")
+        try:
+            with claim:
+                client = epochs_mod.make_client(args.comfy)
+                cancel = (lambda: Path(args.cancel_file).is_file()) if args.cancel_file else None
+                run(project, manifest, client=client, cancel=cancel)
+        finally:
+            claim.release()
         failed = sum(1 for task in manifest["tasks"] if task.get("status") == "failed")
         if failed:
             # Partial work is not a finished run: the import still recovers what was drawn, and the exit code says
