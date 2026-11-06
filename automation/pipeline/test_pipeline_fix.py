@@ -24,7 +24,10 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
-        self.project = pj.Project.create("demo", dict(CARD), folder=self.root / "demo")
+        self.tool2_config = self.root / "jobs.json"
+        self.tool2_config.write_text(json.dumps({"models": {}}), encoding="utf-8")
+        card = dict(CARD, tool2={"config": str(self.tool2_config)})
+        self.project = pj.Project.create("demo", card, folder=self.root / "demo")
         self.chars = self.root / "chars"
         self.chars.mkdir()
 
@@ -309,6 +312,75 @@ class ImportTests(Base):
         html = review.write_page(self.project, self.root / "review.html", log=lambda *_: None).read_text("utf-8")
         self.assertIn('class="pair"', html)
         self.assertIn("원본", html)
+
+
+class RecoveryTests(Base):
+    """R4: an import that was interrupted recovers its pictures through the sidecar, and the engine is the plan's."""
+
+    def _corrected(self, plan_data):
+        out = Path(plan_data["jobs"][0]["out"])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(TINY_PNG + b"CORRECTED")
+        return out
+
+    def test_a_skipped_row_with_a_verified_sidecar_is_recovered(self):
+        sources = self.origins()
+        target = self.candidate("fixme.png", parents=[sources["o1.png"]])
+        data = fix.plan(self.project, log=lambda *_: None)
+        out = self._corrected(data)
+        job = data["jobs"][0]
+        out.with_name(out.name + ".fix.json").write_text(json.dumps({
+            "input": lineage.quick_hash(Path(job["input"])),
+            "graph_version": data["graph_version"]}), encoding="utf-8")
+        results = [{"input": job["input"], "out": str(out), "status": "skipped"}]
+        outcome = fix.import_corrections(self.project, data, results, log=lambda *_: None)
+        self.assertEqual(len(outcome["records"]), 1, "the interrupted import recovers its picture")
+        self.assertEqual(outcome["records"][0]["result_row_status"], "skipped")
+
+    def test_a_skipped_row_without_a_sidecar_is_not_recovered(self):
+        sources = self.origins()
+        self.candidate("fixme.png", parents=[sources["o1.png"]])
+        data = fix.plan(self.project, log=lambda *_: None)
+        out = self._corrected(data)
+        results = [{"input": data["jobs"][0]["input"], "out": str(out), "status": "skipped"}]
+        outcome = fix.import_corrections(self.project, data, results, log=lambda *_: None)
+        self.assertEqual(outcome["records"], [])
+        self.assertIn("sidecar", outcome["skipped"][0]["reason"])
+
+    def test_a_sidecar_naming_other_bytes_is_not_evidence(self):
+        sources = self.origins()
+        self.candidate("fixme.png", parents=[sources["o1.png"]])
+        data = fix.plan(self.project, log=lambda *_: None)
+        out = self._corrected(data)
+        job = data["jobs"][0]
+        other = self.root / "other.png"
+        other.write_bytes(TINY_PNG + b"OTHER")
+        out.with_name(out.name + ".fix.json").write_text(json.dumps({
+            "input": lineage.quick_hash(other), "graph_version": data["graph_version"]}), encoding="utf-8")
+        results = [{"input": job["input"], "out": str(out), "status": "skipped"}]
+        outcome = fix.import_corrections(self.project, data, results, log=lambda *_: None)
+        self.assertEqual(outcome["records"], [])
+
+    def test_the_plan_records_the_engine_the_project_chose(self):
+        self.origins()
+        self.candidate("fixme.png", parents=[self.project.source_records()[0]["id"]])
+        data = fix.plan(self.project, log=lambda *_: None)
+        self.assertEqual(data["engine"], "qwen")
+        self.assertTrue(Path(data["config"]).is_file())
+
+    def test_a_ph3_plan_records_a_ph3_correction(self):
+        self.tool2_config.write_text(json.dumps({"models": {"backend": "p_h3"}}), encoding="utf-8")
+        sources = self.origins()
+        self.candidate("fixme.png", parents=[sources["o1.png"]], depth=0, generation=1)
+        data = fix.plan(self.project, log=lambda *_: None)
+        self.assertEqual(data["engine"], "ph3")
+        out = self._corrected(data)
+        results = [{"input": data["jobs"][0]["input"], "out": str(out), "status": "done", "steps": 8, "cfg": 1.0,
+                    "resolution": 1024, "seed": 7}]
+        outcome = fix.import_corrections(self.project, data, results, log=lambda *_: None)
+        self.assertEqual(len(outcome["records"]), 1)
+        self.assertEqual(outcome["records"][0]["generator"], "ph3_edit")
+        self.assertEqual(outcome["records"][0]["models"]["family"], "ph3")
 
 
 if __name__ == "__main__":

@@ -49,6 +49,23 @@ def corrections_of(project, target_id):
     return [record for record in project.candidates() if record.get("fix_of") == target_id]
 
 
+def chosen_engine(project):
+    """(config path, engine, graph_version) - the tool2 run settings the project itself chose.
+
+    The card names the config file; whether that config draws on Qwen or on P-H3 decides what a correction made with
+    it must be recorded as (spec R4). A missing or unreadable config is a refusal, not a guess.
+    """
+    path = str(((project.card.get("tool2") or {}).get("config")) or "")
+    if not path:
+        raise pj.ProjectError("the card's tool2 block names no config, so the correction engine cannot be chosen")
+    config = gen.read_json(path)
+    if not config:
+        raise pj.ProjectError(f"the card's tool2 config is not readable: {path}")
+    engine = "ph3" if str(((config.get("models") or {}).get("backend")) or "") == "p_h3" else "qwen"
+    graph = gen.tool_graph_version(gen.tool_paths()["batch"], config.get("models"))
+    return {"config": path, "engine": engine, "graph_version": graph}
+
+
 def plan(project, *, refs="none", redo=(), log=print):
     """The corrections to run: {batch, jobs, blocked, refs, prompts, already}.
 
@@ -124,8 +141,10 @@ def plan(project, *, refs="none", redo=(), log=print):
         log(f"  blocked {row['id']}: {row['reason']}")
     for row in already:
         log(f"  already corrected {row['id']}: {', '.join(row['corrected_as'])}")
+    chosen = chosen_engine(project)
+    log(f"[fix] engine {chosen['engine']} ({chosen['config']}, graph {chosen['graph_version']})")
     return {"batch": batch, "folder": str(folder), "jobs": jobs, "blocked": blocked, "already": already, "refs": refs,
-            "reference_ids": reference_ids, "default_prompt": DEFAULT_FIX_PROMPT}
+            "reference_ids": reference_ids, "default_prompt": DEFAULT_FIX_PROMPT, **chosen}
 
 
 def batch_id(jobs, refs):
@@ -152,6 +171,10 @@ def run(plan_data, *, python=None, log=print, on_event=None, cancel_file=None, t
         payload.append(row)
     jobs_path.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
     command += ["--fix-jobs", str(jobs_path), "--result-json", str(result_path), "--events"]
+    if plan_data.get("config"):
+        # The correction runs on the settings the project itself chose, not on whatever tool2 defaults to today
+        # (spec R4): the engine a record names has to be the engine that actually drew the picture.
+        command += ["--config", str(plan_data["config"])]
     if cancel_file:
         command += ["--cancel-file", str(cancel_file)]
     log(f"[fix] {' '.join(command)}")
@@ -183,20 +206,58 @@ def run(plan_data, *, python=None, log=print, on_event=None, cancel_file=None, t
     return gen.read_json(result_path).get("jobs") or []
 
 
+def sidecar_verified(out, job, *, graph_version):
+    """Does the correction's own sidecar vouch for these bytes being this job's output?
+
+    An interruption between saving the picture and importing it leaves no result row; the re-run reports the picture
+    as `skipped - already there, from the same inputs and recipe`. That is recoverable only when the sidecar the fix
+    mode wrote still matches the job's input bytes and the graph that drew it - a sidecar naming other bytes, or no
+    sidecar at all, is not evidence (spec R4).
+    """
+    sidecar = out.with_name(out.name + ".fix.json")
+    data = gen.read_json(sidecar) if sidecar.is_file() else None
+    if not data:
+        return False
+    source = Path(job["input"])
+    if not source.is_file():
+        return False
+    try:
+        if data.get("input") != lineage.quick_hash(source):
+            return False
+    except OSError:
+        return False
+    return not graph_version or str(data.get("graph_version") or "") == str(graph_version)
+
+
 def import_corrections(project, plan_data, results, *, log=print):
     """Record what was corrected as new candidates: the image it corrects, one edit deeper, same generation.
 
-    A row tool2 did not report as `done` is not imported. The corrected picture is copied into the project's own
-    candidates folder by `Project.import_candidates`, so the correction keeps its provenance even if the fix folder is
-    cleaned up later.
+    A row tool2 reported `done` is imported; so is a `skipped - already there` row whose sidecar still verifies, which
+    is how an import that was interrupted recovers its pictures without drawing them twice (spec R4). Anything else -
+    failed, no row, an unverifiable sidecar - is refused with its reason. The engine is the plan's: the generator and
+    family a record carries are the ones that actually drew the picture. The corrected picture is copied into the
+    project's own candidates folder by `Project.import_candidates`, so the correction keeps its provenance even if the
+    fix folder is cleaned up later.
     """
+    engine = plan_data.get("engine") or "qwen"
+    generator = gen.ENGINE_GENERATOR[engine]
+    family = gen.ENGINE_FAMILY[engine]
+    graph_version = plan_data.get("graph_version") or ""
     rows = {Path(row.get("out") or "").name: row for row in results or []}
     records, skipped = [], []
     for job in plan_data["jobs"]:
         out = Path(job["out"])
         row = rows.get(out.name) or {}
-        if row.get("status") != "done" or not out.is_file():
-            skipped.append({"id": job["id"], "reason": row.get("error") or row.get("status") or "no result row"})
+        status = row.get("status")
+        if status == "done" and out.is_file():
+            pass
+        elif status == "skipped" and out.is_file() and sidecar_verified(out, job, graph_version=graph_version):
+            row = {**row, "graph_version": row.get("graph_version") or graph_version}
+        else:
+            reason = row.get("error") or row.get("status") or "no result row"
+            if status == "skipped" and out.is_file():
+                reason = "the output exists but its sidecar does not verify it as this correction"
+            skipped.append({"id": job["id"], "reason": reason})
             continue
         # The row's `resolution` is a budget of resolution**2 pixels, not a pixel count: the graph takes the shape
         # from the first input, so 1541 came back as 1216x1952. The record keeps what the file actually is.
@@ -206,13 +267,15 @@ def import_corrections(project, plan_data, results, *, log=print):
         except (OSError, ValueError):
             pass
         record = lineage.record(
-            out, generator="qwen_edit", parent_ids=[job["id"]] + list(job.get("ref_ids") or []),
+            out, generator=generator, parent_ids=[job["id"]] + list(job.get("ref_ids") or []),
             train_generation=int(job.get("generation") or 0), edit_depth=int(job.get("edit_depth") or 0) + 1,
             slot={"slot_id": job.get("slot"), "category": job.get("category")},
             prompt=job["prompt"], seed=row.get("seed"), steps=row.get("steps"), cfg=row.get("cfg"),
             width=width, height=height,
-            graph_version=f"tool2:{row.get('graph_version') or ''}".rstrip(":"),
+            graph_version=f"tool2:{row.get('graph_version') or graph_version}".rstrip(":"),
             fix_of=job["id"], fix_batch=plan_data["batch"], fix_prompt_source=job["prompt_source"],
+            models={"family": family},
+            result_row_status=status,
             resolution_budget=row.get("resolution"))
         caption = gen._caption_of(out)
         source = "the correction's own caption"

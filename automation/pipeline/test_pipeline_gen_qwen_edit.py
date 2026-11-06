@@ -18,27 +18,31 @@ for entry in (str(ROOT / "src"), str(AUTO)):
 from pipeline import gen_qwen_edit as gen  # noqa: E402
 from pipeline import lineage, models  # noqa: E402
 
-FAKE_TOOL2 = '''\
-import json, sys
+FAKE_TOOL2 = '''import json, sys
 from pathlib import Path
-args = sys.argv[1:]
-def value(flag):
+GRAPH_VERSION = "fake@1"
+def value(flag, args):
     return args[args.index(flag) + 1] if flag in args else None
-out = Path(value("--out")) / value("--character")
-result_arg = value("--result-json")
-if "--dry-run" in args:
-    print("   framing_00_abcdefabcdef_s1000 [front.png]: a plan line", flush=True)
-    sys.exit(0)
-print(json.dumps({"kind": "run", "character": value("--character"), "planned": 2}), flush=True)
-print(json.dumps({"kind": "image", "stem": "framing_00_abc_s1000", "status": "done"}), flush=True)
-print("a human line on stderr", file=sys.stderr, flush=True)
-out.mkdir(parents=True, exist_ok=True)
-made = out / "framing_00_abcdefabcdef_s1000.png"
-made.write_bytes(b"MADE-BY-TOOL2")
-Path(result_arg).write_text(json.dumps({"version": 1, "graph_version": "fake@1", "characters": [
-    {"folder": value("--character"), "planned": 1, "done": 1, "generated": [
-        {"stem": "framing_00_abcdefabcdef_s1000", "file": str(made), "category": "framing"}]}]}), encoding="utf-8")
-print(json.dumps({"kind": "summary", "done": 1, "skipped": 0, "failed": 0}), flush=True)
+def _cli():
+    # tool_graph_version() loads this file as a module to read GRAPH_VERSION; the CLI body must not run then.
+    args = sys.argv[1:]
+    out = Path(value("--out", args)) / value("--character", args)
+    result_arg = value("--result-json", args)
+    if "--dry-run" in args:
+        print("   framing_00_abcdefabcdef_s1000 [front.png]: a plan line", flush=True)
+        sys.exit(0)
+    print(json.dumps({"kind": "run", "character": value("--character", args), "planned": 2}), flush=True)
+    print(json.dumps({"kind": "image", "stem": "framing_00_abc_s1000", "status": "done"}), flush=True)
+    print("a human line on stderr", file=sys.stderr, flush=True)
+    out.mkdir(parents=True, exist_ok=True)
+    made = out / "framing_00_abcdefabcdef_s1000.png"
+    made.write_bytes(b"MADE-BY-TOOL2")
+    Path(result_arg).write_text(json.dumps({"version": 1, "graph_version": "fake@1", "characters": [
+        {"folder": value("--character", args), "planned": 1, "done": 1, "generated": [
+            {"stem": "framing_00_abcdefabcdef_s1000", "file": str(made), "category": "framing"}]}]}), encoding="utf-8")
+    print(json.dumps({"kind": "summary", "done": 1, "skipped": 0, "failed": 0}), flush=True)
+if __name__ == "__main__":
+    _cli()
 '''
 
 
@@ -486,6 +490,93 @@ class ProjectImportTests(SnapshotTests):
         self.assertEqual(code, 0)
         self.assertEqual(len(self.proj.candidates()), before)
         self.assertEqual(len(self.proj.candidates()), 1)
+
+
+class EngineTests(ProjectImportTests):
+    """R4: the record names the engine that actually drew the picture, and only rows that belong to the run."""
+
+    def _ph3_card(self):
+        config = self.dir / "ph3-jobs.json"
+        config.write_text(json.dumps({
+            "comfy_url": "http://127.0.0.1:8192", "resolution": 1024, "base_seed": 1000, "seeds_per_job": 1,
+            "models": {"unet": "u", "clip": "c", "vae": "v", "backend": "p_h3"},
+            "characters": [{"folder": "tester", "trigger": "trg", "edit_bases": 1}],
+        }, ensure_ascii=False), encoding="utf-8")
+        return {"id": "tester", "tool2": {"config": str(config), "character": "tester",
+                                          "characters": str(self.chars)}}
+
+    def _result_with(self, snap, **row_extra):
+        made = Path(snap["out"]) / "framing_00_abcdefabcdef_s1000.png"
+        made.write_bytes(b"MADE-BY-TOOL2")
+        (Path(snap["out"]) / "manifest.jsonl").write_text(json.dumps(
+            {"file": made.name, "source": "front.png", "prompt": "Zoom in.", "seed": 1003}) + "\n", encoding="utf-8")
+        row = {"stem": "framing_00_abcdefabcdef_s1000", "file": str(made), "category": "framing",
+               "prompt": "Zoom in.", "seed": 1003}
+        row.update(row_extra)
+        return {"graph_version": "fake@1", "characters": [{"folder": "tester", "generated": [row]}]}
+
+    def test_a_p_h3_run_records_itself_as_ph3_edit(self):
+        snap = gen.build_snapshot(self.project, self._ph3_card(), paths=self.paths, log=lambda *_: None)
+        records, _skipped, report = gen.import_candidates(self.proj.dir, self.card, snap,
+                                                          self._result_with(snap), log=lambda *_: None)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["generator"], "ph3_edit")
+        self.assertEqual(records[0]["models"]["family"], "ph3")
+        self.assertEqual(report["engine"], "ph3")
+
+    def test_a_qwen_run_records_itself_as_qwen_edit(self):
+        snap = self.snapshot()
+        records, _skipped, report = gen.import_candidates(self.proj.dir, self.card, snap,
+                                                          self._result_with(snap), log=lambda *_: None)
+        self.assertEqual(records[0]["generator"], "qwen_edit")
+        self.assertEqual(records[0]["models"]["family"], "qwen_image21")
+        self.assertEqual(report["engine"], "qwen")
+
+    def test_a_skipped_row_that_the_rerun_reported_is_still_imported(self):
+        # The interrupted-import case: the picture was saved, the process died, the re-run reports it as
+        # "skipped - already there". The row carries no prompt or seed, so tool2's manifest supplies them.
+        snap = self.snapshot()
+        result = self._result_with(snap)
+        row = result["characters"][0]["generated"].pop()
+        (Path(snap["out"]) / "manifest.jsonl").write_text(json.dumps(
+            {"file": row["file"], "source": "front.png", "prompt": "Zoom in.", "seed": 1003}) + "\n", encoding="utf-8")
+        result["characters"][0]["skipped"] = [{**row, "reason": "already there"}]
+        records, skipped, _report = gen.import_candidates(self.proj.dir, self.card, snap, result,
+                                                          log=lambda *_: None)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["prompt"], "Zoom in.")
+        self.assertEqual(records[0]["seed"], 1003)
+        self.assertEqual(records[0]["result_row_status"], "skipped")
+
+    def test_a_rejected_row_is_never_imported(self):
+        snap = self.snapshot()
+        result = self._result_with(snap)
+        row = result["characters"][0]["generated"].pop()
+        result["characters"][0]["skipped"] = [{**row, "reason": "rejected"}]
+        records, _skipped, _report = gen.import_candidates(self.proj.dir, self.card, snap, result,
+                                                           log=lambda *_: None)
+        self.assertEqual(records, [])
+
+    def test_a_result_drawn_by_another_graph_is_refused_wholesale(self):
+        snap = self.snapshot()
+        result = self._result_with(snap)
+        result["graph_version"] = "someone-elses@9"
+        records, skipped, _report = gen.import_candidates(self.proj.dir, self.card, snap, result,
+                                                          log=lambda *_: None)
+        self.assertEqual(records, [])
+        self.assertTrue(any("signature" in str(s["reason"]) for s in skipped))
+
+    def test_an_older_result_imports_against_its_own_snapshot(self):
+        # Two snapshots for one character: the older result must keep the older snapshot's id, settings and inputs,
+        # not be recorded as if the newest run had drawn it.
+        old = self.snapshot()
+        (self.chars / "front.png").write_bytes(b"DIFFERENT")
+        new = self.snapshot()
+        self.assertNotEqual(old["id"], new["id"])
+        result_path = Path(old["base"]) / "result.json"
+        result_path.write_text(json.dumps(self._result_with(old)), encoding="utf-8")
+        resolved = gen.snapshot_for_result(self.proj.dir, self.card, result_path, log=lambda *_: None)
+        self.assertEqual(resolved["id"], old["id"])
 
 
 class SlotRestoreTests(unittest.TestCase):

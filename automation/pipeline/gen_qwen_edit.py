@@ -546,12 +546,72 @@ def find_snapshot(project_dir, card=None, *, snapshot_id=None, exclude=(), secti
     return rebuilt
 
 
+def snapshot_engine(snapshot):
+    """'ph3' when the run's own config drew on P-H3, 'qwen' otherwise.
+
+    A record that says `qwen_edit` for a picture P-H3 drew attaches the wrong engine to it forever, and the seed
+    policies read the generator field to decide what may enter a set (spec R4). The engine is read from the snapshot's
+    own pinned config, not from what tool2 defaults to today.
+    """
+    config = read_json(snapshot.get("config") or "")
+    backend = str(((config.get("models") or {}).get("backend")) or "")
+    return "ph3" if backend == "p_h3" else "qwen"
+
+
+ENGINE_GENERATOR = {"qwen": "qwen_edit", "ph3": "ph3_edit"}
+ENGINE_FAMILY = {"qwen": "qwen_image21", "ph3": "ph3"}
+
+
+def snapshot_for_result(project_dir, card, result_path, *, log=print, exclude=(), sections=None):
+    """The snapshot that produced this result file: the one in the result's own folder, when it names one.
+
+    A character can hold several snapshots over its life, and importing an older result against the newest one would
+    record the wrong settings, the wrong inputs and the wrong parents for every picture in it (spec R4). A result saved
+    by a run sits next to that run's snapshot.json, so it is read first and `find_snapshot` is the fallback.
+    """
+    folder = Path(result_path).resolve().parent
+    own = read_json(folder / "snapshot.json")
+    if own.get("id"):
+        log(f"[gen_qwen_edit] import-only: the result's own snapshot is {own['id']}")
+        return own
+    return find_snapshot(project_dir, card, log=log, exclude=exclude, sections=sections)
+
+
+def importable_rows(result, snapshot, *, log=print):
+    """(rows, refused): the result rows that may become candidates, and why the rest may not.
+
+    A run that was interrupted between saving an image and importing it reports that image as `skipped - already
+    there` on the re-run, so the skipped rows are read too (spec R4): what may not be imported is said, not implied.
+    Rejected jobs and failed ones are refused, and a result written by a different graph version than the snapshot's
+    own is refused wholesale - a result must be imported under the run that drew it, with that run's signature.
+    """
+    graph = str(result.get("graph_version") or "")
+    rows, refused = [], []
+    if graph and snapshot.get("graph_version") and graph != str(snapshot["graph_version"]):
+        refused.append({"reason": f"the result's signature is {graph}, but the snapshot records "
+                                  f"{snapshot['graph_version']}; it was drawn by a different graph"})
+        return rows, refused
+    for entry in result.get("characters") or []:
+        for status in ("generated", "skipped"):
+            for row in entry.get(status) or []:
+                row = dict(row)
+                row["row_status"] = status
+                if status == "skipped" and "rejected" in str(row.get("reason") or ""):
+                    refused.append({"file": str(row.get("file") or row.get("stem")),
+                                    "reason": "the job was rejected by the run's own settings"})
+                    continue
+                rows.append(row)
+    return rows, refused
+
+
 def import_candidates(project_dir, card, snapshot, result, *, log=print):
     """Write the snapshot's provenance and the run's outputs into the project as candidates.
 
-    Three things this refuses to do: replace the project's own source list (it merges), drop an image the project
-    already has (records are keyed by content hash), and record a run without saying which snapshot, graph and models
-    produced it.
+    Four things this refuses to do: replace the project's own source list (it merges), drop an image the project
+    already has (records are keyed by content hash), record a run without saying which snapshot, graph and models
+    produced it, and import a result whose signature or job status does not belong to this run (spec R4). The engine -
+    Qwen or P-H3 - comes from the snapshot's own pinned config, and the row's prompt and seed come from the result when
+    it carries them and from tool2's manifest when the row is a recovered `skipped`.
     """
     project_dir = Path(project_dir)
     project = open_project(project_dir)
@@ -559,28 +619,35 @@ def import_candidates(project_dir, card, snapshot, result, *, log=print):
     sources_report = merge_sources(project_dir, snapshot["sources"], snapshot_id=snapshot["id"], log=log)
     hashes = model_hashes(snapshot)
     manifest_records = tool2_manifest(out_dir, chars_dir)
+    engine = snapshot_engine(snapshot)
+    rows, refused = importable_rows(result, snapshot, log=log)
     records, skipped = [], []
-    for entry in result.get("characters") or []:
-        for row in entry.get("generated") or []:
-            path = Path(row.get("file") or "")
-            if not path.is_file():
-                skipped.append({"file": str(path), "reason": "the file the result names is not on disk"})
-                continue
-            parents, refs, why = parents_for(path.name, out_dir, chars_dir, snapshot, log)
-            record = lineage.record(
-                path, generator="qwen_edit", parent_ids=parents,
-                train_generation=1, edit_depth=1,          # a tool2 edit works from the originals
-                slot={"category": row.get("category") or _category_of(row.get("stem", ""))},
-                prompt=row.get("prompt", ""), seed=row.get("seed"),
-                steps=row.get("steps"), cfg=row.get("cfg"),
-                width=row.get("resolution") or row.get("width"), height=row.get("resolution") or row.get("height"),
-                graph_version=f"tool2:{snapshot['graph_version']}", snapshot=snapshot["id"],
-                stem=row.get("stem"), prompt_id=f"{snapshot['id']}:{row.get('stem') or path.stem}",
-                refs=refs, models={"family": "qwen_image21", "files": hashes,
-                                   "record": manifest_records.get(path.name) or {}},
-                allow_missing_parents=True, orphan_reason=why)
-            record["caption"] = _caption_of(path)
-            records.append(record)
+    for row in rows:
+        path = Path(row.get("file") or "")
+        if not path.is_file():
+            skipped.append({"file": str(path), "reason": "the file the result names is not on disk"})
+            continue
+        parents, refs, why = parents_for(path.name, out_dir, chars_dir, snapshot, log)
+        manifest_row = manifest_records.get(path.name) or {}
+        record = lineage.record(
+            path, generator=ENGINE_GENERATOR[engine], parent_ids=parents,
+            train_generation=1, edit_depth=1,          # a tool2 edit works from the originals
+            slot={"category": row.get("category") or _category_of(row.get("stem", ""))},
+            prompt=row.get("prompt") or manifest_row.get("prompt") or "",
+            seed=row.get("seed") if row.get("seed") is not None else manifest_row.get("seed"),
+            steps=row.get("steps") or manifest_row.get("steps"),
+            cfg=row.get("cfg") if row.get("cfg") is not None else manifest_row.get("cfg"),
+            width=row.get("resolution") or row.get("width"), height=row.get("resolution") or row.get("height"),
+            graph_version=f"tool2:{snapshot['graph_version']}", snapshot=snapshot["id"],
+            stem=row.get("stem"), prompt_id=f"{snapshot['id']}:{row.get('stem') or path.stem}",
+            refs=refs, models={"family": ENGINE_FAMILY[engine], "files": hashes,
+                               "record": manifest_row},
+            result_row_status=row.get("row_status"),
+            allow_missing_parents=True, orphan_reason=why)
+        record["caption"] = _caption_of(path)
+        records.append(record)
+    for item in refused:
+        skipped.append({"file": str(item.get("file") or ""), "reason": item["reason"]})
     if project is not None:
         written, project_skipped = project.import_candidates(records, log=log)
         for item in project_skipped:
@@ -595,7 +662,7 @@ def import_candidates(project_dir, card, snapshot, result, *, log=print):
     if skipped:
         log(f"[gen_qwen_edit] {len(skipped)} result row(s) were not imported")
     report = {"candidates": written, "skipped": skipped, "sources": sources_report,
-              "snapshot": snapshot["id"], "records": records}
+              "snapshot": snapshot["id"], "engine": engine, "records": records}
     return records, skipped, report
 
 
@@ -786,11 +853,12 @@ def main(argv=None):
         return 0
     overrides = parse_overrides(args.overrides)
     if args.import_only:
-        # The snapshot a run belongs to is `tool2/<id>/snapshot.json`; the id is a hash of the settings and the input
-        # bytes, so it can be recovered without generating anything.
-        snapshot = find_snapshot(project_dir, card,
-                                 exclude=(args.exclude or "").split(",") if args.exclude else (),
-                                 sections=overrides)
+        # The snapshot a run belongs to is `tool2/<id>/snapshot.json`, and a result file sits next to the snapshot of
+        # the run that wrote it: importing the result's own folder first keeps an older result from being recorded
+        # against a newer snapshot's settings and inputs (spec R4).
+        snapshot = snapshot_for_result(project_dir, card, args.import_only,
+                                       exclude=(args.exclude or "").split(",") if args.exclude else (),
+                                       sections=overrides)
         import_candidates(project_dir, card, snapshot, read_json(args.import_only))
         return 0
     snapshot = build_snapshot(project_dir, card, exclude=(args.exclude or "").split(",") if args.exclude else (),
