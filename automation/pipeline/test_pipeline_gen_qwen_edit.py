@@ -253,6 +253,30 @@ class OverrideTests(SnapshotTests):
             with self.assertRaises(ValueError):
                 gen.parse_overrides([bad])
 
+    def test_a_json_value_can_choose_which_shots_run(self):
+        """Which shots a grid makes is a list, so a run has to be able to say it without editing the tool's config."""
+        parsed = gen.parse_overrides(['angles.grid={"azimuths":["front view"],"distances":["close-up"],"skip":[]}'])
+        self.assertEqual(parsed["angles"]["grid"]["azimuths"], ["front view"])
+        with self.assertRaises(ValueError):
+            gen.parse_overrides(["--angles.grid=[not json]".lstrip("-")])
+
+    def test_a_character_setting_travels_with_the_snapshot(self):
+        snap = gen.build_snapshot(self.project, self.card, paths=self.paths, log=lambda *_: None,
+                                  character={"outfit_hint": "orange cardigan"})
+        pinned = json.loads(Path(snap["config"]).read_text(encoding="utf-8"))["characters"][0]
+        self.assertEqual(pinned["outfit_hint"], "orange cardigan")
+        self.assertEqual(snap["character_overrides"], {"outfit_hint": "orange cardigan"})
+        self.assertNotIn("outfit_hint",
+                         json.loads(self.config.read_text(encoding="utf-8"))["characters"][0],
+                         "the tool's own config must keep not knowing about this run")
+
+    def test_changing_which_original_is_edited_changes_the_snapshot(self):
+        """The character entry picks the picture each job edits, so it belongs in the snapshot's identity."""
+        plain = self.snapshot()
+        other = gen.build_snapshot(self.project, self.card, paths=self.paths, log=lambda *_: None,
+                                   character={"edit_bases": ["side.png"]})
+        self.assertNotEqual(plain["id"], other["id"])
+
     def test_the_override_lands_in_the_snapshots_own_config_only(self):
         before = self.config.read_text(encoding="utf-8")
         snap = gen.build_snapshot(self.project, self.card, paths=self.paths, log=lambda *_: None,

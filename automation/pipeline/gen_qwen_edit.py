@@ -144,12 +144,18 @@ def source_origin(path, char_entry):
     return "user", "assumed an original the user supplied"
 
 
-def snapshot_id(tool2_cfg, char_folder, sources, graph_version):
-    """A stable id for this exact generator, settings and input bytes."""
+def snapshot_id(tool2_cfg, char_folder, sources, graph_version, entry=None):
+    """A stable id for this exact generator, settings, character entry and input bytes.
+
+    The character entry belongs in the id: it names the edit bases and the references, so two runs that differ only
+    there produce different pictures and must not share a snapshot folder.
+    """
     payload = {"tool2": {k: v for k, v in tool2_cfg.items() if k != "characters"},
                "character": char_folder,
                "graph_version": graph_version,
                "sources": sorted(sources)}
+    if entry is not None:
+        payload["entry"] = {k: v for k, v in entry.items() if k != "excluded_inputs"}
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:12]
 
 
@@ -175,7 +181,11 @@ def apply_section_overrides(tool2_cfg, overrides):
 
 
 def parse_overrides(values):
-    """`--set expressions.use_extra_refs=false` -> {"expressions": {"use_extra_refs": False}}."""
+    """`--set expressions.use_extra_refs=false` -> {"expressions": {"use_extra_refs": False}}.
+
+    A value written as JSON is parsed as JSON, which is how a list setting (which shots, which items) can be chosen
+    for one run without editing the tool's config.
+    """
     out = {}
     for item in values or []:
         if "=" not in item or "." not in item.split("=", 1)[0]:
@@ -185,6 +195,11 @@ def parse_overrides(values):
         text = raw.strip()
         if text.lower() in ("true", "false"):
             value = text.lower() == "true"
+        elif text[:1] in "[{":
+            try:
+                value = json.loads(text)
+            except ValueError as exc:
+                raise ValueError(f"--set {path}: the value looks like JSON but does not parse ({exc})") from exc
         else:
             try:
                 value = int(text)
@@ -197,8 +212,20 @@ def parse_overrides(values):
     return out
 
 
-def build_snapshot(project_dir, card, *, exclude=(), holdout=None, sections=None, tool2_config=None, paths=None,
-                   log=print):
+def parse_character_overrides(values):
+    """`--set-char edit_bases=a.png,b.png` -> {"edit_bases": ["a.png", "b.png"]}."""
+    out = {}
+    for item in values or []:
+        if "=" not in item:
+            raise ValueError(f"--set-char wants key=value, not {item!r}")
+        key, raw = item.split("=", 1)
+        text = raw.strip()
+        out[key.strip()] = [part.strip() for part in text.split(",") if part.strip()] if "," in text else text
+    return out
+
+
+def build_snapshot(project_dir, card, *, exclude=(), holdout=None, sections=None, character=None, tool2_config=None,
+                   paths=None, log=print):
     """Write this run's settings and input folder, and return where everything is.
 
     The holdout is kept out of the run twice over: by the file names the card froze, and by content hash, so a holdout
@@ -262,6 +289,12 @@ def build_snapshot(project_dir, card, *, exclude=(), holdout=None, sections=None
     snapshot_entry, dropped_references = scrub_references(entry, {row["name"] for row in dropped})
     for row in dropped_references:
         log(f"[gen_qwen_edit] {row['key']}: dropped excluded reference(s) {', '.join(row['removed'])}")
+    applied_character = {}
+    for key, value in (character or {}).items():
+        # The character entry decides which picture each job edits, so a per-run change to it is part of the run.
+        snapshot_entry[key] = value
+        applied_character[key] = value
+        log(f"[gen_qwen_edit] character.{key} = {value} (this run only)")
 
     sources = []
     for path in kept:
@@ -270,7 +303,7 @@ def build_snapshot(project_dir, card, *, exclude=(), holdout=None, sections=None
         record["decided_by"] = why
         sources.append(record)
 
-    ident = snapshot_id(tool2_cfg, folder, [r["sha256"] for r in sources], graph_version)
+    ident = snapshot_id(tool2_cfg, folder, [r["sha256"] for r in sources], graph_version, entry=snapshot_entry)
     base = project_dir / "tool2" / ident
     chars_dir = base / "chars" / folder
     out_dir = base / "out" / folder
@@ -290,7 +323,7 @@ def build_snapshot(project_dir, card, *, exclude=(), holdout=None, sections=None
         "tool2_config": str(config_path), "excluded": sorted({row["name"] for row in dropped}),
         "excluded_detail": dropped, "missing_references": missing_references,
         "dropped_references": dropped_references, "holdout": holdout,
-        "section_overrides": applied_overrides,
+        "section_overrides": applied_overrides, "character_overrides": applied_character,
         "sources": sources, "source_hashes": {r["src_path"]: r["sha256"] for r in sources},
     }
     (base / "snapshot.json").write_text(json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")

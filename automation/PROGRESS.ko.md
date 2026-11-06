@@ -878,3 +878,43 @@ M3(생성기 B/C: 시드 LoRA 학습 → 에포크 평가 → 슬롯 배치 생�
 
 
 
+## 21. 구도 중심 데이터셋 — 전신·측면·포즈·의상·배경 (2026-11-06 17:00~)
+
+사용자 지적: "데이터셋이 목적인데 표정에 집착하지 말고 측면샷이나 cowboy shot처럼 더 다양한 구도가 좋지 않겠니" →
+"전신샷, 얼굴샷, 포즈, 의상, 배경에 더 신경 써야지". 24슬롯 계획에서 표정은 4개뿐이고, 각도 8 · 프레이밍 4 · 포즈 4가 구도다.
+
+### 21.1 전신·카우보이·포즈는 전신 앵커에서 시작한다 — 그 앵커의 출처는 복원 불가
+
+`plan_jobs()`에서 `body = d != "close-up"`이므로 **medium(cowboy)·wide 각도, full-body/dutch 프레이밍, 포즈 전부가
+`body_bases`(전신 앵커)에서 시작**한다. 그 앵커(`anchor_refined_fullbody_d_00020__e7417d_s1001.png`)는 `origin: synthetic`,
+`parent_ids: []`인 채로 프로젝트에 들어왔다.
+
+**복원 시도와 결과**: tool2는 전신 후보를 `fullbody_<refid>__<key>_s<seed>`로 이름 붙이고, `key = sha1(prompt + 입력
+바이트들)[:6]`이다. 설정(`fullbody_source` + `figure_refs` + 프롬프트)으로 **재계산한 키는 `495d78`, 파일명은 `e7417d`** —
+일치하지 않았다(당시 설정이 지금과 달랐다). 그래서 **부모를 기록하지 않았다**(추정 금지). 확인된 것만 적으면:
+`_fullbody_candidates/refined_…_s1001.png`와 캐릭터 폴더의 앵커가 **바이트 동일**(3,131,273B)이므로, 앵커는 그 refined
+후보를 채택한 것이고, refined의 입력은 미세련 앵커(`fullbody_d_00020__e7417d_s1001.png`, 840KB) + `fullbody_source`다.
+그 미세련 앵커의 입력이 복원되지 않으므로 사슬은 미확인에서 끝난다 → **앵커는 격리 유지, 파생물은 시드 부적격.**
+
+**따라서 전신·포즈 이미지는 "최종 데이터셋용"으로 만들고, 시드에는 넣지 않는다**(감사가 `unverified_ancestor`로 표시).
+시드에 넣으려면 앵커를 **비홀드아웃 원본에서 새로 생성**해 출처를 파이프라인이 기록하게 해야 한다(다음 작업).
+
+### 21.2 의상 — 카드에 `outfit_hint`가 없었다
+
+수아맘 항목에는 `outfit_hint`가 없어서, 전신 프롬프트가 옷의 아래쪽(바지·신발)을 **모델이 지어내는** 상태였다.
+`original_tags`가 실제로 기록한 의상(`fullbody_source` = SeedVR2: "orange cardigan, beige dress")만 근거로 삼아
+**이번 실행의 스냅샷 항목에만** `outfit_hint`를 넣었다(`--set`/`character=` 경로, `dataset_jobs.json` 불변).
+영구 반영하려면 사용자 승인 후 툴2 설정에 넣어야 한다.
+
+### 21.3 이번 배치 (실행 중)
+
+| 항목 | 값 |
+| --- | --- |
+| 스냅샷 | `15b2013998f6` (각도: 정면·측면·후면 × close/medium/wide, `extra` 비움, 참조 0장, outfit_hint 추가) |
+| 각도 | 7계획 → **4장生成** — tool2가 앵커가 있으면 grid medium을 건너뛴다("앵커에서 뽑은 medium은 결국 full body") |
+| 프레이밍 | 7장 (upper body, 3/4, side profile, from behind, extreme close-up face, full body, dutch) |
+| 포즈 | 4장 (sitting, walking, waving, phone) — 전부 1536 |
+| **cowboy shot** | grid medium이 건너뛰어지므로, `angles.extra`(저각도/고각도 medium·wide 4컷)를 되살린 **별도 소배치**로 뽑아야 한다 |
+
+속도: 1024 close-up 약 30초, 1536 전신 약 2분 → 15장에 약 20~25분.
+
