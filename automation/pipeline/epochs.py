@@ -37,7 +37,7 @@ import time
 from pathlib import Path
 
 from . import comfy as comfy_mod
-from . import krea2_gen, lineage, models
+from . import krea2_gen, lineage, make_cancel, models
 
 AUTO = Path(__file__).resolve().parents[1]          # automation
 
@@ -565,6 +565,7 @@ def main(argv=None):
     parser.add_argument("--note", default="", help="why this epoch was chosen (choose)")
     parser.add_argument("--serve", action="store_true", help="open the sheet in a browser (sheet)")
     parser.add_argument("--comfy", default=None, help="ComfyUI base URL")
+    parser.add_argument("--cancel-file", help="stop before the next cell once this file exists")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
@@ -616,7 +617,12 @@ def main(argv=None):
         if problems:
             raise EpochError("model problems: " + "; ".join(problems))
         names = resolve_names(client)
-        run(project, manifest, client=client, names=names)
+        # A GUI (or a person at a terminal) pauses by creating this file; the check happens between cells, so every
+        # picture already drawn stays a complete picture and a rerun picks up from there.
+        cancel = make_cancel(args.cancel_file)
+        run(project, manifest, client=client, names=names, cancel=cancel)
+        if cancel is not None and cancel():
+            print("paused: the remaining cells are still pending, so this command continues them")
         return 0
 
     if args.command == "sheet":

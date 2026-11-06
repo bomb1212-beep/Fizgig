@@ -72,7 +72,8 @@ print('fixture completed',flush=True)
         self.temp.cleanup()
 
     def test_tabs_preview_and_caption_save_preserve_original(self):
-        self.assertEqual(len(self.app.notebook.tabs()), 3)
+        # Four tabs since M5 added "데이터셋 생성"; the three original tabs and their behaviour are unchanged.
+        self.assertEqual(len(self.app.notebook.tabs()), 4)
         self.assertEqual(len(self.app.review_files), 1)
         original = (self.source / "one.txt").read_text(encoding="utf-8")
         self.app.caption_text.delete("1.0", "end")

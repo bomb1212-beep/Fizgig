@@ -257,6 +257,31 @@ class RunTests(unittest.TestCase):
         self.assertEqual(failed, 2, "e02 fails once per checkpoint")
         self.assertEqual(done, len(epochs.EVAL_PROMPTS) * 2 - 2)
 
+    def test_cancelling_stops_between_cells_and_keeps_what_was_drawn(self):
+        # A pause has to leave complete pictures and the rest still pending; that is what makes a rerun continue.
+        client = self.client()
+        drawn = []
+
+        def cancel():
+            return len(drawn) >= 3
+
+        original = client.run
+
+        def counting(graph, out, slot_id=None, method=None, seed=None):
+            result = original(graph, out, slot_id=slot_id, method=method, seed=seed)
+            drawn.append(out)
+            return result
+
+        client.run = counting
+        done, _skipped, failed = epochs.run(self.project, self.manifest, client=client, names=self.names(),
+                                            log=lambda *_: None, cancel=cancel)
+        self.assertEqual(failed, 0)
+        self.assertEqual(done, 3, "the cell in flight finishes, then the loop stops")
+        self.assertTrue(all(Path(path).is_file() for path in drawn))
+        again = epochs.run(self.project, self.manifest, client=self.client(), names=self.names(),
+                           log=lambda *_: None)
+        self.assertEqual(again[0], len(epochs.EVAL_PROMPTS) * 2 - 3, "the rerun draws only what is missing")
+
     def test_a_failed_cell_is_retried_on_the_next_run_and_the_rest_is_not(self):
         client = self.client(fail_on="e02_upper")
         epochs.run(self.project, self.manifest, client=client, names=self.names(), log=lambda *_: None)

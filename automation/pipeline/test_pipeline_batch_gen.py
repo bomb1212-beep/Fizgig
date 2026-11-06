@@ -297,6 +297,35 @@ class RunTests(unittest.TestCase):
                  if node["class_type"] == "UNETLoader"]
         self.assertEqual(unets, ["raw.safetensors"])
 
+    def test_cancelling_stops_between_cells_and_the_rest_stays_pending(self):
+        client = self.client()
+        done, _skipped, failed = batch_gen.run(self.project, self.manifest, client=client, names=self.names(),
+                                               log=lambda *_: None, cancel=lambda: True)
+        self.assertEqual((done, failed), (0, 0))
+        self.assertEqual(len(client.runs), 0, "the stop is checked before the first cell here")
+        after = batch_gen.run(self.project, self.manifest, client=self.client(), names=self.names(),
+                              log=lambda *_: None)
+        self.assertEqual(after[0], 2, "nothing was drawn, so the whole plan is still pending")
+
+    def test_a_cancel_after_one_cell_keeps_that_cell(self):
+        client = self.client()
+        drawn = []
+        original = client.run
+
+        def counting(graph, out, slot_id=None, method=None, seed=None):
+            result = original(graph, out, slot_id=slot_id, method=method, seed=seed)
+            drawn.append(Path(out))
+            return result
+
+        client.run = counting
+        done, _skipped, failed = batch_gen.run(self.project, self.manifest, client=client, names=self.names(),
+                                               log=lambda *_: None, cancel=lambda: len(drawn) >= 1)
+        self.assertEqual((done, failed), (1, 0))
+        self.assertTrue(drawn[0].is_file())
+        after = batch_gen.run(self.project, self.manifest, client=self.client(), names=self.names(),
+                              log=lambda *_: None)
+        self.assertEqual(after[0], 1, "the drawn cell is skipped and the other is drawn")
+
     def test_another_configuration_is_refused_before_anything_is_drawn(self):
         self.manifest["inference"]["variant"] = "a"
         client = self.client()

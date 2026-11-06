@@ -30,7 +30,7 @@ from pathlib import Path
 
 from . import comfy as comfy_mod
 from . import epochs as epochs_mod
-from . import krea2_gen, lineage, models
+from . import krea2_gen, lineage, make_cancel, models
 
 AUTO = Path(__file__).resolve().parents[1]          # automation
 
@@ -330,6 +330,7 @@ def main(argv=None):
     parser.add_argument("--project", required=True)
     parser.add_argument("--seeds-per-slot", type=int, default=SEEDS_PER_SLOT)
     parser.add_argument("--comfy", default=None)
+    parser.add_argument("--cancel-file", help="stop before the next cell once this file exists")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
@@ -372,7 +373,10 @@ def main(argv=None):
             raise BatchError("model problems: " + "; ".join(problems))
         names = epochs_mod.resolve_names(client)
         names["character_lora"] = client.name_for("lora", character_lora_path(project))
-        run(project, manifest, client=client, names=names)
+        cancel = make_cancel(args.cancel_file)
+        run(project, manifest, client=client, names=names, cancel=cancel)
+        if cancel is not None and cancel():
+            print("paused: the remaining cells are still pending, so this command continues them")
         return 0
 
     if args.command == "import":

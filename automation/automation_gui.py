@@ -15,6 +15,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
 
 import runner
+import dataset_tab
 from local_caption import LocalClient
 
 ROOT, AUTO = runner.ROOT, runner.AUTO
@@ -387,12 +388,17 @@ class App(tk.Tk):
         self.work_tab = ttk.Frame(self.notebook, padding=18)
         self.review_tab = ttk.Frame(self.notebook, padding=18)
         self.instructions_tab = ttk.Frame(self.notebook, padding=18)
+        self.dataset_pane = ttk.Frame(self.notebook, padding=18)
         self.notebook.add(self.work_tab, text="작업 & 학습")
         self.notebook.add(self.review_tab, text="사진 · 캡션 검수")
         self.notebook.add(self.instructions_tab, text="캡션 지침")
+        self.notebook.add(self.dataset_pane, text="데이터셋 생성")
         self.build_work()
         self.build_review()
         self.build_instructions()
+        # The dataset tab is a separate object so the existing tabs keep their own code path; it only shares the window.
+        # Named `dataset_view` because `self.dataset` is already the 기본 데이터셋 StringVar of the work tab.
+        self.dataset_view = dataset_tab.DatasetTab(self, self.dataset_pane, automation_dir=AUTO)
         footer = ttk.Frame(main)
         footer.grid(row=2, column=0, sticky="ew", pady=(15, 8))
         self.status = tk.StringVar(value="준비됨 · 캡션과 학습을 순서대로 실행합니다.")
