@@ -50,6 +50,12 @@ class FakeProject:
         import contextlib
         return contextlib.nullcontext()
 
+    def source_records(self):
+        return list(getattr(self, "_sources", []) or [])
+
+    def resolve_file(self, name):
+        return Path(name) if name else None
+
     def save(self):
         self.saved += 1
 
@@ -182,6 +188,100 @@ class PlanTests(unittest.TestCase):
         manifest = epochs.plan(self.project, run_folder=self.run, log=lambda *_: None)
         self.assertEqual(manifest["run"]["state"]["complete"], False)
         self.assertEqual(manifest["run"]["state"]["epoch"], 20)
+
+
+class SheetClipSortTests(unittest.TestCase):
+    """R7 P2: the comparison sheet's auxiliary CLIP sort - scores on the cells, best of a row marked, rows sortable."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.run = self.root / "runs" / "char-abc123"
+        (self.run / "output").mkdir(parents=True)
+        self.project = FakeProject(self.root / "proj")
+        self.project.dir.mkdir(parents=True)
+        self.project._sources = [{"id": "s_1", "file": str(self.root / "a.png"), "origin": "user"},
+                                 {"id": "s_2", "file": str(self.root / "b.png"), "origin": "user"}]
+        from PIL import Image
+        Image.new("RGB", (16, 16), (120, 120, 120)).save(self.root / "a.png")
+        Image.new("RGB", (16, 16), (60, 60, 60)).save(self.root / "b.png")
+        for epoch in (2, 4):
+            (self.run / "output" / f"char-{epoch:06d}.safetensors").write_bytes(safetensors_bytes(epoch))
+        self.manifest = epochs.plan(self.project, run_folder=self.run, seeds=[1], log=lambda *_: None)
+        self.exp = epochs.manifest_path_of(self.project, self.run).parent
+        for task in self.manifest["tasks"]:
+            path = self.exp / task["file"]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"\x89PNG\r\n\x1a\n" + task["prompt_id"].encode())
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def sheet(self, clip_scores=None):
+        return epochs.write_sheet(self.project, self.run, log=lambda *_: None,
+                                  clip_scores=clip_scores).read_text("utf-8")
+
+    def test_without_scores_the_sheet_stays_plain(self):
+        html = self.sheet()
+        self.assertNotIn("data-clip", html)
+        self.assertNotIn("clip-sort", html)
+
+    def test_scores_land_on_cells_and_the_rows_best_is_marked(self):
+        clips = {}
+        for task in self.manifest["tasks"]:
+            clips[(task["prompt_id"], int(task["epoch"]), int(task["seed"]))] =                 0.9 if task["epoch"] == 4 else 0.5
+        html = self.sheet(clips)
+        self.assertIn('data-clip="0.9000"', html)
+        self.assertIn('data-clip="0.5000"', html)
+        self.assertIn("최고", html)
+        self.assertIn("CLIP 평균", html)
+
+    def test_the_sort_control_and_js_are_present_with_scores(self):
+        html = self.sheet({("p", 2, 1): 0.5})
+        self.assertIn('id="clip-sort"', html)
+        self.assertIn("CLIP 높은 순", html)
+        self.assertIn("clip-desc:4", html, "one option sorts by a single epoch's column")
+
+    def test_sheet_clip_scores_uses_the_injected_embedder_and_writes_the_sidecar(self):
+        from PIL import Image
+
+        class Vec:
+            def __init__(self, values):
+                self.values = values
+
+            def __mul__(self, other):
+                return Vec([a * b for a, b in zip(self.values, other.values)])
+
+            def sum(self):
+                return sum(self.values)
+
+        class FakeEmbedder:
+            def embed(self, paths):
+                out = {}
+                for p in paths:
+                    with Image.open(p) as image:
+                        colours = [image.getpixel((x, y)) for x in (0, 8) for y in (0, 8)]
+                        brightness = sum(sum(c) / 3 for c in colours) / len(colours)
+                        out[str(p)] = Vec([brightness / 255.0, 1.0 - brightness / 255.0])
+                return out
+
+        # the fixture cells are fake bytes, not images: give them real pixels
+        for task in self.manifest["tasks"]:
+            Image.new("RGB", (16, 16), (128, 128, 128)).save(self.exp / task["file"])
+        scores = epochs.sheet_clip_scores(self.project, self.run, embedder=FakeEmbedder(),
+                                          log=lambda *_: None)
+        self.assertEqual(len(scores), len(self.manifest["tasks"]))
+        self.assertTrue(all(value is not None for value in scores.values()))
+        sidecar = epochs.sheet_clip_path(self.project, self.run)
+        self.assertTrue(sidecar.is_file())
+        # the sheet re-renders from the sidecar without touching the embedder again
+        html = self.sheet()
+        self.assertIn("data-clip", html)
+
+    def test_sheet_clip_scores_without_originals_is_refused(self):
+        self.project._sources = []
+        with self.assertRaises(epochs.EpochError):
+            epochs.sheet_clip_scores(self.project, self.run, log=lambda *_: None)
 
 
 class RunTests(unittest.TestCase):

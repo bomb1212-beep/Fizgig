@@ -25,6 +25,7 @@ import json
 import sys
 import webbrowser
 from pathlib import Path
+import urllib.parse
 from urllib.parse import unquote
 
 AUTO = Path(__file__).resolve().parents[1]
@@ -115,6 +116,32 @@ def candidate_rows(project, *, decision=None, generator=None, slot=None, images_
     return rows
 
 
+def _duplicate_groups(project, rows, *, max_distance=6):
+    """Annotate rows with their near-duplicate group, using the scorer's own pHash clustering (spec R7 P2).
+
+    Group 1 is the largest. A row in no group stays without `dup_group` - "not a near-duplicate" is the normal case
+    and must not look like group 0. Files that are missing are simply not grouped; nothing is removed anywhere.
+    """
+    scorable = [row for row in rows if row.get("exists")]
+    if len(scorable) < 2:
+        return []
+    try:
+        from .scorers import common
+        groups = common.phash_groups([{"id": row["id"], "path": str(project.resolve_file(row["file"]))}
+                                      for row in scorable], max_distance=max_distance)["rows"]
+    except Exception:  # noqa: BLE001 - a hashing failure must not take the review page down
+        return []
+    sizes = {}
+    for number, group in enumerate(groups, start=1):
+        sizes[number] = group["count"]
+        for row_id in group["ids"]:
+            for row in rows:
+                if row["id"] == row_id:
+                    row["dup_group"] = number
+                    row["dup_count"] = group["count"]
+    return sizes
+
+
 def _is_on(row, decision):
     """Is this plain button the current state? A reasoned rejection lights its own button, not "기각"."""
     if row["decision"] != decision:
@@ -163,10 +190,13 @@ def _cell(row, images_prefix):
                  f'data-face="{"" if row.get("arcface_max") is None else row["arcface_max"]}" '
                  f'data-white="{"" if row.get("white_ratio") is None else row["white_ratio"]}" '
                  f'data-slot="{escape(str(row["slot"] or ""))}" '
-                 f'data-decision-key="{escape(str(row["decision"] or ""))}"')
+                 f'data-decision-key="{escape(str(row["decision"] or ""))}" '
+                 f'data-dup="{row.get("dup_group") or ""}"')
+    dup = row.get("dup_count") or 0
     flags = "".join(f'<div class="flag">{escape(text)}</div>' for text in (
         ("다른 캐릭터" if row["reason"] == FIX_BLOCKED else ""),
         ("" if row["fixable"] else "보정 불가"),
+        (f"근접 중복 G{row.get('dup_group')} ({dup}장)" if dup > 1 else ""),
         (f"결정: {escape(str(row['by']))}" if row["by"] else ""),
     ) if text)
     before = row.get("before")
@@ -197,6 +227,9 @@ def write_page(project, destination, *, images_prefix="/image", quota_plan=None,
         except Exception:  # noqa: BLE001 - a missing or broken score file must not hide the review page
             scores = {}
     rows = candidate_rows(project, images_prefix=images_prefix, scores=scores)
+    # Near-duplicate groups (spec R7 P2): computed with the same pHash the scorer uses, shown as a number on each
+    # grouped card, and filterable - grouped for review, never removed.
+    dup_sizes = _duplicate_groups(project, rows)
     quotas = project.quotas(quota_plan or _plan_from_card(project.card))
     short = {slot: info for slot, info in quotas.items() if info["short"]}
     counts = {name: sum(1 for r in rows if r["decision"] == name) for name in pj.DECISIONS}
@@ -213,7 +246,8 @@ def write_page(project, destination, *, images_prefix="/image", quota_plan=None,
             f"후보 {len(rows)} · 미검수 {len(project.undecided())} · 채택 {counts['accept']} · "
             f"기각 {counts['reject']} · 보정 {counts['fix']} · 슬롯 부족 {len(short)}"
             + (f" · 점수 {scored}" if scored else " · 점수 없음")
-            + (f" · 다른 캐릭터 {blocked}" if blocked else "")),
+            + (f" · 다른 캐릭터 {blocked}" if blocked else "")
+            + (f" · 근접 중복 묶음 {len(dup_sizes)}" if dup_sizes else "")),
         sources=html.escape(f"원본 {source_counts['user']}장 · 합성 {source_counts['synthetic']}장 "
                             f"({synthetic_share:.0%})"),
         cards="".join(_cell(row, images_prefix) for row in rows),
@@ -273,6 +307,7 @@ _TEMPLATE = """<!doctype html>
  .card .pair .ph.small {{ width: 74px; height: 60px; font-size: 10px; }}
  .card .pair .arrow {{ color: #789; font-size: 14px; }}
  .card .scores {{ color: #8a9; font-size: 11px; font-family: monospace; margin-top: 2px; }}
+ .card .crop-score {{ color: #9bd; font-size: 11px; font-family: monospace; }}
  #controls {{ display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 8px 0 14px;
               padding: 6px 10px; background: #191d21; border: 1px solid #2a3138; border-radius: 4px; }}
  #controls label {{ color: #9ab; font-size: 12px; }}
@@ -306,8 +341,19 @@ _TEMPLATE = """<!doctype html>
   <option value="fix">보정</option>
  </select></label>
  <label>점수 있는 것만 <input type="checkbox" id="scored"></label>
+ <label>근접 중복만 <input type="checkbox" id="dup"></label>
  <button type="button" id="reset">초기화</button>
  <span id="shown" style="color:#789;font-size:12px"></span>
+ <span style="color:#789;font-size:12px">크롭 재채점(대상 카드):
+  <select id="crop-preset">
+   <option value="">직접 입력</option>
+   <option value="face">얼굴(중앙 35%)</option>
+   <option value="upper">상반신(중앙 70%)</option>
+  </select>
+  <input id="crop-box" placeholder="x,y,w,h (0~1)" size="12">
+  <button type="button" id="crop-run">재채점</button>
+  <span id="crop-state" style="color:#8a9"></span>
+ </span>
 </div>
 <div class="grid" id="grid">{cards}</div>
 <div id="state"><span id="target"></span><span id="last"></span>이미지를 클릭하면 확대, A=채택 · R=기각 · F=보정 · D=다른 캐릭터.
@@ -421,12 +467,14 @@ function applyView() {{
   const slot = document.getElementById('slot').value;
   const status = document.getElementById('status').value;
   const scoredOnly = document.getElementById('scored').checked;
+  const dupOnly = document.getElementById('dup').checked;
 
   let visible = allCards.filter(card => {{
     if (slot && card.dataset.slot !== slot) return false;
     if (status === '__none') {{ if (card.dataset.decision) return false; }}
     else if (status && card.dataset.decision !== status) return false;
     if (scoredOnly && num(card, 'clip') === null && num(card, 'face') === null) return false;
+    if (dupOnly && !card.dataset.dup) return false;
     return true;
   }});
 
@@ -452,8 +500,40 @@ function applyView() {{
   // Every view change re-syncs the cursor, so the highlighted card is always one the reviewer can actually see.
   syncCursor();
 }}
-['sort', 'slot', 'status', 'scored'].forEach(id =>
+['sort', 'slot', 'status', 'scored', 'dup'].forEach(id =>
   document.getElementById(id).addEventListener('change', applyView));
+const CROP_PRESETS = {{face: [0.325, 0.05, 0.35, 0.35], upper: [0.15, 0.05, 0.7, 0.6]}};
+function cropState(text) {{ document.getElementById('crop-state').textContent = text; }}
+document.getElementById('crop-preset').addEventListener('change', e => {{
+  const box = CROP_PRESETS[e.target.value];
+  if (box) document.getElementById('crop-box').value = box.join(',');
+}});
+document.getElementById('crop-run').addEventListener('click', async () => {{
+  const card = cursorCard || cards()[0];
+  if (!card) {{ cropState('대상 카드가 없습니다'); return; }}
+  const parts = document.getElementById('crop-box').value.split(',').map(s => parseFloat(s.trim()));
+  if (parts.length !== 4 || parts.some(v => !isFinite(v) || v < 0 || v > 1) || parts[2] <= 0 || parts[3] <= 0) {{
+    cropState('박스는 x,y,w,h (0~1, 너비·높이 > 0)'); return;
+  }}
+  const kind = document.getElementById('crop-preset').value || 'custom';
+  cropState('채점 중…');
+  try {{
+    const response = await fetch('/crop-score/' + card.dataset.id + '?kind=' + kind + '&box=' + parts.join(','));
+    const data = await response.json();
+    if (!response.ok) {{ cropState(data.error || 'failed'); return; }}
+    const value = (data.max === null || data.max === undefined)
+      ? kind + ' 점수 없음' : kind + ' max ' + Number(data.max).toFixed(3);
+    let line = card.querySelector('.crop-score');
+    if (!line) {{
+      line = document.createElement('div');
+      line.className = 'crop-score';
+      const anchor = card.querySelector('.scores');
+      if (anchor) {{ anchor.after(line); }} else {{ card.appendChild(line); }}
+    }}
+    line.textContent = '크롭 ' + value + ' · box ' + parts.join(',');
+    cropState(card.dataset.id + ' → ' + value);
+  }} catch (error) {{ cropState(String(error)); }}
+}});
 document.getElementById('reset').addEventListener('click', () => {{
   document.getElementById('sort').value = '';
   document.getElementById('slot').value = '';
@@ -484,11 +564,89 @@ def check_decision(project, candidate_id, decision):
     return record, state
 
 
-def make_server(project, port=8195, log=print, quota_plan=None):
-    """Serve the review page for one project: the images, the decisions, and nothing else."""
+def parse_crop_box(raw):
+    """A user-typed crop box "x,y,w,h" in 0~1 fractions, or a ProjectError saying why it is not one (spec R7 P2)."""
+    parts = [part.strip() for part in str(raw or "").split(",")]
+    if len(parts) != 4:
+        raise pj.ProjectError("크롭 박스는 x,y,w,h 네 값입니다")
+    try:
+        values = [float(part) for part in parts]
+    except ValueError as exc:
+        raise pj.ProjectError("크롭 박스 값은 숫자입니다") from exc
+    if any(v < 0 or v > 1 for v in values):
+        raise pj.ProjectError("크롭 박스 값은 0~1 비율입니다")
+    if values[2] <= 0 or values[3] <= 0:
+        raise pj.ProjectError("크롭의 너비와 높이는 0보다 커야 합니다")
+    return values
+
+
+def _pixel_box(path, box):
+    """A 0~1 box turned into this image's pixels; raises when the crop would have no area."""
+    from PIL import Image
+    with Image.open(path) as image:
+        width, height = image.size
+    x, y, w, h = box
+    pixel = [max(0, round(x * width)), max(0, round(y * height)),
+             round(w * width), round(h * height)]
+    if pixel[2] < 1 or pixel[3] < 1:
+        raise pj.ProjectError(f"크롭이 {Path(path).name}에서 면적 0이 됩니다")
+    return pixel
+
+
+def crop_scores(project, candidate_id, box, *, name="face", embedder=None):
+    """The identity score of the user's crop, against the same crop of every original (spec R7 P2).
+
+    The box arrives in 0~1 fractions and is applied to the candidate **and to every reference original** - a face box
+    is only comparable with other face boxes, which is the rule the scorer already enforces by name. A lazy embedder
+    keeps the review page cheap until somebody actually asks for a re-score.
+    """
+    from . import score as score_mod
+    from .scorers import clip_vision
+    record = project.candidate_by_id(candidate_id)
+    if record is None:
+        raise pj.ProjectError(f"존재하지 않는 후보입니다: {candidate_id}")
+    target = project.resolve_file(record.get("file"))
+    if not target or not Path(target).is_file():
+        raise pj.ProjectError("후보 이미지가 디스크에 없습니다")
+    references = score_mod.reference_paths(project)
+    if not references:
+        raise pj.ProjectError("비교할 사용자 원본이 없습니다")
+    paths = [Path(p) for p in references]
+    paths.append(Path(target))
+    crops = {}
+    for path in paths:
+        crops[path.name] = {name: _pixel_box(path, box)}
+    if embedder is None:
+        embedder = crop_scores.embedder
+        if embedder is None:
+            embedder = crop_scores.embedder = clip_vision.Embedder()
+    result = clip_vision.identity_scores([Path(target)], [Path(p) for p in references], ids=[candidate_id],
+                                         crops=crops, embedder=embedder)
+    row = result["rows"][0]
+    return {"id": candidate_id, "kind": name, "box": list(box),
+            "max": row.get(f"crop_{name}_max"), "mean": row.get(f"crop_{name}_mean"),
+            "reference_count": row.get("reference_count")}
+
+
+crop_scores.embedder = None
+
+
+def make_server(project, port=8195, log=print, quota_plan=None, embedder_factory=None):
+    """Serve the review page for one project: the images, the decisions, and nothing else.
+
+    `embedder_factory` builds the CLIP embedder the crop re-score uses, lazily on first use; tests inject a fake so
+    the page's GPU path is exercised without a model.
+    """
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     root = Path(project.dir).resolve()
+    embedder_state = {"embedder": None}
+
+    def embedder():
+        if embedder_state["embedder"] is None:
+            from .scorers import clip_vision
+            embedder_state["embedder"] = (embedder_factory or clip_vision.Embedder)()
+        return embedder_state["embedder"]
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -520,13 +678,31 @@ def make_server(project, port=8195, log=print, quota_plan=None):
             return self._send(200, target.read_bytes(), MEDIA_TYPES.get(target.suffix.lower(), "image/png"))
 
         def do_GET(self):
-            path = self.path.split("?", 1)[0]
+            split = urllib.parse.urlsplit(self.path)
+            path = split.path
             if path in ("/", "/index.html"):
                 page = root / "review.html"
                 write_page(project, page, quota_plan=quota_plan, log=lambda *_: None)
                 return self._send(200, page.read_bytes(), "text/html; charset=utf-8")
             if path.startswith("/image/"):
                 return self._image(path[len("/image/"):])
+            if path.startswith("/crop-score/"):
+                candidate_id = unquote(path[len("/crop-score/"):])
+                query = urllib.parse.parse_qs(split.query)
+                kind = (query.get("kind") or ["face"])[0]
+                try:
+                    if kind not in ("face", "upper", "custom"):
+                        raise pj.ProjectError("크롭 이름은 face, upper 또는 custom입니다")
+                    box = parse_crop_box((query.get("box") or [""])[0])
+                    row = crop_scores(project, candidate_id, box, name=kind, embedder=embedder())
+                except pj.ProjectError as exc:
+                    return self._send(400, json.dumps({"error": str(exc)}, ensure_ascii=False),
+                                      "application/json; charset=utf-8")
+                except Exception as exc:  # noqa: BLE001 - a scorer failure is a message, not a crash
+                    return self._send(500, json.dumps({"error": f"{type(exc).__name__}: {exc}"},
+                                                      ensure_ascii=False), "application/json; charset=utf-8")
+                log(f"{candidate_id} crop {kind} max {row.get('max')}")
+                return self._send(200, json.dumps(row, ensure_ascii=False), "application/json; charset=utf-8")
             return self._send(404, "not found")
 
         def do_POST(self):

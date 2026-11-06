@@ -443,21 +443,125 @@ _PAGE_TEMPLATE = """<!doctype html>
  .ph {{ padding: 30px 6px; text-align: center; font-size: 12px; }}
  tr.prompts td {{ background: #171a1f; }}
  .missing-flag {{ color: #f0b46b; }}
+ .clip-value {{ color: #9cf; }}
+ .meta.best-clip {{ color: #7fe3a0; font-weight: 600; }}
 </style></head><body>
 <h1>{title}</h1>
 <p class="hint">{summary}</p>
 <table><thead><tr><th class="row">프롬프트</th>{head}</tr></thead>
 <tbody>{rows}</tbody></table>
+{clip_tools}
 </body></html>
 """
 
 
-def write_sheet(project, run_folder, log=print):
+def sheet_clip_path(project, run_folder):
+    return manifest_path_of(project, run_folder).parent / "grid_clip.json"
+
+
+def sheet_clip_scores(project, run_folder, *, embedder=None, log=print):
+    """{(prompt_id, epoch, seed): clip_max} for every drawn cell, against the user's originals (spec R7 P2).
+
+    This is the auxiliary sort the comparison sheet offers: it says which epoch drew a composition closest to the
+    character, per cell, so the human eye starts at the strong candidates. It is a measurement laid over the grid,
+    never a decision. The scores are written beside the sheet so it can be re-rendered without touching the GPU.
+    """
+    from . import score as score_mod
+    from .scorers import clip_vision
+    manifest = read_manifest(manifest_path_of(project, run_folder))
+    exp = manifest_path_of(project, run_folder).parent
+    refs = score_mod.reference_paths(project)
+    if not refs:
+        raise EpochError("no user originals to compare against, so the grid cannot be scored")
+    cells = [((t["prompt_id"], int(t["epoch"]), int(t["seed"])), exp / t["file"])
+             for t in manifest["tasks"] if (exp / t["file"]).is_file()]
+    if not cells:
+        raise EpochError("no drawn cell to score; run the grid first")
+    embedder = embedder or clip_vision.Embedder()
+    scores = {}
+    batch = 8
+    for start in range(0, len(cells), batch):
+        chunk = cells[start:start + batch]
+        result = clip_vision.identity_scores(
+            [path for _key, path in chunk], refs,
+            ids=["|".join(str(part) for part in key) for key, _path in chunk], embedder=embedder)
+        for row in result["rows"]:
+            prompt_id, epoch, seed = str(row["id"]).split("|")
+            scores[(prompt_id, int(epoch), int(seed))] = row.get("max_cosine")
+    sidecar = sheet_clip_path(project, run_folder)
+    sidecar.write_text(json.dumps({ "|".join(str(part) for part in key): value
+                                    for key, value in scores.items() }, ensure_ascii=False, indent=1),
+                       encoding="utf-8")
+    log(f"[epochs] {len(scores)} cell score(s) -> {sidecar}")
+    return scores
+
+
+def _read_clip_sidecar(project, run_folder):
+    sidecar = sheet_clip_path(project, run_folder)
+    if not sidecar.is_file():
+        return None
+    try:
+        raw = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    out = {}
+    for key, value in raw.items():
+        parts = str(key).split("|")
+        if len(parts) != 3 or value is None:
+            continue
+        out[(parts[0], int(parts[1]), int(parts[2]))] = float(value)
+    return out
+
+
+_CLIP_SORT_TOOLS = """
+<p style="margin: 10px 0 0">
+ 정렬 <select id="clip-sort">
+  <option value="">기본(프롬프트 순)</option>
+  <option value="clip-desc">CLIP 높은 순(각 프롬프트의 최고 점수)</option>
+  {options}
+ </select>
+ <span id="clip-note" style="color:#789;font-size:12px"></span>
+</p>
+<script>
+(function () {{
+  const sorter = document.getElementById('clip-sort');
+  if (!sorter) return;
+  const body = document.querySelector('tbody');
+  const original = Array.from(body.querySelectorAll('tr')).filter(tr => tr.querySelector('td'));
+  const bestOf = tr => Math.max(-1, ...Array.from(tr.querySelectorAll('.cell[data-clip]'))
+    .map(cell => parseFloat(cell.dataset.clip)).filter(v => !isNaN(v)));
+  sorter.addEventListener('change', () => {{
+    const rows = original.slice();
+    if (sorter.value === 'clip-desc') {{
+      rows.sort((a, b) => bestOf(b) - bestOf(a));
+    }} else if (sorter.value.startsWith('clip-desc:')) {{
+      const epoch = parseInt(sorter.value.split(':')[1], 10);
+      const at = tr => {{
+        const index = Array.from(tr.children).findIndex(cell => cell.textContent.includes('에포크 ' + epoch));
+        const cell = tr.children[index] && tr.children[index].querySelector('.cell[data-clip]');
+        return cell ? parseFloat(cell.dataset.clip) : -1;
+      }};
+      rows.sort((a, b) => at(b) - at(a));
+    }}
+    rows.forEach(row => body.appendChild(row));
+    document.getElementById('clip-note').textContent = 'CLIP은 눈의 보조일 뿐입니다';
+  }});
+}})();
+</script>
+"""
+
+
+def write_sheet(project, run_folder, log=print, clip_scores=None):
     """Write comparison.html: prompt rows x checkpoint columns, so one composition can be compared down a row.
 
     Rows are prompts, not checkpoints: the question is "which epoch draws this pose right", and answering it means
-    seeing the same composition at every epoch next to each other.
+    seeing the same composition at every epoch next to each other. When CLIP scores are available - computed by
+    `sheet_clip_scores` and cached beside the sheet, or passed in - each cell carries its score, the strongest cell of
+    a row is marked, and the rows can be sorted by score (spec R7 P2). The scores are an aid for the eye; the choice
+    stays a person's.
     """
+    if clip_scores is None:
+        clip_scores = _read_clip_sidecar(project, run_folder)
     manifest = read_manifest(manifest_path_of(project, run_folder))
     exp = manifest_path_of(project, run_folder).parent
     by_key = {(t["prompt_id"], int(t["epoch"]), int(t["seed"])): t for t in manifest["tasks"]}
@@ -465,13 +569,29 @@ def write_sheet(project, run_folder, log=print):
     seeds = [int(s) for s in manifest["seeds"]]
     choice = chosen(project) or {}
     picked = choice.get("epoch")
+    def clip_of(prompt_id, epoch, seed):
+        if not clip_scores:
+            return None
+        return clip_scores.get((prompt_id, epoch, seed))
+
+    column_means = {}
+    if clip_scores:
+        for epoch in epochs:
+            values = [clip_of(prompt["id"], epoch, seed) for prompt in manifest["prompts"] for seed in seeds]
+            values = [v for v in values if v is not None]
+            column_means[epoch] = round(sum(values) / len(values), 4) if values else None
     head = "".join(
         f'<th class="col{" best" if picked == e else ""}">에포크 {e}'
         f'<div class="meta">{html_escape(_short_sha(manifest, e))}'
-        f'{" · 선택됨" if picked == e else ""}</div></th>'
+        f'{" · 선택됨" if picked == e else ""}</div>'
+        + (f'<div class="meta">CLIP 평균 {column_means[e]:.3f}</div>' if column_means.get(e) is not None else "")
+        + '</th>'
         for e in epochs)
     rows = []
     for prompt in manifest["prompts"]:
+        row_clips = {(epoch, seed): clip_of(prompt["id"], epoch, seed) for epoch in epochs for seed in seeds}
+        scored = [(key, value) for key, value in row_clips.items() if value is not None]
+        best = max(scored, key=lambda pair: pair[1])[0] if scored else None
         cells = []
         for epoch in epochs:
             inner = []
@@ -485,11 +605,16 @@ def write_sheet(project, run_folder, log=print):
                     inner.append(f'<div class="cell missing"><div class="ph">'
                                  f'{html_escape(task.get("error") or task["status"])}</div></div>')
                     continue
-                inner.append(f'<div class="cell"><a href="{rel}" target="_blank">'
+                value = row_clips[(epoch, seed)]
+                is_best = best is not None and (epoch, seed) == best
+                clip_attr = f' data-clip="{value:.4f}"' if value is not None else ""
+                clip_meta = (f'<div class="meta clip-value{" best-clip" if is_best else ""}">'
+                             f'{value:.3f}{" · 최고" if is_best else ""}</div>') if value is not None else ""
+                inner.append(f'<div class="cell"{clip_attr}><a href="{rel}" target="_blank">'
                              f'<img loading="lazy" src="{rel}" alt="e{epoch} {prompt["id"]} s{seed}"></a>'
-                             f'<div class="meta">s{seed}</div></div>')
+                             f'<div class="meta">s{seed}</div>{clip_meta}</div>')
             cells.append(f"<td>{''.join(inner)}</td>")
-        rows.append(f'<tr><th class="row">{html_escape(prompt["id"])}'
+        rows.append(f'<tr data-order="{len(rows)}"><th class="row">{html_escape(prompt["id"])}'
                     f'<div class="meta">{html_escape(prompt.get("category") or "")}</div>'
                     f'<div class="prompt">{html_escape(prompt["prompt"])}</div></th>{"".join(cells)}</tr>')
     missing = sum(1 for t in manifest["tasks"] if not (exp / t["file"]).is_file())
@@ -503,10 +628,16 @@ def write_sheet(project, run_folder, log=print):
         summary += f' · 선택된 에포크: <b>{picked}</b>'
     else:
         summary += (' · 아직 고르지 않음 — CLI: <b>choose --epoch N</b>')
+    clip_tools = ""
+    if clip_scores:
+        summary += ' · <b>CLIP 보조 정렬</b> 사용(점수는 눈의 보조일 뿐, 선택은 사람이 합니다)'
+        clip_tools = _CLIP_SORT_TOOLS.format(
+            options="".join(f'<option value="clip-desc:{e}">CLIP 높은 순 — 에포크 {e}</option>'
+                            for e in reversed(epochs)))
     path = exp / "comparison.html"
     path.write_text(_PAGE_TEMPLATE.format(
         title=html_escape(f"에포크 비교 — {project.card.get('id', '')}"),
-        summary=summary, head=head, rows="".join(rows)), encoding="utf-8")
+        summary=summary, head=head, rows="".join(rows), clip_tools=clip_tools), encoding="utf-8")
     log(f"[epochs] {path}")
     return path
 
@@ -581,6 +712,8 @@ def main(argv=None):
     parser.add_argument("--seeds", help=f"comma-separated seeds; default: {','.join(map(str, EVAL_SEEDS))}")
     parser.add_argument("--note", default="", help="why this epoch was chosen (choose)")
     parser.add_argument("--serve", action="store_true", help="open the sheet in a browser (sheet)")
+    parser.add_argument("--clip", action="store_true",
+                        help="with sheet: score the drawn cells with CLIP for the auxiliary sort (GPU)")
     parser.add_argument("--comfy", default=None, help="ComfyUI base URL")
     parser.add_argument("--cancel-file", help="stop before the next cell once this file exists")
     parser.add_argument("--json", action="store_true")
@@ -643,7 +776,12 @@ def main(argv=None):
         return 0
 
     if args.command == "sheet":
-        path = write_sheet(project, run_folder)
+        clip_scores = None
+        if args.clip:
+            # The auxiliary sort needs scores; they cost one scoring pass over the drawn cells and are cached
+            # beside the sheet, so re-rendering costs nothing (spec R7 P2).
+            clip_scores = sheet_clip_scores(project, run_folder, log=log)
+        path = write_sheet(project, run_folder, clip_scores=clip_scores)
         if args.serve:
             import webbrowser
             webbrowser.open(path.as_uri())

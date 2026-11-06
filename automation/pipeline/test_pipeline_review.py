@@ -158,6 +158,203 @@ class PageTests(unittest.TestCase):
             self.assertNotIn(leftover, html)
 
 
+class DuplicateGroupTests(unittest.TestCase):
+    """R7 P2: near-duplicates are grouped with the scorer's own pHash and shown, never removed."""
+
+    def setUp(self):
+        import tempfile
+        from PIL import Image
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        base = Image.new("RGB", (64, 64), (120, 120, 120))
+        for x in range(0, 64, 8):
+            for y in range(0, 64, 8):
+                base.putpixel((x, y), (10, 10, 10))
+        base.save(self.root / "twin_a.png")
+        # A redraw with slightly different lighting: same structure, a few values moved - one pHash group.
+        twin = base.copy()
+        for x in range(64):
+            for y in range(64):
+                r, g, b = twin.getpixel((x, y))
+                twin.putpixel((x, y), (min(255, r + 6), g, b))
+        twin.save(self.root / "twin_b.png")
+        # Strongly different structure, so its difference-hash sits far from the flat twins: left half dark,
+        # right half light, with a hard vertical edge.
+        different = Image.new("RGB", (64, 64), (10, 10, 10))
+        for x in range(32, 64):
+            for y in range(64):
+                different.putpixel((x, y), (250, 250, 250))
+        different.save(self.root / "different.png")
+        candidates = [
+            {"id": "c_t1", "file": "twin_a.png", "generator": "qwen_edit", "slot": {"id": "frm_face"},
+             "train_generation": 1, "edit_depth": 0, "parent_ids": [], "caption": ""},
+            {"id": "c_t2", "file": "twin_b.png", "generator": "qwen_edit", "slot": {"id": "frm_face"},
+             "train_generation": 1, "edit_depth": 0, "parent_ids": [], "caption": ""},
+            {"id": "c_d1", "file": "different.png", "generator": "qwen_edit", "slot": {"id": "frm_back"},
+             "train_generation": 1, "edit_depth": 0, "parent_ids": [], "caption": ""},
+        ]
+        self.project = FakeProject(self.root, candidates)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def page(self):
+        return review.write_page(self.project, self.root / "review.html", log=lambda *_: None).read_text(
+            encoding="utf-8")
+
+    def test_the_twins_share_a_group_and_the_odd_one_out_has_none(self):
+        import re
+        page = self.page()
+        twins = re.findall(r'<div class="card" data-id="(c_t[12])"[^>]*data-dup="(\d+)"', page)
+        self.assertEqual({tid for tid, _group in twins}, {"c_t1", "c_t2"})
+        odd = re.search(r'<div class="card" data-id="c_d1"[^>]*data-dup="([^"]*)"', page)
+        self.assertIsNotNone(odd)
+        self.assertEqual(odd.group(1), "", "not being a near-duplicate is the normal case, not group 0")
+
+    def test_the_group_is_named_on_the_card(self):
+        self.assertIn("근접 중복 G1 (2장)", self.page())
+
+    def test_the_summary_names_the_grouping(self):
+        self.assertIn("근접 중복 묶음 1", self.page())
+
+    def test_the_filter_checkbox_is_on_the_page(self):
+        page = self.page()
+        self.assertIn('id="dup"', page)
+        self.assertIn("근접 중복만", page)
+
+
+class CropScoreTests(unittest.TestCase):
+    """R7 P2: a user-typed crop box re-scores the picture against the same crop of every original."""
+
+    def setUp(self):
+        import tempfile
+        from PIL import Image
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        Image.new("RGB", (64, 64), (200, 200, 200)).save(self.root / "a.png")
+        Image.new("RGB", (64, 64), (100, 100, 100)).save(self.root / "b.png")
+
+        class Project(FakeProject):
+            def __init__(self, root, candidates):
+                super().__init__(root, candidates)
+                self._sources = [{"id": "s_1", "file": "a.png", "origin": "user", "sha256": "sa"},
+                                 {"id": "s_2", "file": "b.png", "origin": "user", "sha256": "sb"}]
+
+            def source_records(self):
+                return list(self._sources)
+
+            def candidate_by_id(self, candidate_id):
+                for record in self.candidates():
+                    if record["id"] == candidate_id:
+                        return record
+                return None
+
+        self.candidate_file = self.root / "cand.png"
+        Image.new("RGB", (64, 64), (210, 210, 210)).save(self.candidate_file)
+        self.project = Project(self.root, [{"id": "c_1", "file": "cand.png", "generator": "qwen_edit",
+                                            "slot": {"id": "frm_face"}, "train_generation": 1,
+                                            "edit_depth": 0, "parent_ids": [], "caption": ""}])
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_a_box_with_the_wrong_shape_is_refused(self):
+        for bad in ("1,2,3", "a,b,c,d", "0.5,0.5,-1,0.2", "0.5,0.5,0.2,0"):
+            with self.assertRaises(review.pj.ProjectError):
+                review.parse_crop_box(bad)
+
+    def test_a_good_box_parses(self):
+        self.assertEqual(review.parse_crop_box("0.1, 0.2, 0.3, 0.4"), [0.1, 0.2, 0.3, 0.4])
+
+    def test_a_pixel_box_comes_from_the_image_size(self):
+        self.assertEqual(review._pixel_box(self.root / "a.png", [0.25, 0.5, 0.5, 0.25]), [16, 32, 32, 16])
+
+    def test_the_route_scores_the_crop_against_the_same_crop_of_the_originals(self):
+        import json as json_mod
+        import threading
+        import urllib.request
+        from PIL import Image
+
+        class Vec:
+            """Just enough of a tensor for the scorer's cosine: elementwise multiply and sum."""
+
+            def __init__(self, values):
+                self.values = values
+
+            def __mul__(self, other):
+                return Vec([a * b for a, b in zip(self.values, other.values)])
+
+            def sum(self):
+                return sum(self.values)
+
+        class FakeEmbedder:
+            """Brightness vectors, so the bright crop matches the bright original and nothing else."""
+
+            @staticmethod
+            def _vector_of(image):
+                colours = [image.getpixel((x, y)) for x in (0, 32) for y in (0, 32)]
+                brightness = sum(sum(c) / 3 for c in colours) / len(colours)
+                return Vec([brightness / 255.0, 1.0 - brightness / 255.0])
+
+            def embed(self, paths):
+                out = {}
+                for p in paths:
+                    with Image.open(p) as image:
+                        out[str(p)] = self._vector_of(image)
+                return out
+
+            def embed_crops(self, path, boxes):
+                out = {}
+                with Image.open(path) as image:
+                    for name, (x, y, w, h) in boxes.items():
+                        colours = [image.getpixel((px, py)) for px, py in
+                                   [(x, y), (min(x + w, 63), min(y + h, 63))]]
+                        brightness = sum(sum(c) / 3 for c in colours) / len(colours)
+                        out[name] = Vec([brightness / 255.0, 1.0 - brightness / 255.0])
+                return out
+
+        server = review.make_server(self.project, port=0, quota_plan=None,
+                                    embedder_factory=FakeEmbedder)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            url = f"http://127.0.0.1:{port}/crop-score/c_1?kind=face&box=0.1,0.1,0.6,0.6"
+            with urllib.request.urlopen(url, timeout=10) as response:
+                data = json_mod.loads(response.read().decode("utf-8"))
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual(data["id"], "c_1")
+        self.assertEqual(data["kind"], "face")
+        self.assertIsNotNone(data["max"])
+        # The bright crop sits closer to the bright original than to the dark one: max above the mean over both.
+        self.assertGreater(data["max"], 0.6)
+        self.assertGreater(data["max"], data["mean"])
+        self.assertEqual(data["reference_count"], 2)
+
+    def test_the_route_refuses_a_bad_box_without_touching_the_embedder(self):
+        import threading
+        import urllib.error
+        import urllib.request
+
+        def no_embedder():
+            raise AssertionError("a refused box must not build an embedder")
+
+        server = review.make_server(self.project, port=0, quota_plan=None, embedder_factory=no_embedder)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            url = f"http://127.0.0.1:{port}/crop-score/c_1?kind=face&box=1,2,3"
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(url, timeout=10)
+            self.assertEqual(caught.exception.code, 400)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
 class KeyboardScopeTests(unittest.TestCase):
     """R1: the keyboard decides only what the reviewer can see.
 
