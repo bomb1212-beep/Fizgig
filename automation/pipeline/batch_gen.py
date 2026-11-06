@@ -125,11 +125,16 @@ def training_of(project):
     }
 
 
-def short_slots(project, *, log=None):
-    """Which slots still need pictures, split into what to draw and what is only waiting on the reviewer.
+def slot_board(project, *, log=None):
+    """(draw, pending): which slots still need pictures, read-only, split by whether review may still fill them.
 
-    The split is the point: a slot whose picture is sitting in the review queue is not a slot the generator should fill
-    again, and counting it as short would make every run of this stage draw the same six pictures.
+    A slot is only short when too few of its pictures were **accepted** - a pending picture might fill it, and a
+    correction is still being judged, so the board counts what is settled and lists the rest. This is the
+    classification both generators consume: batch B draws the draw rows and reports the pending ones, and ph3_edit
+    plans the draw rows too - a waiting picture is not a gap to fill, whoever does the filling.
+
+    Read-only on purpose: planning an edit must never rewrite batch B's manifest, and neither generator needs a seed
+    snapshot to classify slots.
     """
     quotas = project.card.get("slot_quotas") or {}
     if not quotas:
@@ -144,8 +149,6 @@ def short_slots(project, *, log=None):
     for slot, row in sorted(board.items()):
         if row["short"] <= 0:
             continue
-        if slot not in SLOT_PROMPTS:
-            raise BatchError(f"slot {slot!r} has no prompt in SLOT_PROMPTS; add one rather than guessing its wording")
         entry = {"slot": slot, "category": category_of(slot), "target": row["target"],
                  "accepted": row["accepted"], "short": row["short"], "waiting": waiting.get(slot, 0)}
         # A waiting picture that is accepted fills the slot, so a slot covered by waiting pictures is not drawn.
@@ -156,6 +159,21 @@ def short_slots(project, *, log=None):
             draw.append(entry)
     if log is not None:
         log(f"[batch_b] {len(draw)} slot(s) to draw, {len(pending)} waiting on review")
+    return draw, pending
+
+
+def short_slots(project, *, log=None):
+    """The slots batch B would draw: the slot board, plus the requirement that every slot have a prompt.
+
+    The wording each slot is asked for is batch B's own vocabulary; a slot the plan asks for but this table does not
+    know is refused rather than guessed, because a prompt that does not match its slot id would fill the quota with
+    the wrong picture.
+    """
+    draw, pending = slot_board(project, log=log)
+    for entry in draw:
+        if entry["slot"] not in SLOT_PROMPTS:
+            raise BatchError(f"slot {entry['slot']!r} has no prompt in SLOT_PROMPTS; "
+                             "add one rather than guessing its wording")
     return draw, pending
 
 

@@ -19,7 +19,7 @@ import os
 import time
 from pathlib import Path
 
-from pipeline import batch_gen, comfy, epochs as epochs_mod, lineage, ph3_gen, project as pj
+from pipeline import batch_gen, comfy, epochs as epochs_mod, lineage, ph3_gen, project as pj, seed
 
 # The step budget of one P-H3 edit. Kept here rather than in ph3_gen because it is a budget decision, not a graph fact.
 STEPS = 8
@@ -54,51 +54,161 @@ def write_manifest(project, manifest):
     os.replace(temp, path)
 
 
-def sources(project):
-    """Accepted pictures an edit may start from: real originals first, then accepted edits.
+def sources(project, *, caps=None, log=None):
+    """(usable, unusable) - accepted pictures an edit may start from, with every refusal named.
 
-    Three kinds of picture are refused, each because editing it would poison the lineage rather than merely waste time:
-
-    - a holdout original, whose edits would leak the holdout into the training set through the back door;
-    - a synthetic anchor with no recorded parent, because anything edited from it inherits an unprovable ancestry and
-      the audit refuses the result as `unverified_ancestor`. Sourcing from a labelled original instead is the fix, so
-      the anchor is skipped here rather than producing pictures that can never be used.
+    Editing puts the source picture into the child's lineage, so the source has to be as clean as a training input,
+    checked the same way the audits check one (spec R3): bytes that still hash to what was recorded, a holdout that is
+    refused by id **and by sha256** (a renamed copy of the holdout is still the holdout), ancestry that resolves to
+    recorded pictures without a cycle and without an unparented synthetic anchor, and a LoRA-trained candidate whose
+    training snapshot this project actually holds and that held no holdout. On top of the shared checks sits the child
+    shape the edit would produce: a user original edits to generation 1, depth 1; a candidate keeps its parent's
+    generation and goes one edit deeper - and a child past the caps is excluded here, before any GPU work, rather than
+    becoming a picture no audit can ever admit.
     """
+    caps = caps or lineage.caps(project.card.get("lineage"))
     holdout = project.holdout_entry()
-    forbidden = set(holdout["ids"]) | set(holdout["shas"])
+    holdout_ids = set(holdout["ids"])
+    holdout_shas = set(holdout["shas"])
+    index = project.index()
     review = project.review()
-    out = []
-    unusable = []
+    manifests = seed.snapshot_manifests(project)
+    # A synthetic source whose own parents were never recorded: anything edited from it inherits an unprovable
+    # ancestry and would be refused as unverified_ancestor forever. Skipping it here is the fix.
+    quarantined = {r["id"] for r in project.source_records()
+                   if r.get("origin") == "synthetic"
+                   and not [p for p in (r.get("parent_ids") or []) if p in index]}
+    usable, unusable = [], []
+
+    def refuse(record, code, detail=""):
+        unusable.append({"id": record["id"], "code": code,
+                         "reason": detail or SEED_REASONS.get(code, code)})
+
+    def lineage_problems(record, *, generated):
+        """(code, detail) for the first lineage problem, or None: shared with what the audits refuse.
+
+        `no_ancestry` is a candidate's problem only - a user original legitimately has no parents, it is the root the
+        whole chain is supposed to reach.
+        """
+        parents = list(record.get("parent_ids") or [])
+        loras = [l for l in (record.get("models") or {}).get("loras") or [] if l.get("trained_on_snapshot")]
+        if generated and not parents and not loras:
+            return "no_ancestry", "neither parents nor a training snapshot are recorded"
+        ancestors, unknown, cyclic = seed.walk(record, index)
+        if cyclic:
+            return "cyclic_lineage", "the parent chain leads back to the picture itself"
+        if unknown:
+            return "missing_parent", "a recorded parent is not in the project: " + ", ".join(sorted(unknown))
+        hit = sorted(ancestors & holdout_ids)
+        if hit:
+            return "holdout_indirect", "an ancestor is a holdout original: " + ", ".join(hit)
+        sha_hits = sorted({index[a].get("sha256") for a in ancestors if a in index} & holdout_shas)
+        if sha_hits:
+            return "holdout_indirect", "an ancestor carries a holdout's bytes: " + ", ".join(
+                s[:12] for s in sha_hits)
+        anchor_hits = sorted(ancestors & quarantined)
+        if anchor_hits:
+            return "unverified_ancestor", "an ancestor is an unparented synthetic anchor: " + ", ".join(anchor_hits)
+        for lora in loras:
+            snapshot = manifests.get(lora["trained_on_snapshot"])
+            if snapshot is None:
+                return "lora_snapshot_unverified", f"the LoRA names snapshot {lora['trained_on_snapshot']}, " \
+                                                   "which this project has no record of"
+            if {e.get("sha256") for e in snapshot.get("inputs") or []} & holdout_shas:
+                return "holdout_via_lora", f"the LoRA was trained on {lora['trained_on_snapshot']}, " \
+                                           "which holds a holdout"
+        return None
+
     for record in project.source_records():
-        if record["id"] in forbidden or record.get("sha256") in forbidden:
+        if record["id"] in holdout_ids or record.get("sha256") in holdout_shas:
+            refuse(record, "holdout_source", "the holdout itself (or a copy of its bytes) is never an edit source")
             continue
-        # A synthetic source is an anchor whose own ancestry was never recorded; an edit of it can never be verified.
-        if (record.get("origin") or "user") != "user" and not (record.get("parent_ids") or []):
-            unusable.append({"id": record["id"], "reason": "synthetic anchor with no recorded parent"})
+        if record["id"] in quarantined:
+            refuse(record, "unverified_ancestor", "synthetic anchor with no recorded parent")
             continue
         path = project.resolve_file(record.get("file") or record.get("src_path"))
-        if path and path.is_file():
-            out.append({"id": record["id"], "path": str(path), "origin": "source"})
-    for record in project.candidates():
-        state = review.get(record["id"]) or {}
-        if state.get("decision") != "accept":
+        if not path or not path.is_file():
+            refuse(record, "missing_file", str(record.get("file") or record.get("src_path")))
             continue
-        if record["id"] in forbidden or record.get("sha256") in forbidden:
+        actual = lineage.sha256_file(path)
+        if actual != record.get("sha256"):
+            refuse(record, "tampered_file", f"recorded {str(record.get('sha256'))[:12]}, disk {actual[:12]}")
+            continue
+        problem = lineage_problems(record, generated=False)
+        if problem:
+            refuse(record, problem[0], problem[1])
+            continue
+        # A direct edit of a user original: the product's shape for a model-made edit (spec R3).
+        usable.append({"id": record["id"], "path": str(path), "origin": "source", "sha256": actual,
+                       "generation": 1, "edit_depth": 1})
+    for record in project.candidates():
+        if (review.get(record["id"]) or {}).get("decision") != "accept":
+            continue
+        if record["id"] in holdout_ids or record.get("sha256") in holdout_shas:
+            refuse(record, "holdout_source", "carries a holdout's id or bytes")
             continue
         path = project.resolve_file(record.get("file"))
-        if path and path.is_file():
-            out.append({"id": record["id"], "path": str(path), "origin": "candidate"})
-    return out, unusable
+        if not path or not path.is_file():
+            refuse(record, "missing_file", str(record.get("file")))
+            continue
+        actual = lineage.sha256_file(path)
+        if actual != record.get("sha256"):
+            refuse(record, "tampered_file", f"recorded {str(record.get('sha256'))[:12]}, disk {actual[:12]}")
+            continue
+        problem = lineage_problems(record, generated=True)
+        if problem:
+            refuse(record, problem[0], problem[1])
+            continue
+        # An edit of a candidate keeps the parent's generation and goes one edit deeper (spec R3).
+        generation = int(record.get("train_generation") or 0)
+        depth = int(record.get("edit_depth") or 0) + 1
+        if generation > caps["max_train_generation"]:
+            refuse(record, "generation_cap", f"the edit would sit at generation {generation}, "
+                                             f"past max_train_generation {caps['max_train_generation']}")
+            continue
+        if depth > caps["max_edit_depth"]:
+            refuse(record, "edit_depth_cap", f"the edit would sit at depth {depth}, "
+                                             f"past max_edit_depth {caps['max_edit_depth']}")
+            continue
+        usable.append({"id": record["id"], "path": str(path), "origin": "candidate", "sha256": actual,
+                       "generation": generation, "edit_depth": depth})
+    if log is not None:
+        for row in unusable:
+            log(f"[ph3_edit] not editable {row['id']} [{row['code']}] {row['reason']}")
+    return usable, unusable
 
 
-def instruction_for(slot_id, category):
+SEED_REASONS = {
+    "holdout_source": "the holdout itself, or a copy of its bytes",
+    "unverified_ancestor": "synthetic anchor with no recorded parent",
+    "no_ancestry": "neither parents nor a training snapshot are recorded",
+    "cyclic_lineage": "the parent chain leads back to the picture itself",
+    "missing_parent": "a recorded parent is not in the project",
+    "holdout_indirect": "an ancestor is a holdout original",
+    "holdout_via_lora": "the training snapshot behind the LoRA holds a holdout",
+    "lora_snapshot_unverified": "the LoRA names a snapshot this project has no record of",
+    "missing_file": "the image file is not on disk",
+    "tampered_file": "the bytes on disk no longer hash to what was recorded",
+    "generation_cap": "the edit would sit past max_train_generation",
+    "edit_depth_cap": "the edit would sit past max_edit_depth",
+}
+
+
+def instruction_for(slot_id, category, card=None):
     """The wording handed to P-H3 for one slot.
 
-    Written out per category rather than templated from the slot id: "ang_back" tells a person what it means, and the
-    model needs the same thing said in words. A slot with no entry is refused by `plan` instead of being sent with a
-    vague instruction that would produce a picture nobody asked for.
+    Written out per slot rather than templated from the id: "frm_back" tells a person what it means, and the model
+    needs the same thing said in words. When the card names a default outfit it is carried into the instruction, so the
+    wording reflects what the card actually dresses the character in (spec R3) instead of a generic "same outfit". A
+    slot with no entry is refused by `plan` instead of being sent with a vague instruction that would produce a picture
+    nobody asked for.
     """
-    return INSTRUCTIONS.get(slot_id) or INSTRUCTIONS_BY_CATEGORY.get(category)
+    text = INSTRUCTIONS.get(slot_id) or INSTRUCTIONS_BY_CATEGORY.get(category)
+    if text and card:
+        outfit = (card.get("outfits") or {}).get("default", "")
+        if outfit:
+            text = f"{text}, wearing {outfit}"
+    return text
 
 
 INSTRUCTIONS = {
@@ -118,20 +228,27 @@ INSTRUCTIONS_BY_CATEGORY = {
 }
 
 
-def short_slots(gaps, *, slots=None, force=False):
-    """The gaps worth drawing, from `batch_gen.plan`'s `waiting` rows.
+def short_slots(project, *, slots=None, force=False, log=None):
+    """Short slots with no picture waiting on review, from batch_gen's own read-only classification.
 
-    A slot that already has pictures waiting on review is not a gap to fill: drawing more would grow the review backlog
-    instead of shrinking it. This is the same rule batch_gen applies, and getting it wrong would mean sixteen new
-    pictures for eight slots that each already have one or two waiting.
+    `batch_gen.slot_board` is the producer of the split this decision depends on, so it is consumed directly instead
+    of re-reading a manifest built for someone else (spec R3). Its draw rows are the slots short of an accepted picture
+    with nothing pending on review; its pending rows are slots a waiting picture may still fill. Planning against the
+    pending rows - what this used to do, and what the old tests encoded - would edit the slots that need it least and
+    grow the review backlog instead of shrinking it. Read-only and snapshot-free: nothing is written, and an
+    independent edit never draws through the Krea2 LoRA, so no seed snapshot is required to plan one.
 
-    `force` draws the named slots anyway. Naming a slot is the deliberate override; it exists so the draw path can be
-    exercised on demand, not as a way to quietly grow the backlog.
-
-    Pure on purpose: it is the decision that matters and it can be tested without a seed snapshot or a GPU.
+    `force` draws the named slots anyway (or every pending slot when none is named). Naming a slot is the deliberate
+    override; it exists so the draw path can be exercised on demand, not as a way to quietly grow the backlog.
     """
-    rows = [row for row in (gaps.get("waiting") or [])
-            if int(row.get("short") or 0) > 0 and (force or int(row.get("waiting") or 0) == 0)]
+    try:
+        draw, pending = batch_gen.slot_board(project, log=log)
+    except batch_gen.BatchError:
+        return []                      # a card with no slot plan has no gaps to fill
+    rows = [dict(row) for row in draw]
+    if force:
+        named = set(slots or [])
+        rows += [dict(row) for row in pending if not named or row["slot"] in named]
     if slots:
         wanted = set(slots)
         rows = [row for row in rows if row["slot"] in wanted]
@@ -142,13 +259,12 @@ def plan(project, *, slots=None, seeds=None, source_ids=None, force=False, log=p
     """{manifest} for the short slots, with the pictures already on disk skipped.
 
     Returns a manifest with `tasks == []` when there is nothing to do, which is a normal outcome, not an error: a plan
-    that is already filled or already waiting on review needs no new pictures.
+    that is already filled or already waiting on review needs no new pictures. Planning writes only this stage's own
+    manifest - the batch B plan is not touched, and no GPU or model upload happens here.
     """
-    from pipeline import batch_gen as bg
-
     # Sources are checked first: with nothing editable the plan is impossible whatever the slots say, and that reason
-    # is more useful than "no seed snapshot", which is what bg.plan() would raise instead.
-    available, unusable = sources(project)
+    # is more useful than "no seed snapshot", which a batch plan would raise instead.
+    available, unusable = sources(project, log=log)
     if source_ids:
         wanted_sources = set(source_ids)
         available = [s for s in available if s["id"] in wanted_sources]
@@ -156,24 +272,29 @@ def plan(project, *, slots=None, seeds=None, source_ids=None, force=False, log=p
         raise EditError("no picture is eligible to edit: every source is a holdout, an unparented anchor, or has gone "
                         "missing")
 
-    gaps = bg.plan(project, log=lambda *_: None)
-    short = short_slots(gaps, slots=slots, force=force)
+    short = short_slots(project, slots=slots, force=force, log=log)
 
     seeds = list(seeds or range(7001, 7001 + SEEDS_PER_SLOT))
     tasks, skipped = [], []
     for row in short:
         slot_id, category = row["slot"], row.get("category") or ""
-        instruction = instruction_for(slot_id, category)
+        instruction = instruction_for(slot_id, category, project.card)
         if not instruction:
-            skipped.append({"slot_id": slot_id, "reason": "no instruction is written for this slot"})
+            skipped.append({"slot_id": slot_id,
+                            "reason": "no instruction is written for this slot or its category"})
             continue
-        for seed in seeds:
+        source = available[0]
+        for seed_value in seeds:
             tasks.append({
-                "slot_id": slot_id, "category": category, "seed": int(seed),
+                "slot_id": slot_id, "category": category, "seed": int(seed_value),
                 "instruction": instruction,
-                "source_id": available[0]["id"],
-                "source_path": available[0]["path"],
-                "file": f"{slot_id}_s{seed}.png",
+                "source_id": source["id"], "source_path": source["path"],
+                "source_sha256": source["sha256"],
+                # The child's shape is decided at plan time from the verified source (spec R3), and `records_of`
+                # records exactly this - a direct edit of an original is generation 1, depth 1; an edit of a candidate
+                # keeps the parent's generation and goes one deeper.
+                "generation": source["generation"], "edit_depth": source["edit_depth"],
+                "file": f"{slot_id}_s{seed_value}.png",
                 "status": "pending", "seconds": None, "error": "",
             })
 
@@ -195,7 +316,7 @@ def plan(project, *, slots=None, seeds=None, source_ids=None, force=False, log=p
     log(f"[ph3_edit] {len(tasks)} picture(s) over {len(short)} short slot(s); "
         f"{len(available)} picture(s) available to edit")
     for row in short:
-        log(f"  short: {row['slot']} (needs {row.get('short')}, {row.get('waiting', 0)} waiting on review)")
+        log(f"  short: {row['slot']} (needs {row.get('short')}, nothing waiting on review)")
     for row in skipped:
         log(f"  skipped: {row['slot_id']} - {row['reason']}")
     if not tasks:
@@ -250,11 +371,28 @@ def run(project, manifest, *, client, log=print, cancel=None):
     return manifest
 
 
+def _child_shape(project, task):
+    """(generation, edit_depth) the edit is recorded at, from the plan when it carries them.
+
+    The plan decides the child's shape from the verified source (a direct edit of a user original is generation 1,
+    depth 1; an edit of a candidate keeps the parent's generation and goes one deeper - spec R3). A manifest written
+    before the plan carried these fields is derived honestly instead: the parent's own record, or the product shape for
+    an original when the parent is a source.
+    """
+    if task.get("generation") is not None and task.get("edit_depth") is not None:
+        return int(task["generation"]), int(task["edit_depth"])
+    parent = project.candidate_by_id(task.get("source_id") or "")
+    if parent is not None:
+        return int(parent.get("train_generation") or 0), int(parent.get("edit_depth") or 0) + 1
+    return 1, 1
+
+
 def records_of(project, manifest):
     """Lineage records for the finished edits, ready for `Project.import_candidates`.
 
-    `edit_depth=1` and the source as parent is the whole point: an edit of an accepted picture is one step further from
-    the original, and the seed caps (`max_edit_depth`) are what stop that chain running away.
+    The source as parent is the whole point: an edit of an accepted picture is traceable to the picture it restaged,
+    and the depth the plan computed is what the seed caps (`max_edit_depth`) read when such a picture asks to enter a
+    training set.
     """
     folder = manifest_path(project).parent
     names = documented_models(manifest)
@@ -263,9 +401,10 @@ def records_of(project, manifest):
         out = folder / task["file"]
         if not out.is_file():
             continue
+        generation, depth = _child_shape(project, task)
         slot = {"slot_id": task["slot_id"], "category": task["category"], "prompt": task["instruction"]}
         records.append(lineage.record(
-            out, generator=GENERATOR, parent_ids=[task["source_id"]], train_generation=0, edit_depth=1,
+            out, generator=GENERATOR, parent_ids=[task["source_id"]], train_generation=generation, edit_depth=depth,
             slot=slot, models=names, prompt=task["instruction"], seed=task["seed"],
             steps=int(manifest.get("steps") or STEPS), cfg=0.0,
             graph_version="ph3-edit-v1", method=METHOD,
@@ -312,6 +451,8 @@ def main(argv=None):
     parser.add_argument("--seed", action="append", type=int, help="seed to draw (repeatable)")
     parser.add_argument("--source", action="append", help="only edit this picture id (repeatable)")
     parser.add_argument("--import-only", action="store_true", help="import the pictures already on disk")
+    parser.add_argument("--plan-only", action="store_true",
+                        help="write the plan and stop: no ComfyUI connection, no drawing, no import")
     parser.add_argument("--cancel-file")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
@@ -324,6 +465,12 @@ def main(argv=None):
                 print(json.dumps({"imported": len(records)}, ensure_ascii=False))
             return 0
         manifest = plan(project, slots=args.slot, seeds=args.seed, source_ids=args.source)
+        if args.plan_only:
+            # The plan is the whole deliverable: no GPU is contacted and nothing is imported (spec R3).
+            if args.json:
+                print(json.dumps({"planned": len(manifest["tasks"]), "gaps": len(manifest["gaps"])},
+                                 ensure_ascii=False))
+            return 0
         if not manifest["tasks"]:
             if args.json:
                 print(json.dumps({"planned": 0, "gaps": len(manifest["gaps"])}, ensure_ascii=False))

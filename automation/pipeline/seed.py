@@ -190,6 +190,11 @@ def _snapshot_manifests(project):
     return out
 
 
+# The same reader under a public name: `ph3_edit` verifies an edit parent's LoRA against these manifests too, and the
+# two must never disagree about what snapshots a project holds.
+snapshot_manifests = _snapshot_manifests
+
+
 def _reason(code, detail=""):
     category, why, fix = EXCLUSIONS[code]
     return {"code": code, "category": category, "reason": why + (f" ({detail})" if detail else ""), "fix": fix}
