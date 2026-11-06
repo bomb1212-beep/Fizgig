@@ -207,9 +207,7 @@ class RunTests(unittest.TestCase):
                 self.names = {}
 
             def name_for(self, kind, path):
-                name = kind + "/" + Path(path).name
-                self.names[path] = name
-                return name
+                return Path(path).name
 
             def run(self, graph, out, slot_id=None, method=None, seed=None):
                 if fail_on and fail_on in str(slot_id):
@@ -239,7 +237,7 @@ class RunTests(unittest.TestCase):
             epoch = int(row["method"].rsplit("e", 1)[-1])
             loras = [node["inputs"]["lora_name"] for node in row["graph"].values()
                      if node["class_type"] == "LoraLoaderModelOnly"]
-            self.assertIn(f"lora/char-{epoch:06d}.safetensors", loras,
+            self.assertIn(f"char-{epoch:06d}.safetensors", loras,
                           f"{row['method']} used {loras}")
 
     def test_a_second_run_draws_nothing(self):
