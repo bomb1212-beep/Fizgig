@@ -239,6 +239,28 @@ class ImportTests(SnapshotTests):
 class OverrideTests(SnapshotTests):
     """A per-run setting lives in the snapshot, never in tool2's own config file."""
 
+    def test_every_category_starts_with_one_input_picture(self):
+        """Two or three input pictures drew the character twice, in every category this project tried."""
+        snap = self.snapshot()
+        pinned = json.loads(Path(snap["config"]).read_text(encoding="utf-8"))
+        for section in gen.EXTRA_REFERENCE_SECTIONS:
+            if section in pinned:
+                self.assertFalse(pinned[section].get("use_extra_refs", False),
+                                 f"{section} must not hand the model extra reference pictures by default")
+
+    def test_a_section_can_still_ask_for_them_by_name(self):
+        snap = gen.build_snapshot(self.project, self.card, paths=self.paths, log=lambda *_: None,
+                                  sections={"expressions": {"use_extra_refs": True}})
+        pinned = json.loads(Path(snap["config"]).read_text(encoding="utf-8"))
+        self.assertTrue(pinned["expressions"]["use_extra_refs"])
+
+    def test_a_section_setting_that_is_not_about_references_keeps_the_default(self):
+        snap = gen.build_snapshot(self.project, self.card, paths=self.paths, log=lambda *_: None,
+                                  sections={"expressions": {"one_image": True}})
+        pinned = json.loads(Path(snap["config"]).read_text(encoding="utf-8"))
+        self.assertTrue(pinned["expressions"]["one_image"])
+        self.assertFalse(pinned["expressions"]["use_extra_refs"])
+
     def test_a_section_setting_is_parsed_from_a_command_line_value(self):
         parsed = gen.parse_overrides(["expressions.use_extra_refs=false", "backgrounds.one_image=true",
                                       "poses.steps=30", "angles.cfg=1.5", "framing.resolution=1536"])
@@ -283,7 +305,7 @@ class OverrideTests(SnapshotTests):
                                   sections={"expressions": {"one_image": True}})
         pinned = json.loads(Path(snap["config"]).read_text(encoding="utf-8"))
         self.assertTrue(pinned["expressions"]["one_image"])
-        self.assertEqual({row["key"] for row in snap["section_overrides"]}, {"one_image"})
+        self.assertEqual({row["key"] for row in snap["section_overrides"]}, {"one_image", "use_extra_refs"})
         self.assertEqual(self.config.read_text(encoding="utf-8"), before, "the tool's own config must not change")
 
     def test_an_unknown_section_is_refused(self):

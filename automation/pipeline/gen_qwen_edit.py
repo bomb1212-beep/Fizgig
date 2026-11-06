@@ -160,6 +160,23 @@ def snapshot_id(tool2_cfg, char_folder, sources, graph_version, entry=None):
 
 
 SECTION_OVERRIDES = ("one_image", "use_extra_refs", "steps", "cfg", "resolution")
+# Every category that can be handed extra reference images. The pipeline turns them all off unless a run asks for one
+# by name: on this model and graph, a job with two or three input pictures laid the references out on one canvas and
+# drew the character twice (twelve pictures in one batch, a three-picture probe, three angle shots, a profile framing
+# and six poses - every one of them, whatever the category, the LoRA or the "output one single image" instruction).
+# A face that has to come from an original comes from the anchor instead: `refine_anchor` redraws it with an original
+# close-up as its face reference, and the jobs then see one picture.
+EXTRA_REFERENCE_SECTIONS = ("angles", "framing", "expressions", "backgrounds", "poses")
+
+
+def single_image_overrides(tool2_cfg, sections=None):
+    """(overrides, applied) that leave every category with one input picture, unless the caller said otherwise."""
+    overrides = {section: {"use_extra_refs": False} for section in EXTRA_REFERENCE_SECTIONS if section in tool2_cfg}
+    for section, settings in (sections or {}).items():
+        if section in overrides and "use_extra_refs" in (settings or {}):
+            del overrides[section]["use_extra_refs"]
+    return overrides
+
 
 
 def apply_section_overrides(tool2_cfg, overrides):
@@ -246,7 +263,11 @@ def build_snapshot(project_dir, card, *, exclude=(), holdout=None, sections=None
     tool2_cfg = read_json(config_path)
     if not tool2_cfg:
         raise ValueError(f"tool2's config could not be read: {config_path}")
-    tool2_cfg, applied_overrides = apply_section_overrides(tool2_cfg, sections)
+    merged_overrides = {}
+    for section in set(single_image_overrides(tool2_cfg, sections)) | set(sections or {}):
+        merged_overrides[section] = {**single_image_overrides(tool2_cfg, sections).get(section, {}),
+                                     **((sections or {}).get(section) or {})}
+    tool2_cfg, applied_overrides = apply_section_overrides(tool2_cfg, merged_overrides)
     for row in applied_overrides:
         log(f"[gen_qwen_edit] {row['section']}.{row['key']} = {row['value']} (this run only)")
     entry = character_in(tool2_cfg, folder)
