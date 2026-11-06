@@ -49,10 +49,17 @@ def image_url(row, prefix="/image"):
     return f"{prefix}/{row['id']}{row.get('suffix') or '.png'}"
 
 
-def candidate_rows(project, *, decision=None, generator=None, slot=None, images_prefix="/image"):
-    """The candidates as page rows, newest first, each with its decision and whether it can still be corrected."""
+def candidate_rows(project, *, decision=None, generator=None, slot=None, images_prefix="/image", scores=None):
+    """The candidates as page rows, newest first, each with its decision and whether it can still be corrected.
+
+    `scores` is `{id: row}` from `score.table`. It is passed in rather than read here so the page still renders on a
+    project that has never been scored, and so a scoring pass that failed cannot stop a reviewer from working. Every
+    score field is `None` when there is no score, never 0: a picture ArcFace found no face in has no identity score,
+    and showing it as 0.0 would read as "the worst picture in the set".
+    """
     review = project.review()
     index = project.index()
+    scores = scores or {}
     rows = []
     for record in reversed(project.candidates()):
         state = review.get(record["id"]) or {}
@@ -75,6 +82,7 @@ def candidate_rows(project, *, decision=None, generator=None, slot=None, images_
                                            f"{(before_path.suffix.lower() if before_path else '.png')}",
                       "exists": bool(before_path and before_path.is_file()),
                       "decision": (review.get(fix_of) or {}).get("decision")}
+        scored = scores.get(record["id"]) or {}
         rows.append({
             "id": record["id"],
             "file": record.get("file"),
@@ -95,6 +103,11 @@ def candidate_rows(project, *, decision=None, generator=None, slot=None, images_
             "fixable": fixable(state),
             "fix_of": fix_of,
             "before": before,
+            "clip_max": scored.get("clip_max_cosine"),
+            "clip_mean": scored.get("clip_mean_cosine"),
+            "arcface_max": scored.get("arcface_max_cosine"),
+            "arcface_note": scored.get("arcface_no_face") or "",
+            "white_ratio": scored.get("white_ratio"),
         })
     return rows
 
@@ -130,6 +143,24 @@ def _cell(row, images_prefix):
     meta = (f'<div class="meta">{escape(str(row["generator"]))}'
             f' · gen {row["generation"]} · depth {row["edit_depth"]}'
             f' · {escape(str(row["slot"] or "-"))}</div>')
+    # The scores are shown as measurements, kept apart: CLIP looks at the whole frame and ArcFace at the face, and the
+    # two disagree enough on this data (+0.34 between them) that one blended number would hide which said what.
+    score_bits = []
+    if row.get("clip_max") is not None:
+        score_bits.append(f'CLIP {row["clip_max"]:.3f}')
+    if row.get("arcface_max") is not None:
+        score_bits.append(f'face {row["arcface_max"]:.3f}')
+    elif row.get("arcface_note"):
+        score_bits.append(f'face — ({escape(row["arcface_note"])})')
+    if row.get("white_ratio") is not None:
+        score_bits.append(f'흰배경 {row["white_ratio"]:.2f}')
+    scores_line = (f'<div class="scores">{" · ".join(score_bits)}</div>' if score_bits else "")
+    # Sortable values, kept as data so the page can order without re-rendering.
+    sort_data = (f'data-clip="{"" if row.get("clip_max") is None else row["clip_max"]}" '
+                 f'data-face="{"" if row.get("arcface_max") is None else row["arcface_max"]}" '
+                 f'data-white="{"" if row.get("white_ratio") is None else row["white_ratio"]}" '
+                 f'data-slot="{escape(str(row["slot"] or ""))}" '
+                 f'data-decision-key="{escape(str(row["decision"] or ""))}"')
     flags = "".join(f'<div class="flag">{escape(text)}</div>' for text in (
         ("다른 캐릭터" if row["reason"] == FIX_BLOCKED else ""),
         ("" if row["fixable"] else "보정 불가"),
@@ -145,21 +176,30 @@ def _cell(row, images_prefix):
                 f'<div class="id">원본 {escape(before["id"])}</div></div>'
                 f'<div class="arrow">→</div></div>')
     return (f'<div class="card" data-id="{row["id"]}" data-decision="{row["decision"] or ""}" '
-            f'data-reason="{escape(row["reason"] or "")}" '
+            f'data-reason="{escape(row["reason"] or "")}" {sort_data} '
             f'data-keys="{KEYS["accept"]}{KEYS["reject"]}{KEYS["fix"]}D">'
-            f'{pair}{body}{meta}<div class="id">{escape(row["id"])}</div>'
+            f'{pair}{body}{meta}{scores_line}<div class="id">{escape(row["id"])}</div>'
             f'<div class="caption">{escape((row["caption"] or "")[:120])}</div>'
             f'{flags}<div class="buttons">{buttons}</div></div>')
 
 
-def write_page(project, destination, *, images_prefix="/image", quota_plan=None, log=print):
+def write_page(project, destination, *, images_prefix="/image", quota_plan=None, log=print, scores=None):
     """Render the review page. Decisions are posted back, so it is meant to be served, not opened from disk."""
-    rows = candidate_rows(project, images_prefix=images_prefix)
+    if scores is None:
+        # Reading the stored scores here keeps the page useful without every caller having to pass them, while the
+        # `scores` parameter still lets a caller show a pass that has not been written yet.
+        try:
+            from . import score as score_mod
+            scores = score_mod.table(project)
+        except Exception:  # noqa: BLE001 - a missing or broken score file must not hide the review page
+            scores = {}
+    rows = candidate_rows(project, images_prefix=images_prefix, scores=scores)
     quotas = project.quotas(quota_plan or _plan_from_card(project.card))
     short = {slot: info for slot, info in quotas.items() if info["short"]}
     counts = {name: sum(1 for r in rows if r["decision"] == name) for name in pj.DECISIONS}
     blocked = sum(1 for r in rows if r["reason"] == FIX_BLOCKED)
     synthetic_share, source_counts = project.source_share()
+    scored = sum(1 for row in rows if row["clip_max"] is not None or row["arcface_max"] is not None)
     quota_rows = "".join(
         f'<tr class="{"short" if info["short"] else ""}"><td>{html.escape(slot)}</td><td>{info["accepted"]}</td>'
         f'<td>{info["target"]}</td><td>{info["short"] or ""}</td></tr>'
@@ -169,11 +209,15 @@ def write_page(project, destination, *, images_prefix="/image", quota_plan=None,
         summary=html.escape(
             f"후보 {len(rows)} · 미검수 {len(project.undecided())} · 채택 {counts['accept']} · "
             f"기각 {counts['reject']} · 보정 {counts['fix']} · 슬롯 부족 {len(short)}"
+            + (f" · 점수 {scored}" if scored else " · 점수 없음")
             + (f" · 다른 캐릭터 {blocked}" if blocked else "")),
         sources=html.escape(f"원본 {source_counts['user']}장 · 합성 {source_counts['synthetic']}장 "
                             f"({synthetic_share:.0%})"),
         cards="".join(_cell(row, images_prefix) for row in rows),
         quotas=quota_rows or '<tr><td colspan="4">계획된 슬롯이 없습니다</td></tr>',
+        slot_options="".join(
+            f'<option value="{html.escape(slot)}">{html.escape(slot)}</option>'
+            for slot in sorted({str(row["slot"]) for row in rows if row["slot"]})),
         keys=json.dumps(KEYS),
         reason_keys=json.dumps({key: reason for reason, (_label, key) in REASON_BUTTONS.items()}),
     )
@@ -224,6 +268,15 @@ _TEMPLATE = """<!doctype html>
  .card .pair img {{ width: 74px; height: auto; display: block; border: 1px solid #333; }}
  .card .pair .ph.small {{ width: 74px; height: 60px; font-size: 10px; }}
  .card .pair .arrow {{ color: #789; font-size: 14px; }}
+ .card .scores {{ color: #8a9; font-size: 11px; font-family: monospace; margin-top: 2px; }}
+ #controls {{ display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 8px 0 14px;
+              padding: 6px 10px; background: #191d21; border: 1px solid #2a3138; border-radius: 4px; }}
+ #controls label {{ color: #9ab; font-size: 12px; }}
+ #controls select, #controls input {{ background: #111; color: #cde; border: 1px solid #333b44;
+                                      border-radius: 3px; padding: 3px 6px; font-size: 12px; }}
+ #controls button {{ background: #1d2228; color: #9ab; border: 1px solid #333b44;
+                     border-radius: 3px; padding: 3px 9px; font-size: 12px; cursor: pointer; }}
+ #controls button:hover {{ color: #eafff4; }}
  #state {{ position: sticky; bottom: 0; background: #1b1b1b; border-top: 1px solid #333; padding: 6px 10px; }}
 </style></head><body>
 <h1>{title}</h1>
@@ -231,7 +284,28 @@ _TEMPLATE = """<!doctype html>
 <div class="sources">{sources}</div>
 <table class="quota"><thead><tr><th>슬롯</th><th>채택</th><th>목표</th><th>부족</th></tr></thead>
 <tbody>{quotas}</tbody></table>
-<div class="grid">{cards}</div>
+<div id="controls">
+ <label>정렬 <select id="sort">
+  <option value="">기본(최신순)</option>
+  <option value="clip-desc">CLIP 높은 순</option>
+  <option value="clip-asc">CLIP 낮은 순</option>
+  <option value="face-desc">얼굴 점수 높은 순</option>
+  <option value="face-asc">얼굴 점수 낮은 순</option>
+  <option value="white-asc">흰 배경 적은 순</option>
+ </select></label>
+ <label>슬롯 <select id="slot"><option value="">전체</option>{slot_options}</select></label>
+ <label>상태 <select id="status">
+  <option value="">전체</option>
+  <option value="__none">미검수</option>
+  <option value="accept">채택</option>
+  <option value="reject">기각</option>
+  <option value="fix">보정</option>
+ </select></label>
+ <label>점수 있는 것만 <input type="checkbox" id="scored"></label>
+ <button type="button" id="reset">초기화</button>
+ <span id="shown" style="color:#789;font-size:12px"></span>
+</div>
+<div class="grid" id="grid">{cards}</div>
 <div id="state">이미지를 클릭하면 확대, A=채택 · R=기각 · F=보정 · D=다른 캐릭터.
 결정은 review.json에 바로 기록됩니다.</div>
 <script>
@@ -283,6 +357,59 @@ document.addEventListener('keydown', e => {{
   list[cursor].scrollIntoView({{block: 'center'}});
 }});
 cards()[0]?.setAttribute('tabindex', '0');
+
+// Sorting and filtering works on the DOM the server already rendered, so the review keeps working with no round trip
+// and no second source of truth for what a card contains.
+const allCards = Array.from(document.querySelectorAll('#grid .card'));
+const originalOrder = allCards.slice();
+function num(card, key) {{
+  const raw = card.dataset[key];
+  return raw === undefined || raw === '' ? null : Number(raw);
+}}
+function applyView() {{
+  const sort = document.getElementById('sort').value;
+  const slot = document.getElementById('slot').value;
+  const status = document.getElementById('status').value;
+  const scoredOnly = document.getElementById('scored').checked;
+
+  let visible = allCards.filter(card => {{
+    if (slot && card.dataset.slot !== slot) return false;
+    if (status === '__none') {{ if (card.dataset.decision) return false; }}
+    else if (status && card.dataset.decision !== status) return false;
+    if (scoredOnly && num(card, 'clip') === null && num(card, 'face') === null) return false;
+    return true;
+  }});
+
+  if (sort) {{
+    const [field, direction] = sort.split('-');
+    const key = field === 'white' ? 'white' : field;
+    visible.sort((a, b) => {{
+      const av = num(a, key), bv = num(b, key);
+      // A picture with no score is not a zero: it stays at the end in both directions rather than sorting as the worst.
+      if (av === null && bv === null) return 0;
+      if (av === null) return 1;
+      if (bv === null) return -1;
+      return direction === 'desc' ? bv - av : av - bv;
+    }});
+  }} else {{
+    visible = visible.slice().sort((a, b) => originalOrder.indexOf(a) - originalOrder.indexOf(b));
+  }}
+
+  const grid = document.getElementById('grid');
+  allCards.forEach(card => {{ card.style.display = 'none'; }});
+  visible.forEach(card => {{ card.style.display = ''; grid.appendChild(card); }});
+  document.getElementById('shown').textContent = visible.length + ' / ' + allCards.length + '장 표시';
+}}
+['sort', 'slot', 'status', 'scored'].forEach(id =>
+  document.getElementById(id).addEventListener('change', applyView));
+document.getElementById('reset').addEventListener('click', () => {{
+  document.getElementById('sort').value = '';
+  document.getElementById('slot').value = '';
+  document.getElementById('status').value = '';
+  document.getElementById('scored').checked = false;
+  applyView();
+}});
+applyView();
 </script></body></html>
 """
 

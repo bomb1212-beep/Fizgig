@@ -1,0 +1,153 @@
+{
+ "paired": 68,
+ "unpaired": [
+  {
+   "key": "ang_front_close__krea2_c_e028__s1003",
+   "reason": "not scored by hand"
+  },
+  {
+   "key": "ang_front_medium__qwen_edit__s1003",
+   "reason": "not scored by hand"
+  },
+  {
+   "key": "ang_front_medium__krea2_c_e028__s1003",
+   "reason": "not scored by hand"
+  },
+  {
+   "key": "ang_front_wide__krea2_c_e028__s1003",
+   "reason": "not scored by hand"
+  },
+  {
+   "key": "ang_quarter_medium__krea2_c_e028__s1003",
+   "reason": "not scored by hand"
+  },
+  {
+   "key": "ang_quarter_close__krea2_c_e028__s1003",
+   "reason": "not scored by hand"
+  },
+  {
+   "key": "ang_side_medium__krea2_c_e028__s1003",
+   "reason": "not scored by hand"
+  },
+  {
+   "key": "ang_back_medium__krea2_c_e028__s1003",
+   "reason": "not scored by hand"
+  },
+  {
+   "key": "ang_back_wide__krea2_c_e028__s1003",
+   "reason": "not scored by hand"
+  },
+  {
+   "key": "frm_upper_body__krea2_c_e028__s1003",
+   "reason": "not scored by hand"
+  },
+  {
+   "key": "frm_face__krea2_c_e028__s1003",
+   "reason": "not scored by hand"
+  },
+  {
+   "key": "frm_dutch__krea2_c_e028__s1003",
+   "reason": "not scored by hand"
+  },
+  {
+   "key": "frm_from_above__krea2_c_e028__s1003",
+   "reason": "not scored by hand"
+  },
+  {
+   "key": "exp_smile__krea2_c_e028__s1003",
+   "reason": "not scored by hand"
+  },
+  {
+   "key": "exp_angry__krea2_c_e028__s1003",
+   "reason": "not scored by hand"
+  },
+  {
+   "key": "exp_sad__krea2_c_e028__s1003",
+   "reason": "not scored by hand"
+  },
+  {
+   "key": "exp_surprised__krea2_c_e028__s1003",
+   "reason": "not scored by hand"
+  },
+  {
+   "key": "bg_classroom__krea2_c_e028__s1003",
+   "reason": "not scored by hand"
+  },
+  {
+   "key": "bg_street_night__krea2_c_e028__s1003",
+   "reason": "not scored by hand"
+  },
+  {
+   "key": "bg_park__krea2_c_e028__s1003",
+   "reason": "not scored by hand"
+  },
+  {
+   "key": "bg_bedroom__krea2_c_e028__s1003",
+   "reason": "not scored by hand"
+  },
+  {
+   "key": "pos_sitting__krea2_c_e028__s1003",
+   "reason": "not scored by hand"
+  },
+  {
+   "key": "pos_walking__krea2_c_e028__s1003",
+   "reason": "not scored by hand"
+  },
+  {
+   "key": "pos_waving__krea2_c_e028__s1003",
+   "reason": "not scored by hand"
+  },
+  {
+   "key": "pos_phone__krea2_c_e028__s1003",
+   "reason": "not scored by hand"
+  }
+ ],
+ "unpaired_count": 25,
+ "score_field": "max_cosine",
+ "overall": {
+  "pairs": 68,
+  "top_quartile_agreement": 0.19,
+  "high_human_low_auto": [
+   "ang_back_wide__krea2_a_e028__s1003",
+   "ang_back_wide__krea2_b_e028__s1003",
+   "bg_street_night__krea2_a_e028__s1003",
+   "pos_walking__krea2_b_e028__s1003"
+  ],
+  "rejected_but_scored_high": [],
+  "spearman": 0.1735
+ },
+ "easy_views": {
+  "pairs": 54,
+  "top_quartile_agreement": 0.235,
+  "high_human_low_auto": [
+   "ang_front_wide__krea2_b_e028__s1003",
+   "bg_park__krea2_b_e028__s1003",
+   "bg_street_night__krea2_a_e028__s1003",
+   "pos_walking__krea2_b_e028__s1003"
+  ],
+  "rejected_but_scored_high": [],
+  "spearman": 0.1312
+ },
+ "hard_views": {
+  "pairs": 14,
+  "top_quartile_agreement": 0.25,
+  "high_human_low_auto": [
+   "ang_back_wide__krea2_a_e028__s1003",
+   "ang_back_wide__krea2_b_e028__s1003"
+  ],
+  "rejected_but_scored_high": [],
+  "spearman": 0.1991
+ },
+ "human_quartiles": {
+  "q1": 3.8375000000000004,
+  "median": 4.55,
+  "q3": 5.0,
+  "n": 68
+ },
+ "auto_quartiles": {
+  "q1": 0.8091197907924652,
+  "median": 0.8791559934616089,
+  "q3": 0.9052797555923462,
+  "n": 68
+ }
+}
