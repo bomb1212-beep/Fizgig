@@ -153,7 +153,52 @@ def snapshot_id(tool2_cfg, char_folder, sources, graph_version):
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:12]
 
 
-def build_snapshot(project_dir, card, *, exclude=(), holdout=None, tool2_config=None, paths=None, log=print):
+SECTION_OVERRIDES = ("one_image", "use_extra_refs", "steps", "cfg", "resolution")
+
+
+def apply_section_overrides(tool2_cfg, overrides):
+    """(config, record) with per-section settings merged into the run's own copy of tool2's config.
+
+    A per-run setting belongs to the snapshot: editing `dataset_jobs.json` would change the tool for every character
+    and every later run, and the spec keeps that file behind the user. The merged keys are listed in the snapshot, so a
+    run still says exactly what it was asked to do.
+    """
+    merged = json.loads(json.dumps(tool2_cfg))          # a deep copy: nested sections are edited, not replaced
+    applied = []
+    for section, settings in (overrides or {}).items():
+        if section not in merged or not isinstance(merged[section], dict):
+            raise ValueError(f"tool2's config has no section {section!r} to override")
+        for key, value in (settings or {}).items():
+            merged[section][key] = value
+            applied.append({"section": section, "key": key, "value": value})
+    return merged, applied
+
+
+def parse_overrides(values):
+    """`--set expressions.use_extra_refs=false` -> {"expressions": {"use_extra_refs": False}}."""
+    out = {}
+    for item in values or []:
+        if "=" not in item or "." not in item.split("=", 1)[0]:
+            raise ValueError(f"--set wants section.key=value, not {item!r}")
+        path, raw = item.split("=", 1)
+        section, key = path.rsplit(".", 1)
+        text = raw.strip()
+        if text.lower() in ("true", "false"):
+            value = text.lower() == "true"
+        else:
+            try:
+                value = int(text)
+            except ValueError:
+                try:
+                    value = float(text)
+                except ValueError:
+                    value = raw
+        out.setdefault(section, {})[key] = value
+    return out
+
+
+def build_snapshot(project_dir, card, *, exclude=(), holdout=None, sections=None, tool2_config=None, paths=None,
+                   log=print):
     """Write this run's settings and input folder, and return where everything is.
 
     The holdout is kept out of the run twice over: by the file names the card froze, and by content hash, so a holdout
@@ -174,6 +219,9 @@ def build_snapshot(project_dir, card, *, exclude=(), holdout=None, tool2_config=
     tool2_cfg = read_json(config_path)
     if not tool2_cfg:
         raise ValueError(f"tool2's config could not be read: {config_path}")
+    tool2_cfg, applied_overrides = apply_section_overrides(tool2_cfg, sections)
+    for row in applied_overrides:
+        log(f"[gen_qwen_edit] {row['section']}.{row['key']} = {row['value']} (this run only)")
     entry = character_in(tool2_cfg, folder)
     paths = paths or tool_paths()
     batch = Path(paths.get("batch") or "").resolve()
@@ -242,6 +290,7 @@ def build_snapshot(project_dir, card, *, exclude=(), holdout=None, tool2_config=
         "tool2_config": str(config_path), "excluded": sorted({row["name"] for row in dropped}),
         "excluded_detail": dropped, "missing_references": missing_references,
         "dropped_references": dropped_references, "holdout": holdout,
+        "section_overrides": applied_overrides,
         "sources": sources, "source_hashes": {r["src_path"]: r["sha256"] for r in sources},
     }
     (base / "snapshot.json").write_text(json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -404,7 +453,7 @@ def model_hashes(snapshot):
     return out
 
 
-def find_snapshot(project_dir, card=None, *, snapshot_id=None, exclude=(), paths=None, log=print):
+def find_snapshot(project_dir, card=None, *, snapshot_id=None, exclude=(), sections=None, paths=None, log=print):
     """The snapshot an existing result belongs to: its own folder, or the one the card produces today.
 
     Importing a run that finished after the process died needs the settings and input list of *that* run. The id is a
@@ -432,7 +481,7 @@ def find_snapshot(project_dir, card=None, *, snapshot_id=None, exclude=(), paths
         return newest
     if not card:
         raise ValueError(f"no snapshot under {folder} and no card to rebuild one from")
-    rebuilt = build_snapshot(project_dir, card, exclude=exclude, paths=paths, log=log)
+    rebuilt = build_snapshot(project_dir, card, exclude=exclude, sections=sections, paths=paths, log=log)
     log(f"[gen_qwen_edit] import-only: rebuilt snapshot {rebuilt['id']} from the card (no GPU work was submitted)")
     return rebuilt
 
@@ -623,6 +672,9 @@ def main(argv=None):
                         help="give candidates the slot ids an experiment manifest recorded for their bytes")
     parser.add_argument("--assign-slots", action="store_true",
                         help="give candidates the project slot id their own prompt asks for (no GPU work)")
+    parser.add_argument("--set", dest="overrides", action="append", metavar="SECTION.KEY=VALUE",
+                        help="override a setting in the snapshot's own copy of tool2's config for this run only "
+                             "(e.g. --set expressions.use_extra_refs=false)")
     args = parser.parse_args(argv)
 
     project_dir = Path(args.project)
@@ -641,14 +693,17 @@ def main(argv=None):
             raise SystemExit("--restore-slots needs a project folder")
         restore_slots(project, args.restore_slots)
         return 0
+    overrides = parse_overrides(args.overrides)
     if args.import_only:
         # The snapshot a run belongs to is `tool2/<id>/snapshot.json`; the id is a hash of the settings and the input
         # bytes, so it can be recovered without generating anything.
         snapshot = find_snapshot(project_dir, card,
-                                 exclude=(args.exclude or "").split(",") if args.exclude else ())
+                                 exclude=(args.exclude or "").split(",") if args.exclude else (),
+                                 sections=overrides)
         import_candidates(project_dir, card, snapshot, read_json(args.import_only))
         return 0
-    snapshot = build_snapshot(project_dir, card, exclude=(args.exclude or "").split(",") if args.exclude else ())
+    snapshot = build_snapshot(project_dir, card, exclude=(args.exclude or "").split(",") if args.exclude else (),
+                              sections=overrides)
     result = run(snapshot, only=(args.only or "").split(",") if args.only else None, limit=args.limit,
                  cancel_file=args.cancel_file, dry_run=args.dry_run)
     if result is None:

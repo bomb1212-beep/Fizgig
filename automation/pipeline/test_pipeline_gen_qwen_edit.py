@@ -74,6 +74,7 @@ class SnapshotTests(unittest.TestCase):
         self.config.write_text(json.dumps({
             "comfy_url": "http://127.0.0.1:8190", "resolution": 1024, "base_seed": 1000, "seeds_per_job": 1,
             "models": {"unet": "u", "clip": "c", "vae": "v"},
+            "expressions": {"steps": 25, "cfg": 1.0, "items": [{"text": "a smile", "tags": "smiling"}]},
             "characters": [{"folder": "tester", "trigger": "trg", "edit_bases": 1}],
         }, ensure_ascii=False), encoding="utf-8")
         self.card = {"id": "tester", "tool2": {"config": str(self.config), "character": "tester",
@@ -233,6 +234,45 @@ class ImportTests(SnapshotTests):
         gen.import_candidates(self.project, self.card, snap, self._result(snap), log=lambda *_: None)
         records = lineage.read_jsonl(self.project / "candidates.jsonl")
         self.assertEqual(len(records), 1)
+
+
+class OverrideTests(SnapshotTests):
+    """A per-run setting lives in the snapshot, never in tool2's own config file."""
+
+    def test_a_section_setting_is_parsed_from_a_command_line_value(self):
+        parsed = gen.parse_overrides(["expressions.use_extra_refs=false", "backgrounds.one_image=true",
+                                      "poses.steps=30", "angles.cfg=1.5", "framing.resolution=1536"])
+        self.assertEqual(parsed["expressions"]["use_extra_refs"], False)
+        self.assertEqual(parsed["backgrounds"]["one_image"], True)
+        self.assertEqual(parsed["poses"]["steps"], 30)
+        self.assertEqual(parsed["angles"]["cfg"], 1.5)
+        self.assertEqual(parsed["framing"]["resolution"], 1536)
+
+    def test_a_malformed_override_is_refused(self):
+        for bad in ("expressions", "nokey=1", "=1"):
+            with self.assertRaises(ValueError):
+                gen.parse_overrides([bad])
+
+    def test_the_override_lands_in_the_snapshots_own_config_only(self):
+        before = self.config.read_text(encoding="utf-8")
+        snap = gen.build_snapshot(self.project, self.card, paths=self.paths, log=lambda *_: None,
+                                  sections={"expressions": {"one_image": True}})
+        pinned = json.loads(Path(snap["config"]).read_text(encoding="utf-8"))
+        self.assertTrue(pinned["expressions"]["one_image"])
+        self.assertEqual({row["key"] for row in snap["section_overrides"]}, {"one_image"})
+        self.assertEqual(self.config.read_text(encoding="utf-8"), before, "the tool's own config must not change")
+
+    def test_an_unknown_section_is_refused(self):
+        with self.assertRaises(ValueError):
+            gen.build_snapshot(self.project, self.card, paths=self.paths, log=lambda *_: None,
+                               sections={"no_such_section": {"one_image": True}})
+
+    def test_a_different_setting_is_a_different_snapshot(self):
+        plain = self.snapshot()
+        with_flag = gen.build_snapshot(self.project, self.card, paths=self.paths, log=lambda *_: None,
+                                       sections={"expressions": {"one_image": True}})
+        self.assertNotEqual(plain["id"], with_flag["id"],
+                            "the settings decide the pictures, so they have to decide the snapshot")
 
 
 class HoldoutTests(SnapshotTests):
