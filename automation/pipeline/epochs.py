@@ -361,6 +361,15 @@ def choose(project, *, run_folder, epoch, by="user", note="", log=print):
     generator later produces traceable back to a seed set.
     """
     manifest = read_manifest(manifest_path_of(project, run_folder))
+    # A plan written before _snapshot_of knew where a seed run keeps its snapshot carries null there. Null means the
+    # information was absent, not that someone decided it should stay unknown, so it is re-read rather than copied into
+    # the card forever. Re-planning would fix it too, but planning rebuilds the manifest and would discard which cells
+    # of the grid have already been drawn.
+    if not manifest.get("training_snapshot"):
+        found = _snapshot_of(project, manifest["run"]["folder"])
+        if found:
+            manifest["training_snapshot"] = found
+            write_manifest(manifest_path_of(project, run_folder), manifest)
     rows = {int(row["epoch"]): row for row in manifest["checkpoints"]}
     if int(epoch) not in rows:
         raise EpochError(f"epoch {epoch} is not in this grid; the grid has "

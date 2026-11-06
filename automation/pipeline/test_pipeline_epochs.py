@@ -9,6 +9,7 @@ Three things decide that, and each has its own group below:
 * re-running the grid adds no GPU work, and choosing an epoch refuses a checkpoint whose bytes changed under it.
 """
 import json
+import shutil
 import struct
 import tempfile
 import unittest
@@ -322,6 +323,40 @@ class ChooseTests(unittest.TestCase):
         self.assertIn("training_snapshot", entry)
         self.assertEqual(self.project.card["krea2_inference"]["epoch"], 4)
         self.assertEqual(self.project.card["epoch_note"]["run_id"], "char-abc123")
+
+    def test_choosing_repairs_a_plan_that_never_recorded_the_snapshot(self):
+        # A grid planned before the seed-run layout was understood has null there. The choice must not inherit the
+        # hole, and the repair must not cost the drawn cells.
+        seed_base = self.project.dir / "seed_lora" / "abc123def456"
+        (seed_base / "runs").mkdir(parents=True)
+        (seed_base / "snapshot.json").write_text("{}", encoding="utf-8")
+        inner = seed_base / "runs" / self.run.name
+        shutil.move(str(self.run), str(inner))
+
+        manifest_path = epochs.manifest_path_of(self.project, inner)
+        data = epochs.read_manifest(manifest_path)
+        data["run"]["folder"] = str(inner)
+        data["training_snapshot"] = None
+        data["checkpoints"] = [{**row, "file": str(inner / "output" / Path(row["file"]).name)}
+                               for row in data["checkpoints"]]
+        for task in data["tasks"]:
+            task["status"] = "done"
+        epochs.write_manifest(manifest_path, data)
+
+        entry = epochs.choose(self.project, run_folder=inner, epoch=4, log=lambda *_: None)
+        self.assertEqual(entry["training_snapshot"], "abc123def456")
+        after = epochs.read_manifest(manifest_path)
+        self.assertEqual(after["training_snapshot"]["id"], "abc123def456")
+        self.assertEqual(sum(1 for t in after["tasks"] if t["status"] == "done"), len(after["tasks"]))
+
+    def test_choosing_leaves_a_recorded_snapshot_alone(self):
+        # A snapshot somebody did record is a decision; the repair must not overwrite it with a folder guess.
+        manifest_path = epochs.manifest_path_of(self.project, self.run)
+        data = epochs.read_manifest(manifest_path)
+        data["training_snapshot"] = {"id": "keptbyhand1", "source": "config.json"}
+        epochs.write_manifest(manifest_path, data)
+        entry = epochs.choose(self.project, run_folder=self.run, epoch=2, log=lambda *_: None)
+        self.assertEqual(entry["training_snapshot"], "keptbyhand1")
 
     def test_choosing_an_epoch_the_grid_did_not_draw_is_refused(self):
         with self.assertRaises(epochs.EpochError) as caught:
