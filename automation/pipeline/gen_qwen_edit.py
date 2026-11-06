@@ -629,28 +629,36 @@ def restore_slots(project, exp_dir, *, apply=True, log=print):
 
 
 def slot_for(record, slots):
-    """The project slot a candidate was asked for, from the prompt and caption it carries, or None.
+    """The project slot a candidate was asked for, or None.
 
     tool2's own job category (`expressions_*`, `backgrounds_*`, ...) is the first word of the stem and its vocabulary is
     exactly the project's slot categories, so it decides which slots are even candidates: a background edit's caption
     mentions "from above" and "upper body" because that is the frame it was asked to keep, and letting those words pick
-    an angle slot would file the picture under a job nobody asked for. Within the category the rule is the M0 harness's
-    (`experiment.match_slot`): the text has to satisfy every alternative group and the strongest match wins.
+    an angle slot would file the picture under a job nobody asked for.
+
+    Inside the category the **prompt** is read first, because the prompt is what the job asked for. The caption comes
+    second and only when the prompt matches nothing: it is written by a model looking at the finished picture, so it
+    describes what came out - it said "three-quarter view" for a front-facing portrait, which filed that portrait under
+    the quarter slot.
     """
-    lowered = " ".join(str(part or "") for part in (record.get("prompt"), record.get("caption"),
-                                                    record.get("stem"))).lower()
-    if not lowered.strip():
-        return None
     category = (record.get("slot") or {}).get("category") or _category_of(record.get("stem", "")) or ""
     pool = [slot for slot in slots if slot["category"] == category] or slots
-    best, best_score = None, 0
-    for slot in pool:
-        if not all(any(alt.lower() in lowered for alt in group) for group in slot["match"]):
+    prompt = str(record.get("prompt") or "").lower()
+    full = " ".join(str(part or "") for part in (record.get("prompt"), record.get("caption"),
+                                                 record.get("stem"))).lower()
+    for text in (prompt, full):
+        if not text.strip():
             continue
-        hits = sum(1 for group in slot["match"] for alt in group if alt.lower() in lowered)
-        if hits > best_score:
-            best, best_score = slot, hits
-    return best
+        best, best_score = None, 0
+        for slot in pool:
+            if not all(any(alt.lower() in text for alt in group) for group in slot["match"]):
+                continue
+            hits = sum(1 for group in slot["match"] for alt in group if alt.lower() in text)
+            if hits > best_score:
+                best, best_score = slot, hits
+        if best is not None:
+            return best
+    return None
 
 
 def assign_slots(project, candidate_ids=None, *, apply=True, log=print):

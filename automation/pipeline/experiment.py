@@ -60,8 +60,19 @@ SLOTS = [
      "match": [["from behind"], ["full body"]]},
     {"id": "frm_upper_body", "category": "framing", "prompt": "upper body, portrait, front view",
      "match": [["upper body"]]},
+    # The chest-up compositions a portrait set needs and the original plan had no slot for: they were being filed under
+    # `frm_upper_body` because every one of them says "upper body", which told the quota board nothing.
+    {"id": "frm_quarter", "category": "framing", "prompt": "waist-up, three-quarter view",
+     "match": [["three-quarter view"], ["upper body", "portrait"]]},
+    {"id": "frm_profile", "category": "framing", "prompt": "chest-up, from side, profile",
+     "match": [["profile"], ["upper body", "portrait"]]},
+    {"id": "frm_back", "category": "framing", "prompt": "chest-up, from behind, looking back",
+     "match": [["from behind"], ["upper body", "portrait"]]},
+    {"id": "frm_full_body", "category": "framing", "prompt": "full body, standing, head to shoes",
+     "match": [["full body"]]},
     {"id": "frm_face", "category": "framing", "prompt": "portrait, close-up, face focus, front view",
-     "match": [["portrait", "close-up"]]},
+     # An extreme close-up is described as a close-up or a face shot; without those words the slot could not see it.
+     "match": [["portrait", "close-up", "face focus", "extreme close-up"]]},
     {"id": "frm_dutch", "category": "framing", "prompt": "dutch angle, upper body",
      "match": [["dutch angle"]]},
     {"id": "frm_from_above", "category": "framing", "prompt": "from above, full body, looking down",
@@ -95,6 +106,10 @@ SLOTS = [
      "match": [["waving"]]},
     {"id": "pos_phone", "category": "poses", "prompt": "holding phone, upper body, looking at phone",
      "match": [["holding phone", "phone"]]},
+    {"id": "pos_crossed", "category": "poses", "prompt": "arms crossed, leaning against a wall, full body",
+     "match": [["crossed arms", "arms crossed"]]},
+    {"id": "pos_running", "category": "poses", "prompt": "running, dynamic full body pose",
+     "match": [["running"]]},
 ]
 
 SCORE_FIELDS = ("identity", "instruction", "quality")

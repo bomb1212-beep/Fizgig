@@ -918,3 +918,63 @@ M3(생성기 B/C: 시드 LoRA 학습 → 에포크 평가 → 슬롯 배치 생�
 
 속도: 1024 close-up 약 30초, 1536 전신 약 2분 → 15장에 약 20~25분.
 
+## 22. 구도 계획 확장 · 새 전신 앵커 · cowboy 컷 (2026-11-06 17:35~17:50)
+
+사용자 지시 "전부다": (a) cowboy/저각도 컷, (b) 전신 앵커 재생성, (c) 슬롯 계획 확장 — 셋 다 진행했다.
+
+### 22.1 (c) 슬롯 계획을 30개로 확장 — 무GPU
+
+원래 24슬롯은 M0 비교용이라 **상반신 3/4·프로필·뒤에서·전신(프레이밍)** 이 없었다. 그래서 이 구도들이 전부
+`frm_upper_body`로 뭉쳤다(5건). 추가한 슬롯:
+
+| 슬롯 | 찾는 말 |
+| --- | --- |
+| `frm_quarter` | three-quarter view + (upper body/portrait) |
+| `frm_profile` | profile + (upper body/portrait) |
+| `frm_back` | from behind + (upper body/portrait) |
+| `frm_full_body` | full body |
+| `pos_crossed` / `pos_running` | crossed arms / running |
+| `frm_face`(어휘 확장) | portrait·close-up·face focus·**extreme close-up** |
+
+카드의 `slot_quotas`도 30개로 늘렸다(각 1장). 재매핑 결과: `frm_quarter` 2 · `frm_profile` 1 · `frm_back` 0 ·
+`frm_full_body` 4 · `frm_face` 1 · `frm_dutch` 1 · 포즈 6종 전부 1건씩. 슬롯 없는 7건은 계획에 없는 표정(비웃음)과
+배경(옥상·카페)이다.
+
+**매칭 규칙도 고쳤다**: 슬롯은 "무엇을 요청했는가"이므로 **프롬프트를 먼저** 읽고, 프롬프트가 아무것도 못 맞히면
+그때만 캡션을 본다. 캡션은 그림을 보고 모델이 쓴 것이라(정면 상반신을 "three-quarter"라고 쓴 사례) 슬롯 근거로
+부적절했다.
+
+### 22.2 (b) 전신 앵커를 새로 만들고 출처를 **증명** — GPU 3장(약 1.5분)
+
+기존 앵커는 출처가 복원되지 않아(§21.1: 재계산 키 `495d78` ≠ 파일명 `e7417d`) 격리 상태였다. 그래서 **비홀드아웃
+입력으로 앵커를 새로 3장 생성**하고, 그 입력을 이번 파이프라인이 직접 지정했으므로 부모를 기록했다.
+
+- 입력: `SeedVR2_upscaled_00020_.png`(전신 원본) + `figure_refs` 4장 — **전부 사용자 원본, 홀드아웃 없음**
+- 생성: `--make-fullbody 3` → `fullbody_d_00020__2a1d58_s1000/1001/1002.png`
+- **출처 증명**: tool2의 키 규칙(`sha1(prompt + 입력 바이트)[:6]`)으로 재계산한 값이 **`2a1d58`** 로 파일명과 일치 ✓
+- 프로젝트에는 **후보 3건**으로 등록(부모 5개 = `s_f41bac75`(SeedVR2) + `s_34f99231` `s_3be991a0` `s_94f00c7f` `s_84a8e1ad`), 세대 1·깊이 0. **사용자가 하나를 골라야** 다음 단계(포즈·와이드 각도)의 `body_bases`가 된다.
+
+### 22.3 (a) cowboy/저각도 컷 — GPU 4장(약 6분)
+
+tool2는 앵커가 있으면 grid medium을 건너뛰므로("앵커에서 뽑은 medium은 결국 full body"), `angles.extra`의 명시
+샷만이 cowboy를 만든다. 스냅샷 `15645261852b`에서 4장:
+
+| 컷 | 슬롯 |
+| --- | --- |
+| front view, low-angle, medium shot | `ang_front_wide`(매칭) |
+| front-left quarter, elevated, medium shot | 슬롯 없음(전신 쿼터) |
+| front view, high-angle, wide shot | `ang_front_wide` |
+| back-right quarter, elevated, wide shot | `ang_back_medium` |
+
+### 22.4 지금 검수 대기 (27장)
+
+- 배경 5 · 프레이밍 6 · 포즈 6 · 각도 7 · **전신 앵커 후보 3** — 전부 참조 1장(앵커 후보는 입력 5장이지만 이는
+  앵커 합성 입력이다).
+- 쿼터 판: 채택 22/23이 슬롯에 잡히고, 새로 추가한 13개 슬롯이 아직 "부족"으로 표시된다(이번 배치가 채택되면 해소).
+
+### 22.5 다음
+
+1. 사용자가 **앵커 후보 하나를 채택**하면, 그 앵커를 `body_bases`로 써서 **포즈·와이드 각도를 다시 뽑는다** → 그때는
+   계보가 검증되어 **시드에도 들어갈 수 있다**.
+2. 그 뒤 M3-2(에포크 평가 그리드) → 시드 학습.
+

@@ -57,10 +57,27 @@ def make_loras(folder, epochs):
 
 
 class SlotTests(unittest.TestCase):
-    def test_the_fixed_set_has_twenty_four_unique_slots(self):
+    def test_the_fixed_set_has_thirty_unique_slots(self):
+        """24 from M0, plus the chest-up compositions and two poses the original plan had no slot for."""
         ids = [s["id"] for s in exp.SLOTS]
-        self.assertEqual(len(ids), 24)
-        self.assertEqual(len(set(ids)), 24)
+        self.assertEqual(len(ids), 30)
+        self.assertEqual(len(set(ids)), 30)
+
+    def test_the_compositions_a_portrait_set_needs_have_their_own_slots(self):
+        by_id = {s["id"]: s for s in exp.SLOTS}
+        for slot_id in ("frm_quarter", "frm_profile", "frm_back", "frm_full_body", "pos_crossed", "pos_running"):
+            self.assertIn(slot_id, by_id)
+        # and they win over the generic upper-body slot, which every one of them would also satisfy
+        quarter = {"id": "c_x", "prompt": "waist-up three-quarter view, upper body",
+                   "caption": "", "stem": "framing_01_abc_s1000", "slot": {"category": "framing"}}
+        from pipeline import gen_qwen_edit as gen
+        self.assertEqual(gen.slot_for(quarter, exp.SLOTS)["id"], "frm_quarter")
+        profile = dict(quarter, prompt="chest-up side profile, upper body")
+        self.assertEqual(gen.slot_for(profile, exp.SLOTS)["id"], "frm_profile")
+        behind = dict(quarter, prompt="chest-up from behind, looking back, upper body")
+        self.assertEqual(gen.slot_for(behind, exp.SLOTS)["id"], "frm_back")
+        face = dict(quarter, prompt="extreme close-up of the face, face focus")
+        self.assertEqual(gen.slot_for(face, exp.SLOTS)["id"], "frm_face")
 
     def test_every_category_tool2_uses_is_covered(self):
         categories = {s["category"] for s in exp.SLOTS}
