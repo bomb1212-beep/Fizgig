@@ -292,6 +292,49 @@ class ProjectTests(Base):
         finally:
             os.chdir(here)
 
+    def test_a_source_row_learns_its_parents_from_the_candidate_with_the_same_bytes(self):
+        """An anchor reviewed as a candidate and copied in as an input must not look like an ancestor of unknown origin."""
+        by_name = self.import_originals(4)
+        made = self.root / "anchor_candidate.png"
+        made.write_bytes(b"ANCHOR-BYTES")
+        record = lineage.record(made, generator="qwen_edit", parent_ids=[by_name["o1.png"], by_name["o2.png"]],
+                                train_generation=1, edit_depth=0, slot={"category": "anchor"})
+        self.project.import_candidates([record], log=lambda *_: None)
+        # a later run copies the same picture into the character folder and it is imported as a source
+        copy = self.chars / "anchor_made.png"
+        copy.write_bytes(made.read_bytes())
+        self.project.import_sources([copy], log=lambda *_: None)
+        report = self.project.sync_source_parents(log=lambda *_: None)
+        self.assertEqual(len(report["changed"]), 1)
+        source = {r["id"]: r for r in self.project.source_records()}[report["changed"][0]["id"]]
+        self.assertEqual(source["parent_ids"], [by_name["o1.png"], by_name["o2.png"]])
+        self.assertEqual(source["parents_from"], record["id"])
+        self.assertNotIn(source["id"], seed.audit(self.project)["quarantined"])
+
+    def test_a_synthetic_source_with_no_candidate_behind_it_is_reported(self):
+        lonely = self.chars / "anchor_lonely.png"
+        lonely.write_bytes(b"NOBODY-KNOWS")
+        self.project.import_sources([lonely], log=lambda *_: None)
+        report = self.project.sync_source_parents(log=lambda *_: None)
+        self.assertEqual(report["changed"], [])
+        self.assertEqual(len(report["unresolved"]), 1)
+        self.assertIn(report["unresolved"][0]["id"], seed.audit(self.project)["quarantined"])
+
+    def test_a_candidate_that_is_a_copy_of_the_source_does_not_make_it_its_own_parent(self):
+        """The copy records the source as its parent; copying that back would turn a picture into its own ancestor."""
+        by_name = self.import_originals(4)
+        source_path = by_name["o1.png"]
+        # the same bytes as the original, recorded as an edit of it
+        copy = self.root / "copy.png"
+        copy.write_bytes((self.chars / "o1.png").read_bytes())
+        record = lineage.record(copy, generator="qwen_edit", parent_ids=[source_path], train_generation=1,
+                                edit_depth=1)
+        self.project.import_candidates([record], log=lambda *_: None)
+        report = self.project.sync_source_parents(log=lambda *_: None)
+        self.assertEqual([row["id"] for row in report["changed"]], [])
+        stored = {r["id"]: r for r in self.project.source_records()}[source_path]
+        self.assertEqual(stored.get("parent_ids"), [])
+
     def test_the_lock_refuses_a_second_owner_and_only_its_owner_releases_it(self):
         with self.project.lock():
             lock_path = self.project.dir / "pipeline.lock"

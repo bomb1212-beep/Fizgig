@@ -625,6 +625,46 @@ class Project:
         return num, skipped
 
     # ------------------------------------------------------------------ migration
+    def sync_source_parents(self, *, apply=True, log=print):
+        """Copy parents from a candidate row onto the source row with the same bytes.
+
+        A generated picture can arrive in the project twice: as the candidate that was reviewed, and as an input file a
+        later run copied into the character folder (which `import_sources` records as a source). The two rows describe
+        one picture, but only the candidate knows where it came from - and the seed audit walks parent ids from the
+        source row, so an anchor whose parents were recorded on its candidate looked like an ancestor of unknown
+        origin and took everything drawn from it out of the seed with it.
+        """
+        sources = self.source_records()
+        by_sha = {}
+        for record in self.candidates():
+            if record.get("parent_ids"):
+                by_sha.setdefault(record.get("sha256"), record)
+        changed, unresolved = [], []
+        for source in sources:
+            if source.get("parent_ids") or not source.get("sha256"):
+                continue
+            twin = by_sha.get(source["sha256"])
+            if twin is None:
+                if source.get("origin") == "synthetic":
+                    unresolved.append({"id": source["id"], "file": source.get("file")})
+                continue
+            # A candidate that is a copy of a source records that source as its parent; copying that onto the source
+            # row would make the picture its own ancestor, and a self-parent is a cycle, not a provenance.
+            parents = [parent for parent in twin["parent_ids"] if parent != source["id"]]
+            if not parents:
+                if source.get("origin") == "synthetic":
+                    unresolved.append({"id": source["id"], "file": source.get("file")})
+                continue
+            source["parent_ids"] = parents
+            source["parents_from"] = twin["id"]
+            changed.append({"id": source["id"], "from": twin["id"], "parents": source["parent_ids"]})
+        log(f"[lineage] {len(changed)} source row(s) took their parents from a candidate, "
+            f"{len(unresolved)} synthetic source(s) still have none")
+        if apply and changed:
+            with self.guard():
+                lineage.write_jsonl(self.dir / "sources.jsonl", sources)
+        return {"changed": changed, "unresolved": unresolved}
+
     def normalize_paths(self, *, apply=True, log=print):
         """Rewrite recorded file paths to absolute ones, so a record stops depending on the working directory.
 
