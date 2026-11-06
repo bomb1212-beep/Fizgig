@@ -510,10 +510,12 @@ def main(argv=None):
         names = epochs_mod.resolve_names(client)
         names["character_lora"] = client.name_for("lora", character_lora_path(project))
         cancel = make_cancel(args.cancel_file)
-        run(project, manifest, client=client, names=names, cancel=cancel)
+        done, skipped, failed = run(project, manifest, client=client, names=names, cancel=cancel)
         if cancel is not None and cancel():
             print("paused: the remaining cells are still pending, so this command continues them")
-        return 0
+        # The exit code tells the truth about partial work: a run that drew some cells and failed others did not
+        # finish, and a caller that reads exit 0 as "the plan is done" would call a half-drawn batch complete.
+        return 1 if failed else 0
 
     if args.command == "import":
         manifest = read_manifest(project)

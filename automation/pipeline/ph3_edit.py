@@ -501,6 +501,13 @@ def main(argv=None):
         client = epochs_mod.make_client(args.comfy)
         cancel = (lambda: Path(args.cancel_file).is_file()) if args.cancel_file else None
         run(project, manifest, client=client, cancel=cancel)
+        failed = sum(1 for task in manifest["tasks"] if task.get("status") == "failed")
+        if failed:
+            # Partial work is not a finished run: the import still recovers what was drawn, and the exit code says
+            # the plan did not complete.
+            print(f"[ph3_edit] {failed} task(s) failed; importing what was drawn, exit 1")
+            import_results(project, manifest)
+            return 1
         import_results(project, manifest)
     except (EditError, pj.ProjectError, comfy.ComfyError) as exc:
         print(f"[ph3_edit] {exc}")
