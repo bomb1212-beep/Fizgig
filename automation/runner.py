@@ -625,6 +625,17 @@ def main():
             and (not args.job or j["id"] in args.job)]
     if not jobs or len({j['id'] for j in jobs}) != len(jobs):
         raise ValueError("No selected jobs or duplicate job ids.")
+    if args.command == "run":
+        # The boundary between publishing and training is enforced here, not assumed (spec R2): a job that names an
+        # export trains on exactly what that export's manifest declares, or it does not start at all.
+        from pipeline import export as pipeline_export
+        for job in jobs:
+            if not job.get("export_manifest"):
+                continue
+            try:
+                pipeline_export.training_gate(job["export_manifest"])
+            except Exception as exc:  # noqa: BLE001 - a broken export is a refused run, whatever the reason
+                raise ValueError(f"job {job['id']}: {exc}") from exc
     if args.command == "doctor":
         import torch
         cuda = torch.cuda.is_available()

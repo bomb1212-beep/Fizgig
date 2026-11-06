@@ -209,6 +209,44 @@ def read_manifest(project):
     return _read_json(path)
 
 
+def plan_proof(project, record):
+    """(proven, detail): does a batch B plan this project holds actually name this picture?
+
+    A batch B candidate has no parent ids - the plan that drew it is its only ancestry - so a reviewer's accept alone
+    is not membership, and a slot name alone is never proof: plans get re-planned, and an old picture must not walk
+    back in under its successor's slot (spec R2). Two proofs count. The current plan manifest names a task with this
+    slot and seed whose output file hashes to the candidate's bytes. Or the plan's own output file -
+    `images/<slot>__s<seed>.png`, the one path a B task writes - still hashes to the candidate's bytes while the
+    record describes itself as this stage's output, which is how a picture from a plan that was later re-planned stays
+    provable when the manifest that drew it no longer holds its task row.
+    """
+    slot = record.get("slot") or {}
+    slot_id = slot.get("slot_id") or slot.get("id") or slot.get("category")
+    seed_value = record.get("seed")
+    exp = manifest_path(project).parent
+    manifest = None
+    if manifest_path(project).is_file():
+        try:
+            manifest = _read_json(manifest_path(project))
+        except ValueError:
+            manifest = None
+    if isinstance(manifest, dict):
+        for task in manifest.get("tasks") or []:
+            if task.get("slot_id") != slot_id or task.get("seed") != seed_value:
+                continue
+            out = exp / str(task.get("file") or "")
+            if out.is_file() and lineage.sha256_file(out) == record.get("sha256"):
+                return True, f"plan task {slot_id} s{seed_value} ({task.get('file')})"
+        if not manifest.get("tasks"):
+            manifest = None
+    loras = [l for l in (record.get("models") or {}).get("loras") or [] if l.get("trained_on_snapshot")]
+    if record.get("method") == "krea2_b" and len(loras) == 1 and loras[0].get("trained_on_snapshot"):
+        out = exp / "images" / f"{slot_id}__s{seed_value}.png"
+        if out.is_file() and lineage.sha256_file(out) == record.get("sha256"):
+            return True, f"the plan's own output {out.name} (the manifest was re-planned since it was drawn)"
+    return False, f"no batch B task names slot {slot_id} seed {seed_value} with these bytes"
+
+
 def write_manifest(path, manifest):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

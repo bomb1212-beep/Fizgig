@@ -61,7 +61,7 @@ class CollectTests(unittest.TestCase):
     def patch(self, kept, records=(), captions=None):
         """Run `collect` against a fixed audit, so the eligibility rules are not what is under test here."""
         orig_audit, orig_tool2, orig_records = export.seed.audit, export.seed.tool2_captions, None
-        export.seed.audit = lambda p, caps=None: fake_audit(kept)
+        export.seed.audit = lambda p, caps=None, purpose=None, policy=None: fake_audit(kept)
         export.seed.tool2_captions = lambda folder: (captions or {})
         self.project.candidates = lambda: list(records)
         try:
@@ -239,6 +239,18 @@ class ValidateTests(unittest.TestCase):
     def test_no_manifest_is_reported(self):
         (self.base / "export_manifest.json").unlink()
         self.assertTrue(export.validate(self.base))
+
+    def test_an_unlisted_image_is_reported(self):
+        # The runner reads the folder, so a PNG the manifest does not declare would quietly become training data
+        # (spec R2): it is exactly as wrong as a missing one.
+        (self.base / "unregistered.png").write_bytes(PNG + b"extra")
+        problems = export.validate(self.base)
+        self.assertTrue(any("unlisted image: unregistered.png" in p for p in problems), problems)
+
+    def test_an_unlisted_caption_is_reported(self):
+        (self.base / "orphan.txt").write_text("no image behind this\n", encoding="utf-8")
+        problems = export.validate(self.base)
+        self.assertTrue(any("unlisted caption: orphan.txt" in p for p in problems), problems)
 
 
 class ScorerTests(unittest.TestCase):
@@ -469,11 +481,33 @@ class HoldoutDrawTests(unittest.TestCase):
         self.assertIsNone(evaluate.compare_families(reports)["note"])
 
 
+def write_minimal_export(base):
+    """A real, tiny, intact export folder: one declared image with its caption, and a manifest that says so.
+
+    `add_todos` and `training_gate` refuse anything less, so the todo tests need the real thing rather than a
+    manifest dict that only names a folder.
+    """
+    import hashlib
+    base = Path(base)
+    base.mkdir(parents=True, exist_ok=True)
+    image = base / "abcdef.png"
+    image.write_bytes(PNG)
+    image.with_suffix(".txt").write_text("a caption\n", encoding="utf-8")
+    manifest = {
+        "id": "abc123", "base": str(base), "dataset": str(base), "families": ["krea2", "qwen_image21"],
+        "images": [{"id": "c_1", "file": "abcdef.png", "sha256": hashlib.sha256(PNG).hexdigest(),
+                    "caption_sha256": hashlib.sha256(b"a caption").hexdigest()}],
+    }
+    (base / "export_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return manifest
+
+
 class TodoTests(unittest.TestCase):
     """The step after an export: a training job per final family, added disabled.
 
     Adding it enabled would start a run that costs hours of GPU time on the strength of an export the user may still be
-    reviewing, so "added but off" is the only safe default.
+    reviewing, so "added but off" is the only safe default. A broken export gets nothing at all: the todo would carry
+    the folder's path, and a run that opened it would train on files the manifest does not declare.
     """
 
     def setUp(self):
@@ -483,9 +517,7 @@ class TodoTests(unittest.TestCase):
         self.automation.mkdir()
         (self.automation / "todo.json").write_text("[]", encoding="utf-8")
         self.project = FakeProject(self.root / "projects" / "p", card={"id": "p", "trigger": "suamom"})
-        self.manifest = {"id": "abc123", "families": ["krea2", "qwen_image21"],
-                         "base": str(self.root / "exports" / "abc123"),
-                         "dataset": str(self.root / "exports" / "abc123")}
+        self.manifest = write_minimal_export(self.root / "exports" / "abc123")
 
     def tearDown(self):
         self.temp.cleanup()
@@ -535,6 +567,135 @@ class TodoTests(unittest.TestCase):
     def test_no_family_is_refused(self):
         with self.assertRaises(export.ExportError):
             export.plan_todos(self.project, dict(self.manifest, families=[]), automation_dir=self.automation)
+
+    def test_a_broken_export_gets_no_training_job(self):
+        # An unlisted PNG in the folder means the manifest no longer describes what a run would read (spec R2).
+        (self.root / "exports" / "abc123" / "unregistered.png").write_bytes(PNG + b"stray")
+        with self.assertRaises(export.ExportError) as caught:
+            export.add_todos(self.project, self.manifest, automation_dir=self.automation, log=lambda *_: None)
+        self.assertIn("unlisted image", str(caught.exception))
+        self.assertEqual(json.loads((self.automation / "todo.json").read_text(encoding="utf-8")), [])
+
+
+class TrainingGateTests(unittest.TestCase):
+    """The check between a training job and the frozen files it names (spec R2).
+
+    The runner reads a dataset folder, so the manifest is the contract: whatever is on disk that it does not declare,
+    or whatever it declares that is not on disk, stops the run with its name before a single image is read.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.manifest = write_minimal_export(self.root / "exports" / "abc123")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_an_intact_export_passes_and_returns_its_manifest(self):
+        manifest = export.training_gate(self.root / "exports" / "abc123" / "export_manifest.json")
+        self.assertEqual(manifest["id"], "abc123")
+
+    def test_an_unlisted_image_refuses_the_run(self):
+        (self.root / "exports" / "abc123" / "unregistered.png").write_bytes(PNG + b"stray")
+        with self.assertRaises(export.ExportError) as caught:
+            export.training_gate(self.root / "exports" / "abc123" / "export_manifest.json")
+        self.assertIn("unlisted image", str(caught.exception))
+
+    def test_a_swapped_caption_refuses_the_run(self):
+        image = self.root / "exports" / "abc123" / "abcdef.txt"
+        image.write_text("a different caption\n", encoding="utf-8")
+        with self.assertRaises(export.ExportError) as caught:
+            export.training_gate(self.root / "exports" / "abc123" / "export_manifest.json")
+        self.assertIn("caption of", str(caught.exception))
+
+    def test_a_missing_manifest_is_refused(self):
+        with self.assertRaises(export.ExportError):
+            export.training_gate(self.root / "exports" / "nowhere" / "export_manifest.json")
+
+    def test_a_missing_image_refuses_the_run(self):
+        (self.root / "exports" / "abc123" / "abcdef.png").unlink()
+        with self.assertRaises(export.ExportError) as caught:
+            export.training_gate(self.root / "exports" / "abc123" / "export_manifest.json")
+        self.assertIn("missing image", str(caught.exception))
+
+
+class PublishTests(unittest.TestCase):
+    """Publishing the frozen set: complete or not at all, and the same input is the same export (spec R2)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def project(self):
+        from pipeline import project as pj
+        card = {"id": "fx", "trigger": "fx", "caption_base": "style", "caption_traits": "omit",
+                "fixed_traits": [], "outfits": {},
+                "lineage": {"max_train_generation": 2, "seed_max_generation": 1, "max_edit_depth": 1},
+                "final_families": ["krea2"], "slot_quotas": {}, "holdout": {"ids": []}}
+        return pj.Project.create("fx", card, folder=self.root / "proj")
+
+    def source_png(self, name, byte):
+        path = self.root / name
+        path.write_bytes(bytes([byte]) * 128)
+        return path
+
+    def fake_audit(self, kept):
+        return fake_audit(kept)
+
+    def collect_entries(self, project, rows):
+        """The kept rows `audit` would return, with real files behind them."""
+        return rows
+
+    def test_publish_refuses_when_an_eligible_file_vanished(self):
+        # A file that disappears between the audit and the copy must refuse the whole export: half a frozen set is
+        # not a smaller export, it is a wrong one (spec R2).
+        import hashlib
+        gone = self.source_png("gone.png", 7)
+        here = self.source_png("here.png", 8)
+        kept = [
+            {"id": "s_here", "kind": "source", "origin": "user", "sha256": hashlib.sha256(bytes([8]) * 128).hexdigest(),
+             "path": str(here), "generation": 0, "edit_depth": 0, "slot": "", "lineage_ids": ["s_here"]},
+            {"id": "s_gone", "kind": "source", "origin": "user", "sha256": hashlib.sha256(bytes([7]) * 128).hexdigest(),
+             "path": str(gone), "generation": 0, "edit_depth": 0, "slot": "", "lineage_ids": ["s_gone"]},
+        ]
+        project = self.project()
+        gone.unlink()  # it existed when the audit ran; it is gone by the time publish copies
+        orig_audit = export.seed.audit
+        export.seed.audit = lambda p, caps=None, purpose=None, policy=None: fake_audit(kept)
+        try:
+            with self.assertRaises(export.ExportError) as caught:
+                export.publish(project, log=lambda *_: None)
+        finally:
+            export.seed.audit = orig_audit
+        self.assertIn("s_gone", str(caught.exception))
+        self.assertIn("partial", str(caught.exception))
+        self.assertFalse(export.base_dir(project).exists() and any(export.base_dir(project).iterdir()))
+
+    def test_the_same_input_reuses_the_same_id_and_the_manifest_matches_the_disk(self):
+        import hashlib
+        path = self.source_png("only.png", 9)
+        kept = [{"id": "s_only", "kind": "source", "origin": "user",
+                 "sha256": hashlib.sha256(bytes([9]) * 128).hexdigest(), "path": str(path),
+                 "generation": 0, "edit_depth": 0, "slot": "", "lineage_ids": ["s_only"]}]
+        project = self.project()
+        orig_audit = export.seed.audit
+        export.seed.audit = lambda p, caps=None, purpose=None, policy=None: fake_audit(kept)
+        try:
+            first = export.publish(project, log=lambda *_: None)
+            second = export.publish(project, log=lambda *_: None)
+        finally:
+            export.seed.audit = orig_audit
+        self.assertEqual(first["id"], second["id"])
+        self.assertTrue(second.get("reused"))
+        self.assertEqual(first["policy"], "export-v2")
+        base = Path(first["base"])
+        self.assertEqual(export.validate(base), [])
+        disk = sorted(p.name for p in base.iterdir() if p.suffix.lower() in export.IMAGE_SUFFIXES)
+        self.assertEqual(disk, sorted(entry["file"] for entry in first["images"]))
 
 
 if __name__ == "__main__":

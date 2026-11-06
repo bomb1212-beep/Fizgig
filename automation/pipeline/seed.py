@@ -58,6 +58,12 @@ POLICY_GENERATORS = {
     "seed-v1": ("qwen_edit",),
     "seed-v2": ("qwen_edit", "ph3_edit"),
 }
+# The final export is a different question from the seed, so the audit answers it with the same shared checks but two
+# rules of its own: a Krea2 batch B picture may enter once a plan manifest names it, and the generation ceiling is the
+# final one (`max_train_generation`) rather than the seed's (`seed_max_generation`). EXPORT_POLICY tags reports written
+# under these rules; changing it freezes old exports under their old meaning instead of re-reading them.
+EXPORT_POLICY = "export-v2"
+FINAL_GENERATORS = SEED_GENERATORS + ("krea2_lora",)
 
 # Exclusion reasons: code -> (category for the report, why it happened, what to do about it)
 EXCLUSIONS = {
@@ -95,6 +101,8 @@ EXCLUSIONS = {
                       "restore the original bytes, or re-record the candidate"),
     "duplicate_bytes": ("integrity", "another kept image has the same bytes; this one is not the representative",
                         "nothing: one picture is one training image"),
+    "plan_unproven": ("eligibility", "no batch B plan this project holds names this picture (slot, seed and bytes)",
+                      "keep the plan manifest that produced the candidate, or re-draw the slot"),
 }
 
 
@@ -187,20 +195,43 @@ def _reason(code, detail=""):
     return {"code": code, "category": category, "reason": why + (f" ({detail})" if detail else ""), "fix": fix}
 
 
-def audit(project, *, caps=None, log=None, policy=None):
+def audit(project, *, caps=None, log=None, policy=None, purpose="seed"):
     """Every source and candidate with its verdict, the reason for it, and the counts that follow.
 
     The result is a report as well as a plan: `kept` (deduplicated by content, with every lineage id that shares the
     bytes), `excluded` (one row per refusal, with a reason code, a sentence and what to do), `counts`, `duplicates`
     and `shortfall`. Nothing here writes to the project.
+
+    `purpose` picks the question the audit answers. "seed" (the default) decides what may enter a seed snapshot:
+    the seed generators, capped at `seed_max_generation`. "final" decides what may enter the frozen export: the seed
+    generators plus a Krea2 batch B picture whose plan manifest names it, capped at the final
+    `max_train_generation`. The checks both purposes share - holdout separation, lineage resolution, bytes on disk,
+    duplicates, the reviewer's verdict - are the same lines of code for both, so the two answers cannot drift apart.
     """
+    return _audit(project, caps=caps, log=log, policy=policy, purpose=purpose)
+
+
+def _audit(project, *, caps=None, log=None, policy=None, purpose="seed"):
+    if purpose not in ("seed", "final"):
+        raise pj.ProjectError(f"purpose must be 'seed' or 'final', not {purpose!r}")
     caps = caps or lineage.caps(project.card.get("lineage"))
-    # Which generators count is a property of the policy the snapshot is written under, so an old snapshot keeps the
-    # rule it was built with. An unknown policy is refused rather than defaulting to the newest list.
-    policy = policy or SEED_POLICY
-    if policy not in POLICY_GENERATORS:
-        raise pj.ProjectError(f"unknown seed policy {policy!r} (known: {', '.join(sorted(POLICY_GENERATORS))})")
-    generators = POLICY_GENERATORS[policy]
+    final = purpose == "final"
+    if final:
+        if policy is not None and policy != EXPORT_POLICY:
+            raise pj.ProjectError(f"unknown export policy {policy!r} (known: {EXPORT_POLICY})")
+        policy = policy or EXPORT_POLICY
+        generators = FINAL_GENERATORS
+        generation_limit = caps["max_train_generation"]
+        limit_name = "max_train_generation"
+    else:
+        # Which generators count is a property of the policy the snapshot is written under, so an old snapshot keeps
+        # the rule it was built with. An unknown policy is refused rather than defaulting to the newest list.
+        policy = policy or SEED_POLICY
+        if policy not in POLICY_GENERATORS:
+            raise pj.ProjectError(f"unknown seed policy {policy!r} (known: {', '.join(sorted(POLICY_GENERATORS))})")
+        generators = POLICY_GENERATORS[policy]
+        generation_limit = caps["seed_max_generation"]
+        limit_name = "seed_max_generation"
     holdout = project.holdout_entry()
     holdout_ids = set(holdout["ids"])
     holdout_shas = set(holdout["shas"])
@@ -266,13 +297,21 @@ def audit(project, *, caps=None, log=None, policy=None):
         if reason == "different_character":
             refuse(record, "different_character")
             continue
-        if record.get("generator") not in generators:
-            refuse(record, "generator_not_eligible", str(record.get("generator")))
+        generator = record.get("generator")
+        if generator not in generators:
+            refuse(record, "generator_not_eligible", str(generator))
             continue
+        if final and generator == "krea2_lora":
+            # A batch B picture has no parent ids - the plan that drew it is its only ancestry - so "accepted" alone
+            # is not membership. The proof is the plan manifest (spec R2): a slot name alone never lets a picture in.
+            from . import batch_gen as batch_gen  # local import: the audit must load without the generator modules
+            proven, detail = batch_gen.plan_proof(project, record)
+            if not proven:
+                refuse(record, "plan_unproven", detail)
+                continue
         generation = int(record.get("train_generation") or 0)
-        if generation > caps["seed_max_generation"]:
-            refuse(record, "generation_cap", f"generation {generation} > seed_max_generation "
-                                             f"{caps['seed_max_generation']}")
+        if generation > generation_limit:
+            refuse(record, "generation_cap", f"generation {generation} > {limit_name} {generation_limit}")
             continue
         depth = int(record.get("edit_depth") or 0)
         if depth > caps["max_edit_depth"]:
@@ -339,7 +378,8 @@ def audit(project, *, caps=None, log=None, policy=None):
                      "slot": slot.get("slot_id") or slot.get("id") or slot.get("category") or "",
                      "prompt": record.get("prompt", "")})
         rows.append({"id": record["id"], "kind": "candidate", "sha256": actual, "file": str(path),
-                     "eligible": True, "code": "", "category": "", "reason": "accepted Qwen edit", "fix": ""})
+                     "eligible": True, "code": "", "category": "", "reason": f"accepted {generator} candidate",
+                     "fix": ""})
 
     # ---- one picture is one training image: keep a representative and name the ids it stands for
     by_sha, order = {}, []
@@ -373,7 +413,7 @@ def audit(project, *, caps=None, log=None, policy=None):
                                      if entry["kind"] == "candidate" and entry["slot"] == slot)}
               for slot, target in (project.card.get("slot_quotas") or {}).items()}
     return {
-        "policy": SEED_POLICY, "caps": caps,
+        "policy": policy, "purpose": purpose, "caps": caps,
         "holdout": holdout,
         "kept": unique, "excluded": excluded, "rows": rows,
         "counts": {

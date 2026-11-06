@@ -1,16 +1,20 @@
 """M4: the frozen export - the set that is actually trained on, and the record of why each picture is in it.
 
-The seed snapshot (`seed.py`) is built from accepted candidates and is the *starting* set. This is the final one: it
-takes everything the reviewer accepted across every batch the pipeline has produced, applies the same eligibility rules,
-and freezes the result under an id that changes the moment anything in it changes.
+The seed snapshot (`seed.py`) is built from accepted candidates and is the *starting* set. This is the final one, and
+since R2 it answers a different question from the seed with rules of its own: it takes every valid user original plus
+every candidate the reviewer explicitly accepted that the current pipeline plan actually names - a Krea2 batch B
+picture, a correction, an edit - applies the **final** generation ceiling (`max_train_generation`) and the edit-depth
+cap, and freezes the result under an id that changes the moment anything in it changes. The checks the two sets share
+- holdout separation, lineage, bytes, duplicates, the reviewer's verdict - are one code path in `seed.audit`, so the
+export cannot quietly disagree with the seed about what is allowed; the seed's own ceiling and generator list stay
+what they always were (`seed-v1`/`seed-v2`).
 
 Three properties the spec asks for, and how each is kept:
 
-* **Only eligible pictures.** `seed.audit()` already decides that - generation caps, edit-depth caps, holdout
-  separation, lineage that reaches an original, a reviewer's accept, bytes that still hash to what was recorded. This
-  module does not re-decide any of it; it calls the same audit, so the export cannot disagree with the seed about what
-  is allowed. What it adds is the refusal of anything still awaiting review, which the audit already produces as
-  `not_reviewed`.
+* **Only eligible pictures.** `seed.audit(purpose="final")` decides that - the final generation cap, the edit-depth
+  cap, holdout separation, lineage that reaches a recorded root, a reviewer's accept, bytes that still hash to what
+  was recorded, and for a batch B picture a plan manifest that names it (slot, seed and bytes). What this module adds
+  is the refusal of anything still awaiting review, which the audit already produces as `not_reviewed`.
 * **Immutable.** The id is a hash over every image and caption in the set. The same set always produces the same id; a
   changed caption, a new picture or a removed one produces a different id. Publishing never overwrites: a second export
   with the same id is verified and reused, and a different id gets its own folder.
@@ -18,7 +22,10 @@ Three properties the spec asks for, and how each is kept:
   the exclusion rules that ran, and the distributions a person checks at a glance (generation, slot, synthetic share,
   white background).
 
-The export is what a final training run reads, so a picture that cannot be traced to an original must not be in it.
+The export is what a final training run reads, so a picture that cannot be traced to an original must not be in it -
+and the boundary between publishing and training is enforced, not assumed: `validate()` refuses a folder whose disk
+does not match its manifest in either direction, `publish()` refuses a partial set, and `training_gate()` stands
+between a training job and the frozen files it names.
 """
 from __future__ import annotations
 
@@ -33,7 +40,9 @@ from . import lineage
 from . import project as pj
 from . import seed
 
-EXPORT_POLICY = "export-v1"
+# The policy tag travels with the report and the manifest, so an export keeps meaning what it meant when it was
+# written. It lives in `seed` next to the rules it names; re-defining it here would let the two drift apart.
+EXPORT_POLICY = seed.EXPORT_POLICY
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
 
 
@@ -58,10 +67,11 @@ def collect(project, *, caps=None, log=print):
     """Everything that may go into an export, with the refusals that produced it.
 
     Returns `(entries, report)`: `entries` are the eligible pictures (deduplicated by bytes, each with its lineage ids),
-    `report` is the audit that decided it. Nothing here writes.
+    `report` is the audit that decided it. Nothing here writes. The audit runs with `purpose="final"`: the seed's own
+    ceiling and generator list are untouched, and this is the rule set the frozen set is published under.
     """
     caps = caps or lineage.caps(project.card.get("lineage"))
-    report = seed.audit(project, caps=caps)
+    report = seed.audit(project, caps=caps, purpose="final", policy=EXPORT_POLICY)
     captions = seed.tool2_captions((project.card.get("tool2") or {}).get("dataset"))
     holdout = project.holdout_entry()
 
@@ -146,7 +156,13 @@ def export_dir(project, identity_value):
 
 
 def validate(base):
-    """Every way a published export can be wrong, as sentences; empty means it is intact."""
+    """Every way a published export can be wrong, as sentences; empty means it is intact.
+
+    The check is bidirectional (spec R2): every manifest entry must be on disk and still hash to what was recorded,
+    and every image and caption on disk must be one the manifest declares. An unlisted PNG in the folder is exactly as
+    wrong as a missing one - the runner reads the folder, so anything on disk that the manifest does not name would
+    quietly become training data.
+    """
     base = Path(base)
     manifest = pj.read_json(base / "export_manifest.json")
     if not manifest:
@@ -156,6 +172,15 @@ def validate(base):
     shas = [entry.get("sha256") for entry in entries]
     if len(set(shas)) != len(shas):
         problems.append(f"the manifest lists {len(shas) - len(set(shas))} duplicate sha256 value(s)")
+    listed_images = {str(entry.get("file") or "") for entry in entries}
+    listed_captions = {str(Path(entry.get("file") or "").with_suffix(".txt").name) for entry in entries}
+    for path in sorted(base.iterdir()):
+        if not path.is_file() or path.name == "export_manifest.json":
+            continue
+        if path.suffix.lower() in IMAGE_SUFFIXES and path.name not in listed_images:
+            problems.append(f"unlisted image: {path.name} is on disk but the manifest does not declare it")
+        elif path.suffix.lower() == ".txt" and path.name not in listed_captions:
+            problems.append(f"unlisted caption: {path.name} is on disk but no manifest image uses it")
     for entry in entries:
         image = base / str(entry.get("file") or "")
         if not image.is_file():
@@ -178,7 +203,9 @@ def publish(project, *, caps=None, families=None, log=print):
 
     An export whose id already exists is verified and reused rather than rewritten, so re-running the stage is safe. An
     export whose id exists but whose files do not match is an error: something changed a frozen set, and silently
-    republishing over it would hide that.
+    republishing over it would hide that. An eligible picture that vanishes between the audit and the copy refuses the
+    whole export (spec R2): a set that is missing a picture it declared eligible is not a smaller export, it is a
+    wrong one, and half of it is never published.
     """
     entries, report, holdout, caps = collect(project, caps=caps, log=log)
     if not entries:
@@ -200,12 +227,12 @@ def publish(project, *, caps=None, families=None, log=print):
     staging = base.with_name(f"{value}.tmp-{os.getpid()}-{os.urandom(4).hex()}")
     try:
         staging.mkdir(parents=True)
-        written, missing = [], []
+        written = []
         for entry in entries:
             source = Path(entry["path"])
             if not source.is_file():
-                missing.append(entry["id"])
-                continue
+                raise ExportError(f"{entry['id']} vanished before it could be copied ({source}); "
+                                  "refusing to publish a partial export")
             digest = lineage.sha256_file(source)
             if digest != entry["sha256"]:
                 raise ExportError(f"{source.name} changed while the export was being written")
@@ -236,9 +263,9 @@ def publish(project, *, caps=None, families=None, log=print):
             "distributions": distributions(written),
             "white_background": white,
             "quotas": report["quotas"],
-            "missing_at_publish": missing,
+            "missing_at_publish": [],
             "counts": {"images": len(written), "refused": len(report["excluded"]),
-                       "skipped_missing": len(missing)},
+                       "skipped_missing": 0},
         }
         (staging / "export_manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -354,12 +381,37 @@ def plan_todos(project, manifest, *, families=None, automation_dir=None):
     return out
 
 
+def training_gate(manifest_path):
+    """(manifest) the check between a training job and the frozen set it names.
+
+    A job that trains on an export must train on exactly what the manifest declares: the folder is verified before a
+    run reads a single image, so an unlisted picture, a swapped caption or a lost file stops the run with its name
+    instead of quietly entering the training set (spec R2). Returns the manifest when the export is intact.
+    """
+    path = Path(manifest_path)
+    manifest = pj.read_json(path)
+    if not manifest or not manifest.get("id"):
+        raise ExportError(f"no readable export manifest at {path}")
+    base = Path(manifest.get("base") or path.parent)
+    problems = validate(base)
+    if problems:
+        raise ExportError(f"the export {manifest['id']} is not intact: " + "; ".join(problems[:5]))
+    return manifest
+
+
 def add_todos(project, manifest, *, families=None, automation_dir=None, enable=False, log=print):
     """Add the planned jobs to `todo.json` without duplicating one that is already there.
 
-    Written disabled by default. Starting a training run is the user's call and consumes hours of GPU time, so this adds
-    the entry and leaves it off rather than queuing work nobody asked for.
+    Written disabled by default. Starting a training run is the user's call and consumes hours of GPU time, so this
+    adds the entry and leaves it off rather than queuing work nobody asked for. A broken export gets no job at all:
+    the todo would carry the folder's path, and a training run that opens it would either fail or train on files the
+    manifest does not declare.
     """
+    base = Path(manifest.get("base") or "")
+    problems = validate(base)
+    if problems:
+        raise ExportError(f"the export {manifest.get('id')} is not intact, so no training job will be added: "
+                          + "; ".join(problems[:5]))
     path = todo_path(automation_dir)
     jobs = read_todo(path)
     known = {str(job.get("id") or "") for job in jobs}
