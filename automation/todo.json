@@ -1,8 +1,17 @@
 [
-  {
-    "id": "eunbi_waterbomb",
-    "enabled": true,
-    "trigger": "eunbiwb",
-    "seed": 42
-  }
+ {
+  "id": "eunbi_waterbomb",
+  "enabled": true,
+  "trigger": "eunbiwb",
+  "seed": 42
+ },
+ {
+  "id": "suamom_f52fcb9b76c0_krea2",
+  "family": "krea2",
+  "enabled": true,
+  "trigger": "suamom",
+  "dataset_root": "G:\\데이터셋 통합작성툴\\Fizgig_auto\\automation\\projects\\suamom\\exports\\f52fcb9b76c0",
+  "export": "f52fcb9b76c0",
+  "export_manifest": "G:\\데이터셋 통합작성툴\\Fizgig_auto\\automation\\projects\\suamom\\exports\\f52fcb9b76c0\\export_manifest.json"
+ }
 ]

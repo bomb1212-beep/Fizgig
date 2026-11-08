@@ -356,5 +356,65 @@ class GpuTests(unittest.TestCase):
         self.assertTrue(client.idle())
 
 
+class RecoveryScopeTests(unittest.TestCase):
+    """`run(recover=...)`: what a done journal record is allowed to stand in for.
+
+    Found while measuring the real final LoRA. The recovery matches a done record by whatever `meta` the caller
+    passed - for the holdout that is slot and seed - and the journal does not record the prompt. Two holdout prompts
+    share a seed, so the second cell was served the first cell's picture from a previous run and both prompts came
+    back pixel-identical. A holdout cell must always be its own submission.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def write_done(self, journal, prompt_id, **meta):
+        journal.record(prompt_id, **meta)
+        journal.update(prompt_id, comfy.Journal.DONE,
+                       images=[{"filename": "old.png", "subfolder": "", "type": "output"}])
+
+    def history(self, prompt_id, filename):
+        return {f"/history/{prompt_id}": {prompt_id: {
+            "status": {"status_str": "success"},
+            "outputs": {"9": {"images": [{"filename": filename, "subfolder": "", "type": "output"}]}}}}}
+
+    def test_recovery_serves_a_recorded_cell_whose_file_never_landed(self):
+        journal = comfy.Journal(self.dir / "journal")
+        self.write_done(journal, "p-old", slot_id="s_a", seed=1)
+        fake = FakeComfy({"/view": b"OLD"})
+        client = make(self.dir, fake)
+        out = self.dir / "cell.png"
+        data = client.run({"1": {}}, out, slot_id="s_a", seed=1)
+        self.assertEqual(data, b"OLD")
+        self.assertTrue(out.is_file())
+        self.assertEqual(fake.posted(), [], "the recovery must not submit")
+
+    def test_recover_false_forces_a_fresh_submission(self):
+        journal = comfy.Journal(self.dir / "journal")
+        self.write_done(journal, "p-old", slot_id="s_a", seed=1)
+        fake = FakeComfy({"/prompt": {"prompt_id": "p-new"}, "/view": b"NEW",
+                          **self.history("p-new", "new.png")})
+        client = make(self.dir, fake)
+        out = self.dir / "cell.png"
+        data = client.run({"1": {}}, out, slot_id="s_a", seed=1, recover=False)
+        self.assertEqual(data, b"NEW", "recover=False must ask for a new picture, not adopt the recorded one")
+
+    def test_two_prompts_with_one_seed_do_not_collapse_to_one_picture(self):
+        # The defect, in miniature: two cells, same slot/seed, so the second would find the first's record.
+        journal = comfy.Journal(self.dir / "journal")
+        self.write_done(journal, "p-first", slot_id="s_a", seed=1)
+        fake = FakeComfy({"/prompt": {"prompt_id": "p-second"}, "/view": b"SECOND",
+                          **self.history("p-second", "b.png")})
+        client = make(self.dir, fake)
+        out = self.dir / "second.png"
+        data = client.run({"1": {}}, out, slot_id="s_a", seed=1, recover=False)
+        self.assertEqual(data, b"SECOND")
+        self.assertNotEqual(data, b"FIRST")
+
+
 if __name__ == "__main__":
     unittest.main()

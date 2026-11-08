@@ -357,14 +357,19 @@ class Comfy:
             except OSError:
                 pass
 
-    def run(self, graph, out_path=None, cancel=None, timeout=None, **meta):
+    def run(self, graph, out_path=None, cancel=None, timeout=None, recover=True, **meta):
         """Submit, wait, and return the first output image's bytes (written to `out_path` atomically if given).
 
         A done journal record for the same cell whose image never landed on disk is a download failure, not a job to
         run again: its output is fetched from the recorded entry instead of submitting the graph a second time
         (spec R6).
+
+        `recover=False` turns that lookup off. It is for a caller whose cells are distinguished by something the
+        journal does not record - the holdout, whose two prompts share a seed but not a picture. The recovery matches
+        on the caller's `meta` only, so a record from an earlier run with a different prompt but the same slot and seed
+        was being adopted as if it were this cell's output; that is how two holdout prompts produced one picture.
         """
-        if out_path and self.journal:
+        if out_path and self.journal and recover:
             done = self.journal.find_done(meta)
             if done and not Path(out_path).is_file():
                 image = (done.get("images") or [None])[0]

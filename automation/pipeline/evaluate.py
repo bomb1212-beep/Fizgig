@@ -643,16 +643,16 @@ def draw_holdout(project, *, family="krea2", seeds=(7001, 7002), seeds_always=Tr
                 continue
             pending.append((row, seed, out, cell))
     if not pending:
-        write_holdout_manifest(project, family, manifest)
+        write_holdout_manifest(project, family, manifest, purpose=purpose)
         return drawn, skipped, failed
 
     # Something must actually be drawn: only now is a client contacted and the pinned checkpoint required.
     client = client or epochs_mod.make_client(None)
-    names = names_for_holdout(project, client, family)
+    names = names_for_holdout(project, client, family, pin=pin)
     for row, seed, out, _cell in pending:
         if cancel is not None and cancel():
             log("cancelled")
-            write_holdout_manifest(project, family, manifest)
+            write_holdout_manifest(project, family, manifest, purpose=purpose)
             return drawn, skipped, failed
         try:
             graph = krea2_gen.build(
@@ -662,18 +662,22 @@ def draw_holdout(project, *, family="krea2", seeds=(7001, 7002), seeds_always=Tr
                 filename_prefix=f"pipeline_holdout/{row['id']}_s{seed}",
             )
             out.parent.mkdir(parents=True, exist_ok=True)
-            client.run(graph, out, slot_id=row["id"], method="krea2_b_holdout", seed=seed)
+            # `recover=False`: the journal matches a done record by slot and seed, and the holdout's two prompts
+            # share a seed while being different pictures. Letting the recovery run adopted an earlier cell's output
+            # for a different prompt, which produced two prompts with one picture (found while measuring the final
+            # LoRA). A holdout cell is cheap to redraw and must be its own cell's bytes, so it always submits.
+            client.run(graph, out, slot_id=row["id"], method="krea2_b_holdout", seed=seed, recover=False)
             manifest["cells"] = [c for c in manifest["cells"]
                                  if not (c.get("id") == row["id"] and int(c.get("seed") or 0) == int(seed))]
             manifest["cells"].append({"id": row["id"], "seed": int(seed), "file": out.name,
                                       "sha256": lineage.sha256_file(out), "status": "done"})
-            write_holdout_manifest(project, family, manifest)
+            write_holdout_manifest(project, family, manifest, purpose=purpose)
             drawn.append((f'{row["id"]}__s{seed}', out))
             log(f'  {row["id"]} s{seed}: drawn')
         except Exception as exc:  # noqa: BLE001 - one failed cell must not lose the others
             failed.append({"id": row["id"], "seed": seed, "error": f"{type(exc).__name__}: {exc}"})
             log(f'  {row["id"]} s{seed}: FAILED {exc}')
-    write_holdout_manifest(project, family, manifest)
+    write_holdout_manifest(project, family, manifest, purpose=purpose)
     return drawn, skipped, failed
 
 
@@ -693,21 +697,39 @@ def pixel_hash_of(path):
     return lineage.pixel_hash(path)
 
 
-def names_for_holdout(project, client, family):
-    """The model names one holdout draw needs, resolved once per call."""
-    from . import batch_gen, epochs as epochs_mod, models
+def names_for_holdout(project, client, family, *, pin=None):
+    """The model names one holdout draw needs, resolved once per call.
+
+    `pin` is the checkpoint this draw is measuring (spec N4.3). It decides which character LoRA is loaded, and it has
+    to: the old version ignored it and asked `batch_gen.character_lora_path()`, which returns the **seed run's** LoRA.
+    A `purpose="final"` measurement therefore drew with the seed checkpoint while recording the final one in its pin -
+    the pin said one model and the pictures came from another. A `baseline` pin loads no character LoRA at all.
+    """
+    from . import epochs as epochs_mod, models
     client = client or epochs_mod.make_client(None)
     if not client.ping():
         raise EvalError(f"ComfyUI is not answering at {client.url}")
     resolved = models.resolve("krea2")
-    lora_path = batch_gen.character_lora_path(project)
+    character = None
+    if pin is None or pin.get("purpose") != "baseline":
+        path = (pin or {}).get("checkpoint_path")
+        if path:
+            if not Path(path).is_file():
+                raise EvalError(f"the pinned checkpoint for this holdout is gone: {path}")
+            character = client.name_for("lora", str(path))
+        else:
+            # A seed-purpose draw with no pin cannot say which LoRA it measured, so it refuses rather than
+            # silently using whatever the project last chose.
+            raise EvalError("this holdout draw has no pinned checkpoint; run the draw with a pin, or choose an epoch "
+                            "first (the pictures have to be traceable to one model)")
     return {
         "b_unet": client.name_for("unet", resolved["krea2_raw_dit"]),
         "speed_lora": client.name_for("lora", resolved["krea2_turbo_lora"]),
         "clip": client.name_for("clip", resolved["krea2_text_encoder"]),
         "vae": client.name_for("vae", resolved["krea2_vae"]),
-        "character_lora": client.name_for("lora", str(lora_path)),
+        "character_lora": character,
     }
+
 
 
 def holdout_cells(project, family, *, log=print, purpose=None):

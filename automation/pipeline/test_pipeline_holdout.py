@@ -56,7 +56,7 @@ class _Client:
     def name_for(self, kind, path):
         return kind
 
-    def run(self, graph, out, slot_id=None, method=None, seed=None):
+    def run(self, graph, out, slot_id=None, method=None, seed=None, **_meta):
         if self.fail:
             raise RuntimeError("ComfyUI said no")
         self.runs += 1
@@ -370,6 +370,73 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(report["images"], 4)
         self.assertNotIn("partial", report)
         self.assertEqual(report["purpose"], "seed")
+
+
+class PinDecidesTheModelTests(unittest.TestCase):
+    """The pin has to decide which LoRA is loaded, not just what the record says (spec N4.3).
+
+    Found while measuring the real final LoRA: `names_for_holdout` ignored the pin and asked
+    `batch_gen.character_lora_path()`, which returns the **seed run's** LoRA. A `purpose="final"` draw therefore
+    produced pictures from the seed checkpoint while its manifest recorded the final one - the record named one
+    model and the pixels came from another.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def names(self, pin):
+        from pipeline import evaluate as ev
+        client = _Client()
+
+        class Records:
+            url = "http://fake"
+
+            def __init__(self):
+                self.loras = []
+
+            def ping(self):
+                return True
+
+            def name_for(self, kind, path):
+                if kind == "lora":
+                    self.loras.append(str(path))
+                return Path(path).name
+
+        recorder = Records()
+        with mock.patch.object(ev, "_client", return_value=recorder):
+            out = ev.names_for_holdout(_Minimal(self.root), recorder, "krea2", pin=pin)
+        return out, recorder.loras
+
+    def test_a_final_pin_loads_that_checkpoint(self):
+        checkpoint = self.root / "final.safetensors"
+        checkpoint.write_bytes(b"lora")
+        names, loras = self.names({"purpose": "final", "checkpoint_path": str(checkpoint)})
+        self.assertEqual(names["character_lora"], "final.safetensors")
+        self.assertIn(str(checkpoint), loras)
+
+    def test_a_baseline_pin_loads_no_character_lora(self):
+        names, loras = self.names({"purpose": "baseline", "character_lora": None})
+        self.assertIsNone(names["character_lora"])
+        self.assertTrue(all("character" not in path for path in loras))
+
+    def test_a_pin_whose_checkpoint_is_gone_is_refused(self):
+        with self.assertRaises(evaluate.EvalError) as caught:
+            self.names({"purpose": "final", "checkpoint_path": str(self.root / "missing.safetensors")})
+        self.assertIn("gone", str(caught.exception))
+
+    def test_a_draw_with_no_pin_refuses_rather_than_guessing(self):
+        with self.assertRaises(evaluate.EvalError) as caught:
+            self.names(None)
+        self.assertIn("no pinned checkpoint", str(caught.exception))
+
+
+class _Minimal:
+    """Just enough of a project for `names_for_holdout`: it reads nothing else."""
+
+    def __init__(self, root):
+        self.dir = Path(root)
 
 
 if __name__ == "__main__":

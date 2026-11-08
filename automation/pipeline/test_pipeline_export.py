@@ -512,7 +512,7 @@ class HoldoutManifestTests(unittest.TestCase):
             def name_for(self, kind, path):
                 return kind
 
-            def run(self, graph, out, slot_id=None, method=None, seed=None):
+            def run(self, graph, out, slot_id=None, method=None, seed=None, **_meta):
                 self.runs += 1
                 from PIL import Image
                 Path(out).parent.mkdir(parents=True, exist_ok=True)

@@ -19,6 +19,7 @@ for entry in (str(ROOT / "src"), str(AUTO)):
         sys.path.insert(0, entry)
 
 from pipeline import gpu  # noqa: E402
+import proctree  # noqa: E402  (automation/ is on the path; it is the module the cancel path uses)
 
 
 class GpuGateTests(unittest.TestCase):
@@ -370,10 +371,20 @@ class EntryPointRaceTests(_FakeTool2Fixture, unittest.TestCase):
             go.write_text("now", encoding="utf-8")
             outcomes = [child.communicate(timeout=120) for child in children]
         finally:
+            # `release` lets the winner's fake tool2 finish. It has to be written *before* waiting, and the trees have
+            # to be killed afterwards: a child that timed out in `communicate` leaves the fake tool2 (a grandchild)
+            # running, and that grandchild keeps the GPU claim file alive - which is exactly how a leftover
+            # "generator A" claim survived a whole test run and blocked a real job later.
             release.write_text("go", encoding="utf-8")
             for child in children:
                 if child.poll() is None:
-                    child.wait(timeout=120)
+                    try:
+                        child.wait(timeout=120)
+                    except subprocess.TimeoutExpired:
+                        proctree.kill_tree(child.pid, log=lambda *_: None)
+                # Anything the child started outlives `wait()`; end the tree so a leftover fake tool2 cannot hold
+                # the claim file open.
+                proctree.kill_tree(child.pid, log=lambda *_: None)
         codes = [child.returncode for child in children]
         self.assertEqual(sorted(code == 0 for code in codes), [False, True],
                          f"exactly one entry point may reach GPU work; stderr: {outcomes}")
