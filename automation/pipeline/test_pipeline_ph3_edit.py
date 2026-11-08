@@ -239,6 +239,27 @@ class InstructionTests(unittest.TestCase):
         # A vague instruction would produce a picture nobody asked for, so this is a refusal, not a default.
         self.assertIsNone(ph3_edit.instruction_for("mystery", "nonsense"))
 
+    def test_no_instruction_asks_for_a_small_subject(self):
+        """A framing slot is about how much of the body is shown, never about shrinking the person.
+
+        The old `ang_front_wide` said "character small in frame" and the edit model obeyed: the subject fell from
+        57.8% of the frame in the parent to 4.6% and 1.7% in the two pictures drawn with it, and a person looking at
+        them said the character was far too small against the background. Nothing here may ask for that again.
+        """
+        banned = ("small in frame", "small figure", "distant", "tiny", "far away")
+        for slot, text in ph3_edit.INSTRUCTIONS.items():
+            lowered = text.lower()
+            for phrase in banned:
+                self.assertNotIn(phrase, lowered, f"{slot} tells the model to shrink the subject: {text!r}")
+
+    def test_the_wide_slot_fills_the_frame_like_the_other_generators_ask(self):
+        # `batch_gen` and `experiment` prompt this slot as "full body, front view, standing": the character fills the
+        # frame head to feet. The editor has to agree, or the same slot means two different pictures depending on which
+        # generator drew it.
+        wide = ph3_edit.instruction_for("ang_front_wide", "angles").lower()
+        self.assertIn("full body", wide)
+        self.assertIn("fills the frame", wide)
+
 
 class RecordTests(_Base):
     def test_a_finished_edit_becomes_a_depth_one_candidate_of_its_source(self):

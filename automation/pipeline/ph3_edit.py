@@ -217,7 +217,15 @@ INSTRUCTIONS = {
     "frm_profile": "show the character standing in profile, side view",
     "frm_dutch": "tilt the camera to a dutch angle, same pose and outfit",
     "frm_full_body": "show the character's whole body from head to feet, standing",
-    "ang_front_wide": "pull the camera back to a wide shot, character small in frame, same outfit",
+    # `ang_front_wide` is a *framing* slot: the character fills the frame from head to feet, and "wide" refers to how
+    # much of the body is shown, not to how little of the frame the person occupies. The old wording here said
+    # "character small in frame", which the edit model obeyed literally - the measured subject area fell from 57.8% of
+    # the frame to 4.6% and 1.7% on the two pictures drawn with it, and a person looking at them said the character
+    # was far too small against the background. The other generators' prompt for this same slot
+    # (`batch_gen`/`experiment`: "full body, front view, standing, looking at viewer") never asked for a small
+    # subject, so the three disagreed about what the slot means.
+    "ang_front_wide": "full body shot, front view, standing, the character fills the frame from head to feet, "
+                      "same outfit",
     "ang_front_medium": "medium shot from the front, waist up, same outfit",
     "ang_quarter_close": "close three-quarter view of the face, same hairstyle and expression",
 }
