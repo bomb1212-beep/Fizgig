@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest import mock
 
 from pipeline import epochs
+from pipeline import gpu as gpu_module
 
 
 def safetensors_bytes(epoch=None, *, payload=b"x" * 64, extra_meta=None):
@@ -771,6 +772,36 @@ class PlanIdentityTests(unittest.TestCase):
         after = epochs.read_manifest(epochs.manifest_path_of(self.project, self.run))
         self.assertEqual(after["status"], "partial", "the manifest on disk says what happened, not just 'ran'")
 
+    # --- A manifest that cannot be drawn from is refused by name, not by a bare KeyError --------------------
+    def test_an_incomplete_manifest_is_refused_with_a_usable_message(self):
+        # This came out of re-running the audit probe against the new code: its minimal manifest had no `epoch` on
+        # its one task, and the loop died with `KeyError: 'epoch'` - a message that names neither the file nor the
+        # fix. `validate_manifest` says both.
+        broken = {"run": {"folder": str(self.run)}, "checkpoints": [], "size": {}, "seeds": [1], "prompts": [],
+                  "tasks": [{"file": "images/x.png", "status": "pending"}]}
+        with self.assertRaises(epochs.EpochError) as caught:
+            epochs.run(self.project, broken, client=self.client(), names=self.names(), log=lambda *_: None)
+        self.assertIn("epoch", str(caught.exception))
+        self.assertIn("re-run `plan`", str(caught.exception))
+
+    def test_a_manifest_missing_whole_sections_is_refused(self):
+        for absent in ("run", "tasks", "checkpoints", "size", "seeds", "prompts"):
+            with self.subTest(missing=absent):
+                broken = {key: value for key, value in self.manifest.items() if key != absent}
+                with self.assertRaises(epochs.EpochError) as caught:
+                    epochs.run(self.project, broken, client=self.client(), names=self.names(), log=lambda *_: None)
+                self.assertIn(absent, str(caught.exception))
+
+    def test_a_size_without_dimensions_is_refused(self):
+        broken = {**self.manifest, "size": {}}
+        with self.assertRaises(epochs.EpochError) as caught:
+            epochs.run(self.project, broken, client=self.client(), names=self.names(), log=lambda *_: None)
+        self.assertIn("width", str(caught.exception))
+
+    def test_a_planned_manifest_passes_the_check(self):
+        # The check must not reject what `plan()` writes, or it would refuse the product's own files.
+        epochs.validate_manifest(self.manifest)
+
 
 class CliTests(unittest.TestCase):
     """The CLI tells the truth about what happened (spec N3.3/N3.4)."""
@@ -818,14 +849,27 @@ class CliTests(unittest.TestCase):
             return original(project_, run_folder, embedder=embedder, log=log)
 
         from pipeline.scorers import clip_vision
-        with mock.patch.object(clip_vision, "identity_scores",
-                               side_effect=lambda paths, refs, ids=None, embedder=None: {
-                                   "rows": [{"id": i, "max_cosine": 0.5} for i in (ids or [])]}), \
-                mock.patch.object(clip_vision, "Embedder", FakeEmbedder):
-            code = epochs.main(["sheet", "--project", str(self.root / "proj"), "--run", "char-abc123", "--clip"])
+        # The CLI takes the machine-wide GPU claim, whose path is `AUTO`. Without this patch the test would take the
+        # real `automation/gpu.lock` - which is fine alone but collides with anything else using the machine, and it
+        # is not what this test is about. The claim is redirected into the temporary folder like every other file
+        # this test touches.
+        original_claim = gpu_module.claim_gpu
+        gpu_module.claim_gpu = lambda automation_dir=None, *, what="generation": original_claim(
+            automation_dir=self.root / "locks", what=what)
+        try:
+            with mock.patch.object(clip_vision, "identity_scores",
+                                   side_effect=lambda paths, refs, ids=None, embedder=None: {
+                                       "rows": [{"id": i, "max_cosine": 0.5} for i in (ids or [])]}), \
+                    mock.patch.object(clip_vision, "Embedder", FakeEmbedder):
+                code = epochs.main(["sheet", "--project", str(self.root / "proj"), "--run", "char-abc123", "--clip"])
+        finally:
+            gpu_module.claim_gpu = original_claim
         self.assertEqual(code, 0, "sheet --clip must exit 0 rather than raising NameError")
         sidecar = epochs.sheet_clip_path(project, self.run)
         self.assertTrue(sidecar.is_file())
+        # And the claim it took was released: a leaked lock would refuse the next GPU job for as long as this process
+        # lives, which is what a whole-suite run of this file against the real path looked like.
+        self.assertFalse((self.root / "locks" / gpu_module.GPU_LOCK).exists())
 
     def test_a_run_with_a_stale_clip_sidecar_ignores_it(self):
         project = self.project()

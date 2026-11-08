@@ -423,6 +423,32 @@ def cell_state(out, task):
     return "adopt", None
 
 
+def validate_manifest(manifest):
+    """Refuse a grid manifest that cannot be drawn from, naming what is missing.
+
+    A hand-edited, half-written or older manifest used to fail deep inside the loop with a bare `KeyError: 'epoch'`,
+    which says nothing about which file is wrong or what a person should do. Every field the loop reads is checked
+    here, once, with its own message. This is not a schema: it is the list of keys `run()` cannot proceed without.
+    """
+    required = ("run", "tasks", "checkpoints", "size", "seeds", "prompts")
+    missing = [key for key in required if key not in manifest]
+    if missing:
+        raise EpochError(f"the grid manifest is incomplete; missing {', '.join(missing)} - re-run `plan` to write a "
+                         "complete one (nothing already drawn is lost: the pictures stay under their plan folder)")
+    if not isinstance(manifest["run"], dict) or not manifest["run"].get("folder"):
+        raise EpochError("the grid manifest has no run folder; it cannot say which run's pictures these are")
+    for index, task in enumerate(manifest["tasks"]):
+        absent = [key for key in ("epoch", "file", "prompt_id", "seed") if key not in task]
+        if absent:
+            raise EpochError(f"task {index} of the grid manifest is incomplete; missing {', '.join(absent)} - "
+                             "re-run `plan`")
+    for row in manifest["checkpoints"]:
+        if "epoch" not in row or "file" not in row:
+            raise EpochError("a checkpoint row in the grid manifest has no epoch or file; re-run `plan`")
+    if "width" not in manifest["size"] or "height" not in manifest["size"]:
+        raise EpochError("the grid manifest has no width/height; re-run `plan`")
+
+
 def run(project, manifest, *, client, names, log=print, cancel=None):
     """Draw the pending cells. A cell whose file already exists *and checks out* is skipped (spec N3.2).
 
@@ -433,6 +459,7 @@ def run(project, manifest, *, client, names, log=print, cancel=None):
 
     Returns `(done, skipped, failed)`.
     """
+    validate_manifest(manifest)
     manifest_path = manifest_path_of(project, manifest["run"]["folder"])
     exp = manifest_path.parent
     done = skipped = failed = 0
