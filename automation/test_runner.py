@@ -273,20 +273,63 @@ class FreeBeforeTrainingTests(unittest.TestCase):
 
     def test_an_idle_server_frees_its_vram(self):
         fake = self.client()
-        self.assertTrue(runner.free_comfy_before_training(self.cfg(), client=fake, log=lambda *_: None))
+        self.assertEqual(runner.free_comfy_before_training(self.cfg(), client=fake, log=lambda *_: None), "freed")
         self.assertEqual(fake.calls, ["free"])
 
-    def test_a_busy_server_is_not_interrupted(self):
+    def test_a_busy_server_is_not_interrupted_and_reports_busy(self):
         fake = self.client(answers_idle=False)
-        self.assertFalse(runner.free_comfy_before_training(self.cfg(), client=fake, log=lambda *_: None))
+        # spec N1.4: "busy" is the caller's signal to refuse the training start, not to free under it.
+        self.assertEqual(runner.free_comfy_before_training(self.cfg(), client=fake, log=lambda *_: None), "busy")
         self.assertEqual(fake.calls, [], "freeing under a live request would yank its models")
 
     def test_an_unreachable_server_is_skipped(self):
         fake = self.client(answers_ping=False)
-        self.assertFalse(runner.free_comfy_before_training(self.cfg(), client=fake, log=lambda *_: None))
+        self.assertEqual(runner.free_comfy_before_training(self.cfg(), client=fake, log=lambda *_: None),
+                         "unreachable")
         self.assertEqual(fake.calls, [])
 
     def test_no_server_in_the_config_is_skipped(self):
-        self.assertFalse(runner.free_comfy_before_training({"comfy": {}}, client=self.client(),
-                                                          log=lambda *_: None))
+        self.assertEqual(runner.free_comfy_before_training({"comfy": {}}, client=self.client(),
+                                                           log=lambda *_: None), "no-server")
         self.assertEqual(self.calls, [])
+
+    def test_every_configured_address_is_checked_for_busyness(self):
+        # spec N1.4: another address of the same-GPU server holds the VRAM too, so the 8190/8192 pair must both
+        # be consulted before a training start.
+        fake = self.client()
+        cfg = {"comfy": {"url": "http://127.0.0.1:8190", "extra_urls": ["http://127.0.0.1:8192"]}}
+        self.assertEqual(runner.free_comfy_before_training(cfg, client=fake, log=lambda *_: None), "freed")
+        self.assertEqual(fake.calls, ["free"])
+
+    def test_a_busy_second_address_refuses_even_when_the_first_is_idle(self):
+        fake = self.client(answers_idle=True)
+        cfg = {"comfy": {"url": "http://127.0.0.1:8190", "extra_urls": ["http://127.0.0.1:8192"]}}
+        # The client argument only covers the first address; the extra address builds its own client, so simulate
+        # the second one being busy through a patched Comfy constructor.
+        import pipeline.comfy as comfy_mod
+        original = comfy_mod.Comfy
+        busy = {"second": False}
+
+        class SecondBusy:
+            def __init__(self, url, **_kwargs):
+                pass
+
+            def ping(self):
+                return True
+
+            def idle(self):
+                return not busy["second"]
+
+            def free(self):
+                fake.calls.append("free-extra")
+
+        comfy_mod.Comfy = SecondBusy
+        try:
+            busy["second"] = False
+            self.assertEqual(runner.free_comfy_before_training(cfg, client=fake, log=lambda *_: None), "freed")
+            self.assertEqual(fake.calls, ["free", "free-extra"],
+                             "every reachable idle address releases its VRAM")
+            busy["second"] = True
+            self.assertEqual(runner.free_comfy_before_training(cfg, client=fake, log=lambda *_: None), "busy")
+        finally:
+            comfy_mod.Comfy = original

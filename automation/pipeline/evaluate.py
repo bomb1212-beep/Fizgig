@@ -27,6 +27,11 @@ from pathlib import Path
 # reported on their own.
 HARD_VIEW_SLOTS = ("ang_back", "ang_side", "frm_back", "frm_profile", "from_above", "dutch")
 
+# What a holdout measurement is *for* (spec N4.3). The three are not interchangeable and the report has to say which
+# one it is, because "0.77 with the LoRA" and "0.62 without it" only mean something as a pair, and a seed-run number
+# answers a different question from a final-LoRA one.
+HOLDOUT_PURPOSES = ("seed", "final", "baseline")
+
 
 class EvalError(RuntimeError):
     """An evaluation that cannot be run as asked."""
@@ -268,13 +273,14 @@ def _average_ranks(values):
     return ranks
 
 
-def holdout_family_report(family, scores, *, references, cells_audit=None):
+def holdout_family_report(family, scores, *, references, cells_audit=None, purpose=None):
     """One family's holdout result, with its references named and its cells accounted for.
 
     `scores` is a scorer result whose rows carry `max_cosine`; `references` are the holdout originals it was compared
     against. Reported per family because a number from one family is not evidence about another, and the cells audit is
     part of the number: a measurement over vouched cells says something different from one over files that merely sat
-    in the folder (spec R5).
+    in the folder (spec R5). `purpose` names which experiment this is (seed/final/baseline, spec N4.3) so two numbers
+    for one family can never be read as the same measurement.
     """
     if not references:
         raise EvalError(f"the holdout evaluation for {family} has no references to compare against")
@@ -282,6 +288,7 @@ def holdout_family_report(family, scores, *, references, cells_audit=None):
     missing = [row["id"] for row in scores["rows"] if row.get("max_cosine") is None]
     report = {
         "family": family,
+        "purpose": purpose,
         "scorer": scores["scorer"],
         "references": [str(r) for r in references],
         "images": len(values),
@@ -295,7 +302,12 @@ def holdout_family_report(family, scores, *, references, cells_audit=None):
     }
     if cells_audit is not None:
         report["cells"] = cells_audit
+        if cells_audit.get("expected") and cells_audit.get("scored") != cells_audit.get("expected"):
+            report["partial"] = True
+            report["note"] += (f"; the plan has {cells_audit['expected']} cell(s) and {cells_audit['scored']} were "
+                               "scored, so this is a partial measurement")
     return report
+
 
 
 def compare_families(reports):
@@ -383,15 +395,14 @@ def holdout_scores(project, generated, *, family, scorer="clip_vision", embedder
 
     `generated` is `[(id, path), ...]`. Only the holdout originals are references here - comparing a holdout draw with
     the whole training set would ask "does it look like the character" instead of "did it learn what it never saw".
+
+    The reference set is resolved by purpose (`score.reference_paths(..., purpose="holdout")`), which returns exactly
+    the frozen holdout ids. That is the only place in the product where those two pictures are a reference at all
+    (spec N4.5): every other scoring path excludes them.
     """
+    from . import score as score_mod
     from .scorers import clip_vision
-    holdout = project.holdout_entry()
-    refs = []
-    for record_id in holdout.get("ids") or []:
-        record = project.index().get(record_id) or {}
-        path = project.resolve_file(record.get("file") or record.get("src_path"))
-        if path and Path(path).is_file():
-            refs.append(str(path))
+    refs = score_mod.reference_paths(project, purpose="holdout")
     if not refs:
         raise EvalError("the holdout originals are not on disk, so the holdout cannot be scored")
     if not generated:
@@ -406,97 +417,196 @@ def holdout_scores(project, generated, *, family, scorer="clip_vision", embedder
     return scores, refs, {"family": family}
 
 
-def holdout_dir(project, family):
-    return project.dir / "experiments" / "holdout" / family
+
+def holdout_dir(project, family, *, purpose=None):
+    """Where one purpose's holdout cells for one family live (spec N4.3).
+
+    `seed` keeps the historical path `experiments/holdout/<family>/` so the existing 0.7696/0.6197 measurement stays
+    where it is; the other purposes get their own folder, because a final LoRA's number and a baseline's number are
+    different experiments and must not overwrite each other's cells.
+    """
+    base = project.dir / "experiments" / "holdout"
+    if purpose in (None, "seed"):
+        return base / family
+    return base / purpose / family
 
 
-def holdout_manifest_path(project, family):
-    return holdout_dir(project, family) / "holdout.json"
+def holdout_manifest_path(project, family, *, purpose=None):
+    return holdout_dir(project, family, purpose=purpose) / "holdout.json"
 
 
-def read_holdout_manifest(project, family):
-    data = json.loads(holdout_manifest_path(project, family).read_text(encoding="utf-8-sig")) \
-        if holdout_manifest_path(project, family).is_file() else None
+def read_holdout_manifest(project, family, *, purpose=None):
+    path = holdout_manifest_path(project, family, purpose=purpose)
+    data = json.loads(path.read_text(encoding="utf-8-sig")) if path.is_file() else None
     return data if isinstance(data, dict) and data.get("cells") is not None else None
 
 
-def write_holdout_manifest(project, family, manifest):
+def write_holdout_manifest(project, family, manifest, *, purpose=None):
     from . import project as pj
-    pj.write_json(holdout_manifest_path(project, family), manifest)
+    pj.write_json(holdout_manifest_path(project, family, purpose=purpose), manifest)
 
 
-def holdout_pin(project):
-    """The chosen checkpoint a holdout draw is pinned to, or None when nothing is chosen.
+def _graph_version_for(family, purpose):
+    """Which graph drew these cells, recorded by its own version string (spec N4.3)."""
+    from . import krea2_gen
+    if purpose == "baseline":
+        return {"krea2": krea2_gen.GRAPH_VERSION["b"], "character_lora": None}
+    return {"krea2": krea2_gen.GRAPH_VERSION["b"]}
+
+
+
+def holdout_pin(project, *, purpose="seed", family="krea2", run=None, checkpoint=None):
+    """The checkpoint a holdout draw is pinned to, for one purpose (spec N4.3/R5).
 
     A cell drawn with one LoRA is evidence about that LoRA and about nothing else (spec R5): the pin is what keeps a
     cell from sliding from one experiment into another model's measurement. `checkpoint_matches` travels with the pin,
     because a selection whose file changed underneath it is not the checkpoint the cells were drawn with either.
+
+    The three purposes are kept apart because they answer different questions:
+
+    * `seed` - the epoch chosen from the seed-run grid. What the M3-2 comparison picked, and what the existing
+      `0.7696 vs 0.6197` measurement was made with. This is the only purpose that reads the card's choice.
+    * `final` - one of the project's `final_families`, each trained from the same export. Requires an explicit
+      `run` and `checkpoint`: a seed checkpoint must never stand in for a final LoRA, which is what silently
+      substituting one would do.
+    * `baseline` - the same prompts drawn with no character LoRA at all. There is no checkpoint; the pin is the fact
+      that it had none, which is what makes the difference meaningful rather than a bare number.
+
+    An unavailable `final` pin returns None and the caller names the family's waiting reason; it never falls back.
     """
+    if purpose == "baseline":
+        return {"purpose": "baseline", "family": family, "character_lora": None,
+                "note": "drawn without the character LoRA, so this is the prompt-only reference"}
+    if purpose == "final":
+        if family not in (project.card.get("final_families") or []):
+            return None
+        if not run or not checkpoint:
+            return None
+        path = Path(checkpoint)
+        if not path.is_file():
+            return None
+        from . import lineage
+        return {"purpose": "final", "family": family, "run_id": Path(run).name,
+                "checkpoint_path": str(path), "checkpoint_sha256": lineage.sha256_file(path),
+                "checkpoint_matches": True,
+                "character_lora": "the family's own final LoRA, trained on the chosen export"}
     from . import batch_gen
     chosen = batch_gen.epochs_mod.chosen(project)
     if not chosen:
         return None
-    return {"run_id": chosen.get("run_id"), "epoch": chosen.get("epoch"),
+    return {"purpose": "seed", "family": "krea2", "run_id": chosen.get("run_id"), "epoch": chosen.get("epoch"),
             "checkpoint_path": chosen.get("checkpoint_path"),
             "checkpoint_sha256": chosen.get("checkpoint_sha256"),
             "checkpoint_matches": chosen.get("checkpoint_matches")}
 
 
-def draw_holdout(project, *, family="krea2", seeds=(7001, 7002), seeds_always=True, client=None, log=print,
-                 cancel=None):
-    """Draw the holdout prompts with the chosen final LoRA, for one family, under a pinned manifest.
+def holdout_waiting_reason(project, purpose, family):
+    """Why a purpose/family combination cannot be measured yet, in words a person can act on (spec N4.3).
 
-    Every cell drawn is recorded in `experiments/holdout/<family>/holdout.json` with the checkpoint that drew it and
-    the bytes it produced (spec R5), so a rerun submits nothing new and a scoring pass can vouch for exactly the cells
-    the pin names. The rules that keep it honest:
+    Returns None only when the combination is supported; whether the *checkpoint* exists is a separate question the
+    caller answers from `holdout_pin`.
+    """
+    if purpose not in HOLDOUT_PURPOSES:
+        return f"unknown purpose {purpose!r}; the holdout is measured as one of {', '.join(HOLDOUT_PURPOSES)}"
+    if purpose == "baseline":
+        return None
+    if purpose == "seed":
+        if family != "krea2":
+            return (f"the seed-run holdout is drawn with the krea2 epoch grid, so there is no {family} seed "
+                    "measurement; use --purpose final with that family's run and checkpoint")
+        return None
+    families = project.card.get("final_families") or []
+    if family not in families:
+        return (f"{family} is not one of this project's final families "
+                f"({', '.join(families) or 'none set'})")
+    return None
+
+
+def _missing_pin_reason(project, purpose, family, run, checkpoint):
+    """The actionable message when the policy allows this measurement but no checkpoint can be pinned for it."""
+    if purpose == "seed":
+        return ("no epoch has been chosen for this project, so no holdout can be drawn; "
+                "run `pipeline.epochs choose --epoch N` first")
+    if purpose == "final":
+        if not run or not checkpoint:
+            return (f"a final {family} measurement needs that family's own LoRA: pass --run and --checkpoint. "
+                    "A seed checkpoint is not a substitute for one trained on the final export")
+        return (f"the checkpoint given for the final {family} measurement is not a readable file: {checkpoint}")
+    return f"no checkpoint can be pinned for the {purpose}/{family} holdout"
+
+
+
+
+def draw_holdout(project, *, family="krea2", seeds=(7001, 7002), seeds_always=True, client=None, log=print,
+                 cancel=None, purpose="seed", run=None, checkpoint=None):
+    """Draw the holdout prompts with one LoRA, for one family and purpose, under a pinned manifest.
+
+    Every cell drawn is recorded in `experiments/holdout/<purpose>/<family>/holdout.json` with the checkpoint that drew
+    it and the bytes it produced (spec R5, N4.3), so a rerun submits nothing new and a scoring pass can vouch for
+    exactly the cells the pin names. The rules that keep it honest:
 
     * the same plan again submits nothing - a recorded cell whose bytes still hash to what was drawn is reused;
     * the chosen checkpoint changed since the manifest pinned it: refuse, rather than mixing cells drawn by two models;
     * files on disk that no manifest records are refused too - an unvouched picture must not enter a measurement, and
-      the operator decides whether to move it aside.
+      the operator decides whether to move it aside;
+    * the purpose decides which checkpoint may be used (spec N4.3). A `final` measurement needs that family's own run
+      and checkpoint, an unavailable one returns a waiting reason, and a seed checkpoint never substitutes for it.
     """
-    from . import batch_gen, krea2_gen, epochs as epochs_mod, models
+    from . import batch_gen, krea2_gen, epochs as epochs_mod
 
-    if family != "krea2":
-        raise EvalError(f"the holdout draw is only wired for krea2 so far; asked for {family!r}")
-    prompts = holdout_prompts(project)
-    if not prompts:
-        raise EvalError("no holdout is frozen for this project")
-    out_dir = holdout_dir(project, family)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    size = (project.card.get("krea2_inference") or {}).get("size") or {}
-    width = int(size.get("width") or 1024)
-    height = int(size.get("height") or 1536)
-
-    manifest = read_holdout_manifest(project, family)
+    if purpose not in HOLDOUT_PURPOSES:
+        raise EvalError(f"unknown purpose {purpose!r}; the holdout is measured as one of {', '.join(HOLDOUT_PURPOSES)}")
+    if purpose == "seed" and family != "krea2":
+        # The epoch grid draws with krea2 checkpoints, so there is no such thing as a qwen seed-run measurement.
+        raise EvalError(holdout_waiting_reason(project, purpose, family))
+    if purpose == "final" and family not in ("krea2", "qwen_image21"):
+        raise EvalError(f"no inference path exists for {family!r}; the final holdout can be drawn for "
+                        + ", ".join(project.card.get("final_families") or []))
+    # Refusing stray cells comes first: it is a question about the folder, not about this project's choice, and the
+    # operator needs to hear it even when nothing else is ready (spec R5).
+    out_dir = holdout_dir(project, family, purpose=purpose)
+    manifest = read_holdout_manifest(project, family, purpose=purpose)
     if manifest is None:
+        out_dir.mkdir(parents=True, exist_ok=True)
         stray = sorted(path.name for path in out_dir.glob("*.png"))
         if stray:
             raise EvalError(f"{len(stray)} image(s) sit in {out_dir} that no holdout manifest records "
                             f"({', '.join(stray[:3])}...); move them aside, then draw - an unvouched picture "
                             "cannot say which checkpoint drew it")
-        pin = holdout_pin(project)
-        if not pin:
-            raise EvalError("no epoch has been chosen for this project, so no holdout can be drawn; "
-                            "run `pipeline.epochs choose --epoch N` first")
-        manifest = {"kind": "holdout", "family": family, "created_at": _now_stamp(), "pin": pin,
-                    "prompts": prompts, "seeds": list(seeds), "size": {"width": width, "height": height},
-                    "graph_version": krea2_gen.GRAPH_VERSION["b"], "cells": []}
+    pin = holdout_pin(project, purpose=purpose, family=family, run=run, checkpoint=checkpoint)
+    if pin is None:
+        raise EvalError(_missing_pin_reason(project, purpose, family, run, checkpoint))
+    prompts = holdout_prompts(project)
+    if not prompts:
+        raise EvalError("no holdout is frozen for this project")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    size = (project.card.get("krea2_inference") or {}).get("size") or {}
+    width = int(size.get("width") or 1024)
+    height = int(size.get("height") or 1536)
+
+    if manifest is None:
+        manifest = {"kind": "holdout", "family": family, "purpose": purpose, "created_at": _now_stamp(),
+                    "pin": pin, "prompts": prompts, "seeds": list(seeds),
+                    "size": {"width": width, "height": height},
+                    "graph_version": _graph_version_for(family, purpose), "cells": []}
     else:
-        pin = holdout_pin(project)
-        if pin and manifest.get("pin"):
-            recorded = str(manifest["pin"].get("checkpoint_sha256") or "")
-            current = str(pin.get("checkpoint_sha256") or "")
-            if current and recorded and recorded != current:
-                raise EvalError(f"the holdout cells were drawn with checkpoint {recorded[:12]}, but the project now "
-                                f"chooses {current[:12]}; the two cannot share a measurement. Move the folder aside "
-                                "or restore the choice, then draw again")
-            if pin.get("checkpoint_matches") is False:
-                raise EvalError(f"the chosen checkpoint's file changed since it was chosen "
-                                f"({pin.get('checkpoint_path')}); the holdout cells were drawn with the model as it "
-                                "was, so the two cannot share a measurement")
+        recorded_pin = manifest.get("pin") or {}
+        if str(recorded_pin.get("purpose") or "seed") != purpose:
+            raise EvalError(f"the cells in {out_dir} were drawn for the {recorded_pin.get('purpose')!r} purpose, "
+                            f"not {purpose!r}; they cannot share a measurement")
+        recorded = str(recorded_pin.get("checkpoint_sha256") or "")
+        current = str(pin.get("checkpoint_sha256") or "")
+        if current and recorded and recorded != current:
+            raise EvalError(f"the holdout cells were drawn with checkpoint {recorded[:12]}, but this draw pins "
+                            f"{current[:12]}; the two cannot share a measurement. Move the folder aside "
+                            "or restore the choice, then draw again")
+        if pin.get("checkpoint_matches") is False:
+            raise EvalError(f"the pinned checkpoint's file changed since it was chosen "
+                            f"({pin.get('checkpoint_path')}); the holdout cells were drawn with the model as it "
+                            "was, so the two cannot share a measurement")
         prompts = manifest.get("prompts") or prompts
         seeds = tuple(manifest.get("seeds") or seeds)
+
 
     recorded = {(cell.get("id"), int(cell.get("seed") or 0)): cell for cell in manifest["cells"]}
     drawn, skipped, failed = [], 0, []
@@ -505,12 +615,20 @@ def draw_holdout(project, *, family="krea2", seeds=(7001, 7002), seeds_always=Tr
         return out_dir / f'{row["id"]}__s{seed}.png'
 
     def reusable(path, cell):
+        """Is this file a cell this manifest already vouches for? (spec N4.2)
+
+        `cell` may be None - a file on disk with no manifest entry - which used to crash on `cell.get()` and now simply
+        means "not vouched for". A recorded cell must still decode, still hash to what was drawn, and still be pinned to
+        this plan; anything else is drawn again rather than adopted, because an orphan picture in the holdout folder
+        cannot say which checkpoint drew it.
+        """
         if not path.is_file() or not lineage_image_ok(path):
+            return False
+        if not isinstance(cell, dict):
             return False
         recorded_sha = cell.get("sha256")
         if not recorded_sha:
             return False
-        from . import lineage
         return lineage.sha256_file(path) == recorded_sha
 
     from . import lineage
@@ -569,6 +687,12 @@ def lineage_image_ok(path):
     return lineage.image_decodes(path)
 
 
+def pixel_hash_of(path):
+    """Decoded-pixel identity, or None when the file does not decode (spec N4.1)."""
+    from . import lineage
+    return lineage.pixel_hash(path)
+
+
 def names_for_holdout(project, client, family):
     """The model names one holdout draw needs, resolved once per call."""
     from . import batch_gen, epochs as epochs_mod, models
@@ -586,45 +710,87 @@ def names_for_holdout(project, client, family):
     }
 
 
-def holdout_cells(project, family, *, log=print):
-    """The cells a scoring pass may read, from the manifest, with everything else named apart (spec R5).
+def holdout_cells(project, family, *, log=print, purpose=None):
+    """The cells a scoring pass may read, from the manifest, with everything else named apart (spec R5, N4.1/N4.2).
 
-    Returns `(pairs, audit)`: `pairs` are `(id__seed, path)` for cells the manifest records, that still decode, and
-    that still hash to what was drawn; `audit` names the rest - cells the manifest lists but the folder cannot vouch,
-    files on disk the manifest does not know, and cells whose pixels are byte-identical to another cell.
+    Returns `(pairs, audit)`. `pairs` are `(id__seed, path)` for cells the plan expected, the manifest recorded, that
+    still decode, whose bytes are still what was drawn, and that are not a pixel duplicate of another cell.
+
+    `audit` names everything else, and the distinction between "the plan never got this cell" and "the folder holds a
+    file nobody recorded" is the point (spec N4.1):
+
+    * `expected` - how many cells the manifest's own prompts x seeds say there should be;
+    * `missing` - expected, unrecorded or recorded-but-absent;
+    * `no_sha` - recorded without a SHA, which cannot be vouched for and is therefore not scored;
+    * `undecoded`, `changed` - present but not evidence;
+    * `unlisted` - files on disk the manifest does not name (spec N4.2: never silently trusted);
+    * `duplicate_pixels` - cells whose decoded pixels are identical, so one picture is one measurement.
+
+    A partial draw is never reported as a whole one: `expected` vs `scored` is in the audit, and the caller prints it.
     """
     from . import lineage
-    manifest = read_holdout_manifest(project, family)
+    manifest = read_holdout_manifest(project, family, purpose=purpose)
     if manifest is None:
-        raise EvalError(f"no holdout manifest records what drew the cells in {holdout_dir(project, family)}; "
+        raise EvalError(f"no holdout manifest records what drew the cells in "
+                        f"{holdout_dir(project, family, purpose=purpose)}; "
                         "score only what a draw pinned, or draw again")
-    out_dir = holdout_dir(project, family)
-    pairs, missing, undecoded, changed = [], [], [], []
-    seen_shas = {}
+    out_dir = holdout_dir(project, family, purpose=purpose)
+    prompts = manifest.get("prompts") or []
+    seeds = [int(s) for s in (manifest.get("seeds") or [])]
+    expected_keys = {(str(row.get("id")), seed) for row in prompts for seed in seeds}
+    pairs, missing, undecoded, changed, no_sha = [], [], [], [], []
+    seen_pixels = {}
+    recorded_keys = set()
+    for cell in manifest.get("cells") or []:
+        key = (str(cell.get("id")), int(cell.get("seed") or 0))
+        recorded_keys.add(key)
+        name = str(cell.get("file") or "")
+        path = out_dir / name
+        if not path.is_file():
+            missing.append(name or f"{key[0]}_s{key[1]}")
+            continue
+        if not lineage.image_decodes(path):
+            undecoded.append(name)
+            continue
+        if not cell.get("sha256"):
+            # spec N4.1: a cell with no recorded SHA cannot be distinguished from a file somebody dropped in the
+            # folder, so it is reported rather than scored. The old reader accepted it (`missing_sha_accepted`).
+            no_sha.append(name)
+            continue
+        actual = lineage.sha256_file(path)
+        if actual != cell["sha256"]:
+            changed.append(name)
+            continue
+        pixels = pixel_hash_of(path)
+        if pixels in seen_pixels:
+            # Two files, one picture. Counting it twice would weight one drawing twice in the mean.
+            continue
+        seen_pixels[pixels] = name
+        pairs.append((f'{cell.get("id")}__s{cell.get("seed")}', path))
+    for key in sorted(expected_keys - recorded_keys):
+        missing.append(f"{key[0]}_s{key[1]} (never recorded)")
+    listed = {str(cell.get("file") or "") for cell in manifest.get("cells") or []}
+    unlisted = sorted(path.name for path in out_dir.glob("*.png") if path.name not in listed)
+    duplicate_files = []
+    counts = {}
     for cell in manifest.get("cells") or []:
         path = out_dir / str(cell.get("file") or "")
         if not path.is_file():
-            missing.append(cell.get("file"))
             continue
-        if not lineage.image_decodes(path):
-            undecoded.append(cell.get("file"))
+        pixels = pixel_hash_of(path)
+        if pixels is None:
             continue
-        actual = lineage.sha256_file(path)
-        if cell.get("sha256") and actual != cell["sha256"]:
-            changed.append(cell.get("file"))
-            continue
-        if actual in seen_shas:
-            continue                 # duplicate pixels: one picture is one measurement, the twin is reported
-        seen_shas[actual] = path.name
-        pairs.append((f'{cell.get("id")}__s{cell.get("seed")}', path))
-    listed = {str(cell.get("file") or "") for cell in manifest.get("cells") or []}
-    unlisted = sorted(path.name for path in out_dir.glob("*.png") if path.name not in listed)
-    duplicate_files = sorted(name for sha, name in seen_shas.items()
-                             if sum(1 for cell in (manifest.get("cells") or [])
-                                    if cell.get("sha256") == sha) > 1)
-    audit = {"missing": missing, "undecoded": undecoded, "changed": changed,
-             "unlisted": unlisted, "duplicate_pixels": duplicate_files,
-             "pin": manifest.get("pin"), "recorded": len(manifest.get("cells") or [])}
+        counts.setdefault(pixels, []).append(path.name)
+    for names in counts.values():
+        if len(names) > 1:
+            # The first file of a pixel-identical group is the measurement; the rest are the duplicates reported here.
+            duplicate_files.extend(sorted(names)[1:])
+    audit = {"missing": sorted(missing), "undecoded": undecoded, "changed": changed,
+             "no_sha": no_sha, "unlisted": unlisted, "duplicate_pixels": sorted(duplicate_files),
+             "expected": len(expected_keys), "recorded": len(manifest.get("cells") or []),
+             "scored": len(pairs),
+             "complete": not (missing or undecoded or changed or no_sha or unlisted),
+             "pin": manifest.get("pin")}
     return pairs, audit
 
 
@@ -646,6 +812,11 @@ def main(argv=None):
     parser.add_argument("--score-field", default="clip_max_cosine",
                         help="which automatic number to compare (clip_max_cosine, arcface_max_cosine, ...)")
     parser.add_argument("--family", default="krea2", help="which family to draw and score (holdout)")
+    parser.add_argument("--purpose", default="seed", choices=HOLDOUT_PURPOSES,
+                        help="what the measurement is for: seed (the M3-2 choice), final (a family's own final LoRA) "
+                             "or baseline (no character LoRA at all)")
+    parser.add_argument("--run", help="with --purpose final: the run folder that trained this family's LoRA")
+    parser.add_argument("--checkpoint", help="with --purpose final: the .safetensors that should be measured")
     parser.add_argument("--seeds", default="7001,7002", help="comma-separated seeds (holdout)")
     parser.add_argument("--draw", action="store_true", help="really draw the holdout prompts (needs ComfyUI)")
     parser.add_argument("--score", action="store_true", help="score what was drawn against the holdout originals")
@@ -673,45 +844,60 @@ def main(argv=None):
             try:
                 with claim:
                     drawn, skipped, failed = draw_holdout(project, family=args.family, seeds=seeds,
-                                                          client=None if not args.comfy else _client(args.comfy))
+                                                          client=None if not args.comfy else _client(args.comfy),
+                                                          purpose=args.purpose, run=args.run,
+                                                          checkpoint=args.checkpoint)
             finally:
                 claim.release()
-            print(f"holdout draw: {len(drawn)} image(s), {skipped} already present, {len(failed)} failed")
+            print(f"holdout draw ({args.purpose}/{args.family}): {len(drawn)} image(s), {skipped} already present, "
+                  f"{len(failed)} failed")
             for row in failed:
                 print(f'  FAILED {row["id"]} s{row["seed"]}: {row["error"][:160]}')
             if failed and not drawn:
                 return 1
         if not args.score:
             if not args.draw:
-                print(f"{len(prompts)} holdout original(s); draw these prompts with the final LoRA of each family:")
+                waiting = holdout_waiting_reason(project, args.purpose, args.family)
+                if waiting:
+                    print(f"{args.purpose}/{args.family}: {waiting}")
+                    return 1
+                print(f"{len(prompts)} holdout original(s); draw these prompts with the {args.purpose} LoRA of each "
+                      "family:")
                 for row in prompts:
                     print(f'  {row["id"]}  {Path(row["file"]).name}')
                 print(f'  prompt: {prompts[0]["prompt"]}')
                 print("\nadd --draw to draw them, or --score to score what is already drawn")
             return 0
 
-        folder = holdout_dir(project, args.family)
-        if not holdout_manifest_path(project, args.family).is_file():
+        folder = holdout_dir(project, args.family, purpose=args.purpose)
+        if not holdout_manifest_path(project, args.family, purpose=args.purpose).is_file():
             raise EvalError(f"no holdout manifest in {folder} records what drew the cells there; "
                             "score only what a draw pinned - run the draw first")
-        pairs, audit = holdout_cells(project, args.family)
+        pairs, audit = holdout_cells(project, args.family, purpose=args.purpose)
         if not pairs:
             raise EvalError(f"none of the recorded cells in {folder} can be vouched for: "
                             + "; ".join(f"{k} {len(v)}" for k, v in audit.items() if isinstance(v, list) and v))
         scores, refs, _meta = holdout_scores(project, pairs, family=args.family)
-        report = holdout_family_report(args.family, scores, references=refs, cells_audit=audit)
-        print(f'{args.family}: {report["images"]} image(s) scored, max {_fmt(report["max"])}, '
+        report = holdout_family_report(args.family, scores, references=refs, cells_audit=audit,
+                                       purpose=args.purpose)
+        print(f'{args.purpose}/{args.family}: {report["images"]} image(s) scored, max {_fmt(report["max"])}, '
               f'mean {_fmt(report["mean"])}, median {_fmt(report["median"])}')
+        # A measurement over part of the plan is printed as such, not as a number that looks whole (spec N4.1).
+        if audit.get("expected") and audit.get("scored") != audit.get("expected"):
+            print(f'  cells: {audit.get("scored")}/{audit.get("expected")} of the plan were scored'
+                  + ("" if audit.get("complete") else " - THIS IS A PARTIAL MEASUREMENT"))
         audit_bits = ", ".join(f"{name} {len(values)}" for name, values in
-                               ((k, audit.get(k)) for k in ("missing", "undecoded", "changed", "unlisted",
-                                                            "duplicate_pixels")) if values)
+                              ((k, audit.get(k)) for k in ("missing", "undecoded", "changed", "no_sha", "unlisted",
+                                                           "duplicate_pixels")) if values)
         if audit_bits:
             print(f"  cells apart from the measurement: {audit_bits}")
         if report["unscored"]:
             print(f'  {len(report["unscored"])} image(s) carry no score: {", ".join(report["unscored"][:5])}')
         if args.out:
-            path = write_report(args.out, {"families": [report]}, title=f"{args.family} holdout evaluation")
+            path = write_report(args.out, {"families": [report]},
+                                title=f"{args.purpose}/{args.family} holdout evaluation")
             print(f"wrote {path}")
+
         if args.json:
             print(json.dumps(report, ensure_ascii=False, indent=1, default=str))
         return 0

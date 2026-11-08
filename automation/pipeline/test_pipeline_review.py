@@ -27,7 +27,11 @@ class FakeProject:
         return list(self._candidates)
 
     def source_records(self):
-        return []
+        return list(getattr(self, "_sources", []) or [])
+
+    def holdout_entry(self):
+        # spec N4.5: the reference set excludes the frozen holdout, so the scorers ask the project which ids those are.
+        return dict(self.card.get("holdout") or {"ids": []})
 
     def source_share(self):
         return 0.0, {"user": 0, "synthetic": 0}
@@ -274,6 +278,7 @@ class CropScoreTests(unittest.TestCase):
         import threading
         import urllib.request
         from PIL import Image
+        from pipeline import gpu as review_gpu
 
         class Vec:
             """Just enough of a tensor for the scorer's cosine: elementwise multiply and sum."""
@@ -314,7 +319,9 @@ class CropScoreTests(unittest.TestCase):
                 return out
 
         server = review.make_server(self.project, port=0, quota_plan=None,
-                                    embedder_factory=FakeEmbedder)
+                                    embedder_factory=FakeEmbedder,
+                                    claim_factory=lambda: review_gpu.claim_gpu(
+                                        automation_dir=self.root / "locks", what="crop scoring"))
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
@@ -416,6 +423,77 @@ class KeyboardScopeTests(unittest.TestCase):
         # cursor's target element and break the next re-sync (found in the browser run).
         self.assertTrue(self.script_includes("getElementById('last').textContent"))
         self.assertIn('<span id="target"></span><span id="last"></span>', self.html)
+
+
+class ServerIdentityTests(unittest.TestCase):
+    """spec N5: the port is bound exclusively and the answer says which build it is.
+
+    `duplicate_review_bind` was the audit's finding: Windows let a second server bind port 8195 with no error and every
+    request reached the first one, so a new page could be served beside a day-old build and the person had no way to
+    tell. These tests use port 0 (an OS-assigned free port) so they cannot collide with a real server the user is
+    running, and they never touch the user's 8195.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        import json as json_mod
+        (self.root / "project.json").write_text(json_mod.dumps({"id": "p", "trigger": "t"}), encoding="utf-8")
+        (self.root / "candidates.jsonl").write_text("", encoding="utf-8")
+        (self.root / "sources.jsonl").write_text("", encoding="utf-8")
+        (self.root / "review.json").write_text("{}", encoding="utf-8")
+        self.project = review.pj.Project.open(self.root)
+        self.servers = []
+
+    def tearDown(self):
+        for server in self.servers:
+            try:
+                server.shutdown()
+            except Exception:          # noqa: BLE001 - a server that never served has nothing to shut down
+                pass
+            server.server_close()
+
+    def serve(self, port=0):
+        import threading
+        server = review.make_server(self.project, port=port, quota_plan=None, log=lambda *_: None)
+        self.servers.append(server)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server
+
+    def test_the_health_route_names_the_code_and_the_project(self):
+        import json as json_mod
+        import urllib.request
+        server = self.serve()
+        port = server.server_address[1]
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=10) as response:
+            identity = json_mod.loads(response.read().decode("utf-8"))
+            headers = dict(response.headers)
+        self.assertEqual(identity["project"], "p")
+        self.assertEqual(len(identity["code_sha256"]), 16)
+        self.assertGreater(identity["pid"], 0)
+        self.assertTrue(identity["started_at"])
+        # The same identity is on a plain image/HTML response, so even a stale page can be interrogated.
+        self.assertEqual(headers.get("X-Review-Code"), identity["code_sha256"])
+        self.assertEqual(headers.get("X-Review-Project"), "p")
+
+    def test_a_second_server_refuses_the_port_instead_of_sharing_it(self):
+        import urllib.error
+        first = self.serve()
+        port = first.server_address[1]
+        with self.assertRaises(OSError):
+            review.make_server(self.project, port=port, quota_plan=None, log=lambda *_: None)
+        # And the original is still the one answering.
+        import json as json_mod
+        import urllib.request
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=10) as response:
+            self.assertEqual(json_mod.loads(response.read().decode("utf-8"))["pid"], first.code_identity["pid"])
+
+    def test_the_code_identity_is_a_digest_of_this_module(self):
+        import hashlib
+        identity = review.code_identity()
+        source = Path(review.__file__).read_bytes()
+        self.assertEqual(identity["code_sha256"], hashlib.sha256(source).hexdigest()[:16])
 
 
 if __name__ == "__main__":

@@ -178,13 +178,14 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(argv[4:], ["pipeline.review", "--project", str(self.project)])
 
     def test_only_stages_that_read_a_stop_file_are_marked_cancelable(self):
-        # The set is a claim about the CLIs, so it is checked against them rather than trusted.
-        for key, _label, spec, _hint in dataset_tab.STAGES:
-            module = spec[0]
-            accepts = module in dataset_tab.CANCELABLE
-            if accepts:
-                self.assertIn(module, ("epochs", "batch_gen", "fix"))
-        self.assertEqual(dataset_tab.CANCELABLE, {"epochs", "batch_gen", "fix"})
+        # The set is a claim about the CLIs, so it is checked against them rather than trusted: every module listed
+        # must actually declare `--cancel-file`, or the pause button would be a promise the stage cannot keep.
+        import subprocess
+        import sys
+        for module in sorted(dataset_tab.CANCELABLE):
+            source = (Path(dataset_tab.__file__).parent / "pipeline" / f"{module}.py").read_text(encoding="utf-8")
+            self.assertIn("--cancel-file", source, f"{module} is listed as cancelable but takes no stop file")
+        self.assertEqual(dataset_tab.CANCELABLE, {"epochs", "batch_gen", "fix", "gen_qwen_edit", "ph3_edit"})
 
     def test_planning_and_drawing_are_separate_buttons(self):
         # `epochs run` reads the manifest `plan` wrote and does not plan for itself, so one button cannot mean both.
@@ -408,7 +409,7 @@ class RealWidgetTests(unittest.TestCase):
 class VerdictTests(unittest.TestCase):
     """A stopped grid and a finished grid both exit 0, so the verdict must come from what was requested."""
 
-    def verdict(self, *, code, cancelled=False, paused=False):
+    def verdict(self, *, code, cancelled=False, paused=False, cancel_report=None):
         tab = dataset_tab.DatasetTab.__new__(dataset_tab.DatasetTab)
         tab.running = "epochs_run"
         tab.process = None
@@ -417,8 +418,11 @@ class VerdictTests(unittest.TestCase):
         tab.cancel_file = None
         tab.cancel_requested = cancelled
         tab.pause_requested = paused
+        tab.pause_noted = False
+        tab.cancel_report = cancel_report
         tab.status = _FakeVar("")
         tab.log_lines = []
+        tab.last_log_path = None
         tab.refresh_info = lambda: None
         tab._append = lambda text: None
         tab.app = _FakeApp()
@@ -446,6 +450,42 @@ class VerdictTests(unittest.TestCase):
         text = self.verdict(code=1)
         self.assertIn("실패", text)
         self.assertNotIn("일시정지", text)
+
+    def test_the_verdict_survives_the_header_refresh(self):
+        # spec N5: `refresh_info()` recomputes status, so calling it last turned every failure into "준비됨".
+        tab = dataset_tab.DatasetTab.__new__(dataset_tab.DatasetTab)
+        tab.running = "score"
+        tab.process = None
+        tab.pause_button = _FakeButton("pause")
+        tab.cancel_button = _FakeButton("cancel")
+        tab.cancel_file = None
+        tab.cancel_requested = False
+        tab.pause_requested = False
+        tab.pause_noted = False
+        tab.cancel_report = None
+        tab.status = _FakeVar("")
+        tab.last_log_path = None
+        tab._append = lambda text: None
+
+        def refresh_info():
+            tab.status.set("준비됨")
+        tab.refresh_info = refresh_info
+        tab.app = _FakeApp()
+        tab._finish(1)
+        self.assertIn("실패", tab.status.get())
+
+    def test_a_surviving_process_is_reported_after_a_cancel(self):
+        # spec N2: "취소됨" over a live child would be the same lie as calling a crash a pause.
+        text = self.verdict(code=0, cancelled=True,
+                            cancel_report={"graceful": False, "killed": True, "alive": [4242]})
+        self.assertIn("취소됨", text)
+        self.assertIn("4242", text)
+
+    def test_a_clean_cancel_says_nothing_about_survivors(self):
+        text = self.verdict(code=0, cancelled=True,
+                            cancel_report={"graceful": True, "killed": False, "alive": []})
+        self.assertIn("취소됨", text)
+        self.assertNotIn("경고", text)
 
 
 class _FakeApp:

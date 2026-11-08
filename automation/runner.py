@@ -94,13 +94,6 @@ def queue_owner_running():
 def read_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8-sig"))
 
-
-def _pid_of_lock(path):
-    try:
-        return int(Path(path).read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
-        return None
-
 def write_json(path, obj):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -673,68 +666,88 @@ def main():
             raise ValueError("Environment check failed: " + "; ".join(failures))
         return
     lock = AUTO / "queue.lock"
-    # The other direction of the same gate (spec R6): a generation CLI that is submitting work holds the GPU claim,
-    # and training starting under it would contend for the same card.
     from pipeline import gpu as pipeline_gpu
-    if pipeline_gpu.generation_claim_active(AUTO):
-        from pipeline import gpu
-        raise ValueError("a generation run holds the GPU claim (automation/gpu.lock); training would contend for "
-                         f"the same GPU - wait for it to finish (pid {_pid_of_lock(AUTO / gpu.GENERATION_LOCK)})")
+    # One GPU, one resource lock (spec N1): training, generation and scoring all take the same atomic claim on
+    # gpu.lock, so no two-side pre-check is trusted to keep them apart. The queue lock keeps its queue-serialization
+    # role and gains the same dead-owner rule the GPU claim uses. `run` and `caption` hold the GPU claim from here
+    # until training ends, because the Gemma caption server holds VRAM for the whole span too (spec N1.5).
+    gpu_claim = pipeline_gpu.claim_gpu(what=f"{args.command} run") if args.command in ("run", "caption") else None
     try:
-        with lock.open("x", encoding="utf-8") as handle:
-            handle.write(str(os.getpid()))
-    except FileExistsError:
-        raise ValueError("Queue lock exists. If no runner is active, remove automation/queue.lock.") from None
-    try:
-        for job in jobs:
-            cfg = settings(job)
-            if args.command == "status":
-                run, _, _, _ = context(cfg)
-                print(cfg["id"], read_json(run / "state.json") if (run / "state.json").exists() else "not started")
-                continue
-            run, images, instructions = prepare(cfg)
-            if args.command in ("caption", "run"):
-                # Check training model readiness before loading the caption model.
+        if gpu_claim is not None:
+            gpu_claim.acquire()          # raises GpuBusy when another GPU job is live
+        pipeline_gpu.take_queue_lock(lock)
+        try:
+            for job in jobs:
+                cfg = settings(job)
+                if args.command == "status":
+                    run, _, _, _ = context(cfg)
+                    print(cfg["id"], read_json(run / "state.json") if (run / "state.json").exists() else "not started")
+                    continue
+                run, images, instructions = prepare(cfg)
+                if args.command in ("caption", "run"):
+                    # Check training model readiness before loading the caption model.
+                    if args.command == "run":
+                        blocked = model_paths.problems(family_of(cfg))
+                        if blocked:
+                            raise ValueError("Models not ready: " + "; ".join(blocked))
+                    captions(run, cfg, instructions, limit=args.limit)
+                if args.command == "plan":
+                    result = launch_plan(run, cfg, len(images))
+                    write_json(run / "launch_plan.json", {"stages": [{"name": s.name, "cmd": s.cmd} for s in result.stages],
+                                                           "files": result.files})
+                    print("Plan saved:", run / "launch_plan.json")
                 if args.command == "run":
-                    blocked = model_paths.problems(family_of(cfg))
-                    if blocked:
-                        raise ValueError("Models not ready: " + "; ".join(blocked))
-                captions(run, cfg, instructions, limit=args.limit)
-            if args.command == "plan":
-                result = launch_plan(run, cfg, len(images))
-                write_json(run / "launch_plan.json", {"stages": [{"name": s.name, "cmd": s.cmd} for s in result.stages],
-                                                       "files": result.files})
-                print("Plan saved:", run / "launch_plan.json")
-            if args.command == "run":
-                free_comfy_before_training(cfg)
-                execute(run, cfg, len(images))
+                    # The release-then-gate order matters: freeing the idle server may be what makes the gate pass,
+                    # and a busy server refuses the start before the gate is even consulted (spec N1.4).
+                    if free_comfy_before_training(cfg) == "busy":
+                        raise ValueError("ComfyUI still has requests running; not starting training under it - wait "
+                                         "for the requests to finish (nothing is cancelled)")
+                    # The read-only VRAM gate (spec N1.6): refuse a start that would not fit; an unreadable number
+                    # or an unmeasured family/kind only warns and proceeds.
+                    pipeline_gpu.vram_gate(family_of(cfg), "train", config=cfg)
+                    execute(run, cfg, len(images))
+        finally:
+            lock.unlink(missing_ok=True)
     finally:
-        lock.unlink(missing_ok=True)
+        if gpu_claim is not None:
+            gpu_claim.release()
 
 
 def free_comfy_before_training(cfg, *, client=None, log=print):
-    """Return the generation server's VRAM before training starts, when nothing is running on it.
+    """Ask the configured generation server(s) to release VRAM before training starts, when they are idle.
 
     Training and the generation server share one GPU, and ComfyUI holds its loaded weights until it is asked to let
     go (spec R6). The release happens only when the server answers and has no request running: freeing under a live
-    request would yank models out from under it. An unreachable server is skipped, not an error - training does not
-    depend on it.
+    request would yank models out from under it. Returns a status for the caller to act on (spec N1.4):
+
+    * "freed"       - at least one reachable idle server released its memory;
+    * "busy"        - a reachable server still has requests running; the caller must not start training under it;
+    * "unreachable" - no configured server answered; training does not depend on Comfy, so this is not an error;
+    * "no-server"   - no address is configured.
+
+    `comfy.extra_urls` names other addresses of servers on the same GPU: every reachable one is checked, because a
+    busy server on either address holds VRAM training needs. Nothing is killed and no request is cancelled here.
     """
-    url = ((cfg.get("comfy") or {}).get("url")) or ""
-    if not url:
+    comfy = cfg.get("comfy") or {}
+    urls = [u for u in ([comfy.get("url")] + list(comfy.get("extra_urls") or [])) if u]
+    urls = list(dict.fromkeys(urls))            # dedupe, keep order
+    if not urls:
         log("no ComfyUI server in the config; skipping the VRAM release")
-        return False
+        return "no-server"
     from pipeline.comfy import Comfy
-    client = client or Comfy(str(url))
-    if not client.ping():
-        log(f"ComfyUI at {url} is not reachable; skipping the VRAM release")
-        return False
-    if not client.idle():
-        log(f"ComfyUI at {url} has requests running; not freeing VRAM mid-flight")
-        return False
-    client.free()
-    log(f"ComfyUI at {url} released its VRAM for training")
-    return True
+    result = "unreachable"
+    for index, url in enumerate(urls):
+        probe = client if (client is not None and index == 0) else Comfy(str(url))
+        if not probe.ping():
+            log(f"ComfyUI at {url} is not reachable; skipping the VRAM release")
+            continue
+        if not probe.idle():
+            log(f"ComfyUI at {url} has requests running; not freeing VRAM mid-flight")
+            return "busy"
+        probe.free()
+        log(f"ComfyUI at {url} released its VRAM for training")
+        result = "freed"
+    return result
 
 if __name__ == "__main__":
     try:

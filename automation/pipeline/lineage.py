@@ -42,6 +42,28 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
+def pixel_hash(path):
+    """A hash of the decoded pixels, so two files that are one picture are recognised as one (spec N4.1).
+
+    `sha256_file` hashes the bytes, which is right for lineage - a re-encoded copy is a different output file. For a
+    *measurement* the question is different: if two cells decode to the same RGB grid, scoring both would count the
+    same drawing twice in a mean. Measured on this project, the two holdout cells were two PNGs with different
+    metadata and identical pixels, and the old byte hash called them distinct.
+
+    Returns None when the file cannot be decoded; the caller treats that as "not comparable", not as equal to others.
+    """
+    try:
+        from PIL import Image
+    except ImportError:                          # pragma: no cover - Pillow is already required elsewhere
+        return None
+    try:
+        with Image.open(path) as image:
+            rgb = image.convert("RGB")
+            return hashlib.sha256(rgb.tobytes()).hexdigest()
+    except (OSError, ValueError):
+        return None
+
+
 def image_decodes(path):
     """Can this file actually be opened as an image?
 

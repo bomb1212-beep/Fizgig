@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -153,8 +154,13 @@ def batch_id(jobs, refs):
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:12]
 
 
-def run(plan_data, *, python=None, log=print, on_event=None, cancel_file=None, timeout=7200):
-    """Run the plan through tool2's fix mode and return its result rows (one per job)."""
+def run(plan_data, *, python=None, log=print, on_event=None, cancel_file=None, timeout=7200, claim=None):
+    """Run the plan through tool2's fix mode and return its result rows (one per job).
+
+    `claim` is the GPU claim the caller holds (spec N1 ownership handoff, same contract as generator A): the child
+    inherits the protection through FIZGIG_GPU_LOCK_HEIR and never takes the lock itself, and the claim records the
+    child's pid so a killed parent leaves the orphan's work marked busy, not stale.
+    """
     if not plan_data["jobs"]:
         return []
     folder = Path(plan_data["folder"])
@@ -178,8 +184,14 @@ def run(plan_data, *, python=None, log=print, on_event=None, cancel_file=None, t
     if cancel_file:
         command += ["--cancel-file", str(cancel_file)]
     log(f"[fix] {' '.join(command)}")
+    env = dict(os.environ)
+    if claim is not None:
+        env["FIZGIG_GPU_LOCK_HEIR"] = "1"
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                               encoding="utf-8", errors="replace", cwd=str(Path(paths["batch"]).parent))
+                               encoding="utf-8", errors="replace", cwd=str(Path(paths["batch"]).parent),
+                               env=env)
+    if claim is not None:
+        claim.hand_off(process.pid)
     errors = []
     drain = threading.Thread(target=gen._drain, args=(process.stderr, errors), daemon=True)
     drain.start()
@@ -317,7 +329,14 @@ def main(argv=None):
         "already": plan_data["already"]}, ensure_ascii=False, indent=1))
     if args.plan or not args.run:
         return 0
-    results = run(plan_data, cancel_file=args.cancel_file)
+    # The GPU claim covers the whole tool2 correction run (spec N1).
+    from . import gpu
+    claim = gpu.claim_gpu(what="the correction run")
+    claim.acquire()
+    try:
+        results = run(plan_data, cancel_file=args.cancel_file, claim=claim)
+    finally:
+        claim.release()
     outcome = import_corrections(project, plan_data, results)
     print(json.dumps({"imported": len(outcome["records"]), "skipped": outcome["skipped"]}, ensure_ascii=False))
     return 0

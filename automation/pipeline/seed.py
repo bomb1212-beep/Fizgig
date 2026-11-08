@@ -29,6 +29,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -63,6 +64,10 @@ POLICY_GENERATORS = {
 # final one (`max_train_generation`) rather than the seed's (`seed_max_generation`). EXPORT_POLICY tags reports written
 # under these rules; changing it freezes old exports under their old meaning instead of re-reading them.
 EXPORT_POLICY = "export-v2"
+# The caption-transform rules, versioned separately from the eligibility policies: a change to how `omit` edits a tag
+# list changes what a caption *is*, so a snapshot built under the old rule must not be mistaken for one built under the
+# new (spec N6). Bumped once, when `omit` started applying to inherited captions.
+CAPTION_POLICY_VERSION = "caption-v2"
 FINAL_GENERATORS = SEED_GENERATORS + ("krea2_lora",)
 
 # Exclusion reasons: code -> (category for the report, why it happened, what to do about it)
@@ -115,16 +120,151 @@ def card_caption(card):
     return ", ".join(part.strip() for part in parts if part and part.strip())
 
 
-def add_traits(caption, card):
-    """Append the fixed traits to an existing caption, for the `include` policy."""
-    if str(card.get("caption_traits") or "omit").lower() != "include":
-        return caption
+def caption_traits_policy(card):
+    """`include` or `omit`, normalised. Anything else is `omit`, which is the conservative default."""
+    value = str(card.get("caption_traits") or "omit").strip().lower()
+    return "include" if value == "include" else "omit"
+
+
+def trait_terms(card):
+    """The words the policy is about: the fixed traits and the default outfit, as written in the card.
+
+    The trigger and the caption style are removed from the set even when they coincide with a trait or the default
+    outfit: they are what the card wants in *every* caption, so a caption that names the style as its default outfit
+    must not lose the style. (This is not hypothetical - a card whose `caption_base` names the outfit would otherwise
+    drop its own style line.)
+    """
+    protected = {str(card.get("trigger") or "").strip().lower(),
+                 str(card.get("caption_base") or "").strip().lower()}
+    protected.discard("")
+    terms = [str(t).strip() for t in (card.get("fixed_traits") or []) if str(t or "").strip()]
+    outfit = str((card.get("outfits") or {}).get("default") or "").strip()
+    if outfit:
+        terms.append(outfit)
+    return [term for term in terms if term.lower() not in protected]
+
+
+def _split_tags(text):
+    """Split a caption into comma-separated tags, preserving order and empty slots.
+
+    Captions here are tag lists (`trigger, style, black hair, running`), which is what tool2 writes and what the
+    trainer was fed. A caption with no comma at all is one tag, and the sentence path below handles it.
+    """
+    return [part.strip() for part in str(text).split(",")]
+
+
+def _is_sentence(text):
+    """Is this free prose rather than a tag list?
+
+    Three signals, in order of reliability: a sentence-ending mark; a comma-separated part long enough that it cannot
+    be a tag (tag vocabulary here is one to four words, `from behind` or `looking at viewer`); or a comma-free string
+    of several words. Without the length test, a prose caption that happens to contain one comma was edited as if each
+    clause were a tag, which silently dropped the wrong thing.
+    """
+    text = str(text).strip()
+    if not text:
+        return False
+    if text[-1] in ".!?":
+        return True
+    parts = _split_tags(text)
+    if any(len(part.split()) > 4 for part in parts if part):
+        return True
+    return len(parts) == 1 and len(text.split()) > 2
+
+
+def _drop_terms_from_tags(tags, terms):
+    """Remove tags that *are* one of the terms, case-insensitively, without touching the others.
+
+    Deleting a substring would turn `black hairband` into `band`; a tag either matches a term or it does not.
+    """
+    lowered = {term.lower() for term in terms}
+    kept, dropped = [], []
+    for tag in tags:
+        if tag.strip().lower() in lowered:
+            dropped.append(tag.strip())
+        else:
+            kept.append(tag)
+    return [tag for tag in kept if tag], dropped
+
+
+def _drop_terms_from_sentence(text, terms):
+    """Remove the terms from free prose, leaving the sentence readable.
+
+    A hand-written sentence cannot be edited with the confidence a tag list allows, so this is deliberately narrow: it
+    removes a term only when it appears as a whole phrase, and it leaves the rest of the sentence's punctuation alone.
+    The caller records that this happened and what the original was, so a surprising edit is visible rather than
+    silent (spec N6: "?뺤떊?????녿뒗 ?먯쑀 臾몄옣 蹂?섏? ?ъ쑀? 誘몃━蹂닿린瑜??쒓났?쒕떎").
+    """
+    out, dropped = str(text), []
+    for term in sorted({t for t in terms if t}, key=len, reverse=True):
+        pattern = re.compile(r"(?<![\w-])" + re.escape(term) + r"(?![\w-])", re.IGNORECASE)
+        if pattern.search(out):
+            dropped.append(term)
+            out = pattern.sub("", out)
+    if not dropped:
+        return str(text), []
+    out = re.sub(r"\s{2,}", " ", out)
+    out = re.sub(r"\s+([,.;:])", r"\1", out)
+    out = re.sub(r"([,;])\s*,", r"\1", out)
+    out = re.sub(r"^[\s,;]+|[\s,;]+$", "", out).strip()
+    return out, dropped
+
+
+def _append_terms(caption, card):
+    """`include`: add the fixed traits and the default outfit that the caption does not already carry."""
     extra = [t for t in (card.get("fixed_traits") or []) if t and t.lower() not in caption.lower()]
     outfit = (card.get("outfits") or {}).get("default", "")
     if outfit and outfit.lower() not in caption.lower():
         extra.append(outfit)
     return ", ".join([caption] + extra) if extra else caption
 
+
+def caption_policy_preview(caption, card):
+    """What the policy does to one caption, and why (spec N6). Never writes anything.
+
+    Returns `{"before", "after", "policy", "dropped", "kind", "note"}`. `kind` is `tags`, `sentence` or `built`, so a
+    caller can show the person which rule applied; `note` says what to double-check, and is empty when the edit is
+    mechanical.
+    """
+    policy = caption_traits_policy(card)
+    terms = trait_terms(card)
+    before = str(caption or "").strip()
+    result = {"before": before, "after": before, "policy": policy, "dropped": [], "kind": "tags", "note": ""}
+    if not before:
+        result["kind"] = "built"
+        return result
+    if policy == "include":
+        result["after"] = _append_terms(before, card)
+        if result["after"] != before:
+            result["note"] = "the fixed traits were appended because this caption did not carry them"
+        return result
+    if not terms:
+        return result
+    if _is_sentence(before):
+        after, dropped = _drop_terms_from_sentence(before, terms)
+        result.update(after=after, dropped=dropped, kind="sentence")
+        if dropped:
+            result["note"] = ("this is free prose, so the terms were removed as whole phrases; read the result "
+                              "before trusting it")
+        return result
+    tags = _split_tags(before)
+    kept, dropped = _drop_terms_from_tags(tags, terms)
+    result.update(after=", ".join(kept), dropped=dropped)
+    return result
+
+
+def add_traits(caption, card):
+    """Apply the card's `caption_traits` policy to a caption that already exists.
+
+    `include` appends the fixed traits and the default outfit when they are missing. `omit` **removes** them, which is
+    the half that was missing (spec N6): it used to return the caption untouched, so an inherited caption kept
+    `black hair, beige dress` while a caption built from the card dropped them. The two paths then described the same
+    character two different ways, and which one a picture got depended on whether tool2 happened to caption it.
+
+    The removal is tag-wise for a tag list and whole-phrase for prose; see `caption_policy_preview` for the rationale
+    and the reason string a caller can show.
+    """
+    return caption_policy_preview(caption, card)["after"]
 
 def tool2_captions(folder):
     """{sha256: caption} for the images tool2 already captioned in its own dataset folder.
@@ -474,9 +614,14 @@ def plan_inputs(project, *, log=print, policy=SEED_POLICY):
 
 # ---------------------------------------------------------------------- snapshot
 def snapshot_identity(project, entries, *, caps, holdout, policy=SEED_POLICY):
-    """The id of a snapshot: the project, the policy, the caps, the holdout, and every image and caption by hash."""
+    """The id of a snapshot: the project, the policy, the caps, the holdout, and every image and caption by hash.
+
+    `caption_policy` is in the payload (spec N6): a change to how the policy edits a caption changes what the snapshot
+    *is*, and without it two different sets of captions could hash to one id.
+    """
     payload = {
         "project": project.card.get("id"), "card": project.digest(), "policy": policy, "caps": caps,
+        "caption_policy": CAPTION_POLICY_VERSION,
         "holdout_shas": sorted(holdout["shas"]),
         "inputs": sorted(({"id": e["id"], "lineage_ids": e["lineage_ids"], "image": e["sha256"],
                            "caption": hashlib.sha256(e["caption"].encode("utf-8")).hexdigest()}

@@ -53,6 +53,11 @@ class FakeProject:
     def source_records(self):
         return list(getattr(self, "_sources", []) or [])
 
+    def holdout_entry(self):
+        # spec N4.5: the CLIP sort compares against the originals minus the frozen holdout, so the scorer asks which
+        # ids those are. A fake without this answer would let the exclusion go untested.
+        return dict(self.card.get("holdout") or {"ids": []})
+
     def resolve_file(self, name):
         return Path(name) if name else None
 
@@ -209,10 +214,8 @@ class SheetClipSortTests(unittest.TestCase):
             (self.run / "output" / f"char-{epoch:06d}.safetensors").write_bytes(safetensors_bytes(epoch))
         self.manifest = epochs.plan(self.project, run_folder=self.run, seeds=[1], log=lambda *_: None)
         self.exp = epochs.manifest_path_of(self.project, self.run).parent
-        for task in self.manifest["tasks"]:
-            path = self.exp / task["file"]
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(b"\x89PNG\r\n\x1a\n" + task["prompt_id"].encode())
+        for index, task in enumerate(self.manifest["tasks"]):
+            write_png(self.exp / task["file"], colour=(30 * (index % 8), 90, 90))
 
     def tearDown(self):
         self.temp.cleanup()
@@ -284,7 +287,17 @@ class SheetClipSortTests(unittest.TestCase):
             epochs.sheet_clip_scores(self.project, self.run, log=lambda *_: None)
 
 
+def write_png(path, *, size=(16, 16), colour=(120, 120, 120)):
+    """A real, decodable PNG. spec N3.2 verifies cells by decoding them, so a fake header is now a broken cell."""
+    from PIL import Image
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", size, colour).save(path)
+    return path
+
+
 class RunTests(unittest.TestCase):
+
     """Drawing the grid: resumable, and honest about what it drew."""
 
     def setUp(self):
@@ -314,8 +327,7 @@ class RunTests(unittest.TestCase):
                 if fail_on and fail_on in str(slot_id):
                     raise RuntimeError("ComfyUI said no")
                 self.runs.append({"graph": graph, "out": out, "method": method, "seed": seed})
-                Path(out).parent.mkdir(parents=True, exist_ok=True)
-                Path(out).write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 32)
+                write_png(out, colour=(len(self.runs) % 256, 90, 90))
                 return out
 
         return Fake()
@@ -585,6 +597,272 @@ class SnapshotOfTests(unittest.TestCase):
         self.assertEqual(found["source"], "run_config.json")
 
 
+class PlanIdentityTests(unittest.TestCase):
+    """spec N3.1/N3.2: a plan is identified by what its pictures mean, and a cell has to prove it is that picture.
+
+    Each test here is one of the audit's four reproductions, driven now as a regression instead of a probe.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.run = self.root / "runs" / "char-abc123"
+        (self.run / "output").mkdir(parents=True)
+        self.project = FakeProject(self.root / "proj")
+        self.project.dir.mkdir(parents=True)
+        self.checkpoints = {}
+        for epoch in (2, 4):
+            path = self.run / "output" / f"char-{epoch:06d}.safetensors"
+            path.write_bytes(safetensors_bytes(epoch))
+            self.checkpoints[epoch] = path
+        self.manifest = epochs.plan(self.project, run_folder=self.run, seeds=[1], log=lambda *_: None)
+        self.exp = epochs.manifest_path_of(self.project, self.run).parent
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def client(self, fail_on=None):
+        class Fake:
+            def __init__(self):
+                self.runs = []
+
+            def name_for(self, kind, path):
+                return Path(path).name
+
+            def run(self, graph, out, slot_id=None, method=None, seed=None):
+                if fail_on and fail_on in str(slot_id):
+                    raise RuntimeError("ComfyUI said no")
+                self.runs.append({"graph": graph, "out": Path(out), "method": method})
+                write_png(out, colour=(len(self.runs) * 7 % 256, 60, 60))
+                return out
+
+        return Fake()
+
+    def names(self):
+        return {"b_unet": "raw", "speed_lora": "turbo", "clip": "te", "vae": "vae"}
+
+    # --- `epochs_corrupt_resume`: a file that is not a picture was counted as done ---------------------------
+    def test_a_file_that_does_not_decode_is_not_a_finished_cell(self):
+        task = self.manifest["tasks"][0]
+        path = self.exp / task["file"]
+        write_png(path)
+        path.write_bytes(b"not a png at all")
+        epochs.write_manifest(epochs.manifest_path_of(self.project, self.run), self.manifest)
+        client = self.client()
+        done, skipped, failed = epochs.run(self.project, self.manifest, client=client, names=self.names(),
+                                           log=lambda *_: None)
+        self.assertEqual(skipped, 0, "a corrupt file must not be skipped as if it were the plan's picture")
+        self.assertEqual(failed, 0)
+        self.assertEqual(done, len(self.manifest["tasks"]), "every cell is drawn, the corrupt one included")
+        self.assertTrue(client.runs, "the client was actually asked to draw")
+        self.assertEqual(task["status"], "done")
+
+    def test_a_decodable_file_with_the_wrong_bytes_is_redrawn(self):
+        task = self.manifest["tasks"][0]
+        write_png(self.exp / task["file"], colour=(1, 2, 3))
+        task["sha256"] = "0" * 64                      # the plan recorded a different picture
+        client = self.client()
+        _done, skipped, _failed = epochs.run(self.project, self.manifest, client=client, names=self.names(),
+                                             log=lambda *_: None)
+        self.assertEqual(skipped, 0)
+        self.assertEqual(len(client.runs), len(self.manifest["tasks"]),
+                         "the mismatched cell is redrawn, and so is everything not yet drawn")
+
+    def test_an_unhashed_picture_from_this_plan_is_adopted_and_hashed(self):
+        # An interrupted save left a decodable picture with no recorded SHA. It is this plan's own work, so it is
+        # adopted - but the hash is written, so the next run can prove it instead of adopting it again.
+        task = self.manifest["tasks"][0]
+        write_png(self.exp / task["file"])
+        client = self.client()
+        epochs.run(self.project, self.manifest, client=client, names=self.names(), log=lambda *_: None)
+        self.assertEqual(len(client.runs), len(self.manifest["tasks"]) - 1,
+                         "the adopted cell is not drawn again; the rest still is")
+        self.assertEqual(task["sha256"], epochs._sha256_of(self.exp / task["file"]))
+        # And a second run draws nothing at all, because every cell now carries a hash.
+        client2 = self.client()
+        done2, skipped2, _failed2 = epochs.run(self.project, self.manifest, client=client2, names=self.names(),
+                                               log=lambda *_: None)
+        self.assertEqual((done2, len(client2.runs)), (0, 0))
+        self.assertEqual(skipped2, len(self.manifest["tasks"]))
+
+    def test_a_written_file_that_does_not_decode_is_a_failure_not_a_done_cell(self):
+        # A client that returns without a complete picture must not leave a cell marked done.
+        class Truncating:
+            def name_for(self, kind, path):
+                return Path(path).name
+
+            def run(self, graph, out, slot_id=None, method=None, seed=None):
+                Path(out).parent.mkdir(parents=True, exist_ok=True)
+                Path(out).write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 4)
+
+        done, _skipped, failed = epochs.run(self.project, self.manifest, client=Truncating(), names=self.names(),
+                                            log=lambda *_: None)
+        self.assertEqual(done, 0)
+        self.assertEqual(failed, len(self.manifest["tasks"]))
+        self.assertEqual(self.manifest["status"], "failed")
+
+    # --- `epochs_replan_relabels_images`: a repointed checkpoint reused the old pictures ---------------------
+    def test_a_replanned_grid_does_not_reuse_pictures_drawn_with_other_bytes(self):
+        client = self.client()
+        epochs.run(self.project, self.manifest, client=client, names=self.names(), log=lambda *_: None)
+        drawn_before = len(client.runs)
+        self.assertEqual(drawn_before, len(self.manifest["tasks"]))
+        # The checkpoint is retrained in place, so its name and path are the same and its bytes are not.
+        self.checkpoints[4].write_bytes(safetensors_bytes(4, payload=b"retrained" * 40))
+        replanned = epochs.plan(self.project, run_folder=self.run, seeds=[1], log=lambda *_: None)
+        self.assertNotEqual(replanned["plan_id"], self.manifest["plan_id"],
+                            "different checkpoint bytes are a different plan")
+        client2 = self.client()
+        done, skipped, _failed = epochs.run(self.project, replanned, client=client2, names=self.names(),
+                                            log=lambda *_: None)
+        self.assertEqual(skipped, 0, "pictures drawn with the old bytes are not this plan's evidence")
+        self.assertEqual(done, len(replanned["tasks"]))
+        self.assertEqual(len(client2.runs), len(replanned["tasks"]))
+
+    def test_the_earlier_plan_and_its_pictures_are_preserved(self):
+        client = self.client()
+        epochs.run(self.project, self.manifest, client=client, names=self.names(), log=lambda *_: None)
+        old_id = self.manifest["plan_id"]
+        old_files = [self.exp / t["file"] for t in self.manifest["tasks"] if (self.exp / t["file"]).is_file()]
+        self.assertTrue(old_files)
+        self.checkpoints[2].write_bytes(safetensors_bytes(2, payload=b"changed" * 40))
+        replanned = epochs.plan(self.project, run_folder=self.run, seeds=[1], log=lambda *_: None)
+        archived = self.exp / f"epochs-{old_id}.json"
+        self.assertTrue(archived.is_file(), "the earlier manifest has to survive the re-plan")
+        self.assertEqual(epochs.plan_id(epochs.read_manifest(archived)), old_id)
+        self.assertTrue(all(path.is_file() for path in old_files), "its pictures stay where they were")
+        self.assertEqual(replanned.get("supersedes", {}).get("plan_id"), old_id)
+
+    def test_an_identical_replan_is_the_same_plan_and_archives_nothing(self):
+        again = epochs.plan(self.project, run_folder=self.run, seeds=[1], log=lambda *_: None)
+        self.assertEqual(again["plan_id"], self.manifest["plan_id"])
+        self.assertNotIn("supersedes", again)
+        self.assertEqual([p.name for p in self.exp.glob("epochs-*.json")], [])
+
+    def test_choose_records_what_the_grid_actually_held(self):
+        # spec N3.3: a choice over three of sixteen cells is still a choice, but the record has to say so.
+        client = self.client()
+        drawn = []
+
+        def cancel():
+            return len(drawn) >= 3
+
+        original = client.run
+
+        def counting(graph, out, slot_id=None, method=None, seed=None):
+            result = original(graph, out, slot_id=slot_id, method=method, seed=seed)
+            drawn.append(out)
+            return result
+
+        client.run = counting
+        epochs.run(self.project, self.manifest, client=client, names=self.names(),
+                   log=lambda *_: None, cancel=cancel)
+        entry = epochs.choose(self.project, run_folder=self.run, epoch=2, log=lambda *_: None)
+        grid = entry["grid"]
+        self.assertEqual(grid["cells"], len(epochs.EVAL_PROMPTS))
+        self.assertEqual(grid["drawn"], 3)
+        self.assertGreater(grid["pending"], 0)
+        self.assertEqual(grid["plan_id"], self.manifest["plan_id"])
+
+    def test_a_partial_grid_is_not_reported_as_a_finished_run(self):
+        client = self.client(fail_on="e02_upper")
+        epochs.run(self.project, self.manifest, client=client, names=self.names(), log=lambda *_: None)
+        self.assertEqual(self.manifest["status"], "partial")
+        after = epochs.read_manifest(epochs.manifest_path_of(self.project, self.run))
+        self.assertEqual(after["status"], "partial", "the manifest on disk says what happened, not just 'ran'")
+
+
+class CliTests(unittest.TestCase):
+    """The CLI tells the truth about what happened (spec N3.3/N3.4)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.run = self.root / "proj" / "seed_lora" / "snap1" / "runs" / "char-abc123"
+        (self.run / "output").mkdir(parents=True)
+        card = tiny_card()
+        (self.root / "proj").mkdir(parents=True, exist_ok=True)
+        (self.root / "proj" / "project.json").write_text(json.dumps(card), encoding="utf-8")
+        for epoch in (2, 4):
+            (self.run / "output" / f"char-{epoch:06d}.safetensors").write_bytes(safetensors_bytes(epoch))
+        from PIL import Image
+        Image.new("RGB", (8, 8), (100, 100, 100)).save(self.root / "proj" / "a.png")
+        (self.root / "proj" / "sources.jsonl").write_text(
+            json.dumps({"id": "s_1", "file": str(self.root / "proj" / "a.png"), "origin": "user"}) + "\n",
+            encoding="utf-8")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def project(self):
+        from pipeline import project as pj
+        return pj.Project.open(self.root / "proj")
+
+    def test_sheet_clip_does_not_die_with_a_name_error(self):
+        # `epochs_clip_cli`: `sheet --clip` raised NameError before scoring anything.
+        project = self.project()
+        manifest = epochs.plan(project, run_folder=self.run, seeds=[1], log=lambda *_: None)
+        exp = epochs.manifest_path_of(project, self.run).parent
+        for index, task in enumerate(manifest["tasks"]):
+            write_png(exp / task["file"], colour=(index * 9 % 256, 40, 40))
+        calls = []
+
+        class FakeEmbedder:
+            def embed(self, paths):
+                calls.append(list(paths))
+                return {str(path): [1.0, 0.0] for path in paths}
+
+        original = epochs.sheet_clip_scores
+
+        def fake(project_, run_folder, *, embedder=None, log=print):
+            return original(project_, run_folder, embedder=embedder, log=log)
+
+        from pipeline.scorers import clip_vision
+        with mock.patch.object(clip_vision, "identity_scores",
+                               side_effect=lambda paths, refs, ids=None, embedder=None: {
+                                   "rows": [{"id": i, "max_cosine": 0.5} for i in (ids or [])]}), \
+                mock.patch.object(clip_vision, "Embedder", FakeEmbedder):
+            code = epochs.main(["sheet", "--project", str(self.root / "proj"), "--run", "char-abc123", "--clip"])
+        self.assertEqual(code, 0, "sheet --clip must exit 0 rather than raising NameError")
+        sidecar = epochs.sheet_clip_path(project, self.run)
+        self.assertTrue(sidecar.is_file())
+
+    def test_a_run_with_a_stale_clip_sidecar_ignores_it(self):
+        project = self.project()
+        manifest = epochs.plan(project, run_folder=self.run, seeds=[1], log=lambda *_: None)
+        exp = epochs.manifest_path_of(project, self.run).parent
+        for index, task in enumerate(manifest["tasks"]):
+            write_png(exp / task["file"], colour=(index * 9 % 256, 41, 41))
+        sidecar = epochs.sheet_clip_path(project, self.run)
+        sidecar.write_text(json.dumps({"identity": {"plan_id": "someone-else"}, "cells": {
+            "|".join((t["prompt_id"], str(int(t["epoch"])), str(int(t["seed"])))): {"max": 0.99, "sha256": None}
+            for t in manifest["tasks"][:1]}}), encoding="utf-8")
+        self.assertIsNone(epochs._read_clip_sidecar(project, self.run, manifest=manifest),
+                          "a sidecar measured under another identity is not reused")
+
+    def test_an_aborted_run_does_not_block_finding_the_only_usable_one(self):
+        # `aborted_run_blocks_find_run`: a run with zero checkpoints was a candidate and forced --run every time.
+        aborted = self.root / "proj" / "seed_lora" / "snap2" / "runs" / "char-zzz"
+        (aborted / "state.json").parent.mkdir(parents=True, exist_ok=True)
+        (aborted / "state.json").write_text(json.dumps({"complete": False, "active_stage": "Text Encoder Caching"}),
+                                            encoding="utf-8")
+        project = self.project()
+        self.assertEqual(epochs.find_run(project).name, "char-abc123")
+        rows = {row["name"]: row for row in epochs.run_rows(project)}
+        self.assertFalse(rows["char-zzz"]["usable"])
+        self.assertEqual(rows["char-zzz"]["checkpoints"], 0)
+        self.assertTrue(rows["char-abc123"]["usable"])
+        self.assertTrue(aborted.is_dir(), "the empty run's folder is preserved, never deleted")
+
+    def test_naming_an_aborted_run_says_instead_of_drawing_nothing(self):
+        aborted = self.root / "proj" / "seed_lora" / "snap2" / "runs" / "char-zzz"
+        aborted.mkdir(parents=True)
+        project = self.project()
+        with self.assertRaises(epochs.EpochError) as caught:
+            epochs.find_run(project, "char-zzz")
+        self.assertIn("no checkpoints", str(caught.exception))
+
+
 class FindRunTests(unittest.TestCase):
     """Which run to evaluate: only ever one that was actually found."""
 
@@ -597,9 +875,11 @@ class FindRunTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def make_run(self, snapshot, name):
+    def make_run(self, snapshot, name, *, checkpoints=1):
         path = self.project.dir / "seed_lora" / snapshot / "runs" / name
-        path.mkdir(parents=True)
+        (path / "output").mkdir(parents=True)
+        for epoch in range(1, checkpoints + 1):
+            (path / "output" / f"char-{epoch:06d}.safetensors").write_bytes(safetensors_bytes(epoch))
         return path
 
     def test_the_only_run_is_used_without_being_named(self):
@@ -624,6 +904,7 @@ class FindRunTests(unittest.TestCase):
         with self.assertRaises(epochs.EpochError) as caught:
             epochs.find_run(self.project)
         self.assertIn("train a seed first", str(caught.exception))
+
 
 
 if __name__ == "__main__":

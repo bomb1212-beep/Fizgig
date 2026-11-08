@@ -515,6 +515,13 @@ def main(argv=None):
             import_results(project, manifest)
             return 1
         import_results(project, manifest)
+        if args.cancel_file and Path(args.cancel_file).is_file():
+            # A pause is not a finish (spec N2): the remaining tasks are still pending, so a caller reading exit 0
+            # as "the plan is done" would report a stopped run as a complete one. The drawn pictures are imported
+            # above, which is what makes the rerun continue rather than restart.
+            pending = sum(1 for task in manifest["tasks"] if task.get("status") in (None, "pending"))
+            print(f"paused: {pending} task(s) still pending, so this command continues them")
+            return 0
     except (EditError, pj.ProjectError, comfy.ComfyError) as exc:
         print(f"[ph3_edit] {exc}")
         return 1

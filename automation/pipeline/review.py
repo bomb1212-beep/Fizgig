@@ -20,9 +20,12 @@ Two things the page and the API agree on:
 """
 from __future__ import annotations
 
+import hashlib
 import html
 import json
+import os
 import sys
+import time
 import webbrowser
 from pathlib import Path
 import urllib.parse
@@ -116,6 +119,24 @@ def candidate_rows(project, *, decision=None, generator=None, slot=None, images_
     return rows
 
 
+def attach_crops(project, rows, *, store=None):
+    """Put each candidate's stored crop into its row, so the page renders it after a reload (spec N7).
+
+    The score a crop produced is not stored with the box: it is a measurement of a model and a reference set, and both
+    can change. What is stored is the box and the image's SHA - the part a person decided - and the score shown on a
+    reload is only the one this page measured in the current session. Keeping the two apart is what stops an old
+    number from looking current.
+    """
+    store = read_crop_store(project) if store is None else store
+    for row in rows:
+        entry = store.get(row["id"])
+        if isinstance(entry, dict) and entry.get("box"):
+            row["crops"] = {str(entry.get("kind") or "face"):
+                            {"box": list(entry["box"]),
+                             "max": (row.get("crop_scores") or {}).get(str(entry.get("kind") or "face"))}}
+    return rows
+
+
 def _duplicate_groups(project, rows, *, max_distance=6):
     """Annotate rows with their near-duplicate group, using the scorer's own pHash clustering (spec R7 P2).
 
@@ -185,6 +206,17 @@ def _cell(row, images_prefix):
     if row.get("white_ratio") is not None:
         score_bits.append(f'흰배경 {row["white_ratio"]:.2f}')
     scores_line = (f'<div class="scores">{" · ".join(score_bits)}</div>' if score_bits else "")
+    # A stored crop is part of what the page shows (spec N7): the box and its score are rendered inline, so a reload
+    # restores the measurement instead of losing it. `crops` is `{kind: {box, max}}` for this candidate's own image.
+    crops = row.get("crops") or {}
+    crop_lines = ""
+    for kind, entry in sorted(crops.items()):
+        if not isinstance(entry, dict) or not entry.get("box"):
+            continue
+        value = entry.get("max")
+        shown = "점수 없음" if value is None else f"max {float(value):.3f}"
+        crop_lines += (f'<div class="crop-score">{escape(kind)} {escape(shown)} · box '
+                       f'{escape(",".join(str(v) for v in entry["box"]))}</div>')
     # Sortable values, kept as data so the page can order without re-rendering.
     sort_data = (f'data-clip="{"" if row.get("clip_max") is None else row["clip_max"]}" '
                  f'data-face="{"" if row.get("arcface_max") is None else row["arcface_max"]}" '
@@ -211,7 +243,7 @@ def _cell(row, images_prefix):
     return (f'<div class="card" data-id="{row["id"]}" data-decision="{row["decision"] or ""}" '
             f'data-reason="{escape(row["reason"] or "")}" {sort_data} '
             f'data-keys="{KEYS["accept"]}{KEYS["reject"]}{KEYS["fix"]}D">'
-            f'{pair}{body}{meta}{scores_line}<div class="id">{escape(row["id"])}</div>'
+            f'{pair}{body}{meta}{scores_line}{crop_lines}<div class="id">{escape(row["id"])}</div>'
             f'<div class="caption">{escape((row["caption"] or "")[:120])}</div>'
             f'{flags}<div class="buttons">{buttons}</div></div>')
 
@@ -227,6 +259,9 @@ def write_page(project, destination, *, images_prefix="/image", quota_plan=None,
         except Exception:  # noqa: BLE001 - a missing or broken score file must not hide the review page
             scores = {}
     rows = candidate_rows(project, images_prefix=images_prefix, scores=scores)
+    # A stored crop box renders with its card, so a reload shows what was measured (spec N7). Any score beside it is
+    # this session's, never a stored number: a model or reference change would make an old one wrong.
+    attach_crops(project, rows)
     # Near-duplicate groups (spec R7 P2): computed with the same pHash the scorer uses, shown as a number on each
     # grouped card, and filterable - grouped for review, never removed.
     dup_sizes = _duplicate_groups(project, rows)
@@ -352,6 +387,9 @@ _TEMPLATE = """<!doctype html>
   </select>
   <input id="crop-box" placeholder="x,y,w,h (0~1)" size="12">
   <button type="button" id="crop-run">재채점</button>
+  <label title="원본마다 다른 위치의 크롭을 지정합니다 (spec N7)">원본별
+   <input type="checkbox" id="crop-per-image"></label>
+  <button type="button" id="crop-clear" title="저장된 크롭을 모두 지웁니다">크롭 지우기</button>
   <span id="crop-state" style="color:#8a9"></span>
  </span>
 </div>
@@ -518,7 +556,20 @@ document.getElementById('crop-run').addEventListener('click', async () => {{
   const kind = document.getElementById('crop-preset').value || 'custom';
   cropState('채점 중…');
   try {{
-    const response = await fetch('/crop-score/' + card.dataset.id + '?kind=' + kind + '&box=' + parts.join(','));
+    // With 원본별 on, the box typed here belongs to every *reference* as well as the candidate, which is the
+    // assumption the audit found false for real datasets. So the request names no per-image boxes yet: it reports
+    // which references it could not measure, and the reviewer fills those in from /crops/<id> (spec N7).
+    const perImage = document.getElementById('crop-per-image').checked;
+    let url = '/crop-score/' + card.dataset.id + '?kind=' + kind + '&box=' + parts.join(',');
+    if (perImage) {{
+      const stored = await loadCrops(card.dataset.id);
+      const boxes = Object.entries(stored)
+        .filter(([key, row]) => row && row.box && (row.kind || 'face') === kind)
+        .map(([key, row]) => encodeURIComponent(key) + ':' + row.box.join(','))
+        .join(';');
+      if (boxes) {{ url += '&boxes=' + boxes; }}
+    }}
+    const response = await fetch(url);
     const data = await response.json();
     if (!response.ok) {{ cropState(data.error || 'failed'); return; }}
     const value = (data.max === null || data.max === undefined)
@@ -530,8 +581,34 @@ document.getElementById('crop-run').addEventListener('click', async () => {{
       const anchor = card.querySelector('.scores');
       if (anchor) {{ anchor.after(line); }} else {{ card.appendChild(line); }}
     }}
-    line.textContent = '크롭 ' + value + ' · box ' + parts.join(',');
-    cropState(card.dataset.id + ' → ' + value);
+    const detail = (data.unmeasured && data.unmeasured.length)
+      ? ' · 원본 ' + data.unmeasured.length + '장 박스 미지정' : '';
+    line.textContent = '크롭 ' + value + ' · box ' + parts.join(',') + detail;
+    card.dataset.cropBox = parts.join(',');
+    card.dataset.cropKind = kind;
+    card.dataset.cropMax = data.max === null || data.max === undefined ? '' : String(data.max);
+    cropState(card.dataset.id + ' → ' + value + detail);
+  }} catch (error) {{ cropState(String(error)); }}
+}});
+async function loadCrops(id) {{
+  try {{
+    const response = await fetch('/crops/' + encodeURIComponent(id));
+    if (!response.ok) return {{}};
+    const data = await response.json();
+    return data.crops || {{}};
+  }} catch (error) {{ return {{}}; }}
+}}
+document.getElementById('crop-clear').addEventListener('click', async () => {{
+  const card = cursorCard || cards()[0];
+  if (!card) {{ cropState('대상 카드가 없습니다'); return; }}
+  // Clearing only forgets the measurement; no image file is touched (spec N7).
+  try {{
+    const response = await fetch('/crop-clear/' + encodeURIComponent(card.dataset.id), {{method: 'POST'}});
+    const data = await response.json();
+    if (!response.ok) {{ cropState(data.error || 'failed'); return; }}
+    const line = card.querySelector('.crop-score');
+    if (line) line.remove();
+    cropState('크롭 기록을 지웠습니다 (' + (data.cleared || 0) + '장)');
   }} catch (error) {{ cropState(String(error)); }}
 }});
 document.getElementById('reset').addEventListener('click', () => {{
@@ -593,12 +670,131 @@ def _pixel_box(path, box):
     return pixel
 
 
-def crop_scores(project, candidate_id, box, *, name="face", embedder=None):
-    """The identity score of the user's crop, against the same crop of every original (spec R7 P2).
+def parse_crop_boxes(raw, *, decode=True):
+    """`id:x,y,w,h;id:x,y,w,h` into `{id: box}` (spec N7). Empty string means "no per-image boxes".
 
-    The box arrives in 0~1 fractions and is applied to the candidate **and to every reference original** - a face box
-    is only comparable with other face boxes, which is the rule the scorer already enforces by name. A lazy embedder
-    keeps the review page cheap until somebody actually asks for a re-score.
+    `decode` is on when the text has already been through `urllib.parse.parse_qs`, which is the HTTP path: a Windows
+    path arrives as `C%3A/x/y.png` and has to be turned back into `C:/x/y.png` to match a real file. A caller that
+    passes a string it built itself sets `decode=False` and gets its keys back unchanged.
+
+    A malformed entry is refused rather than skipped: silently dropping one image's box would score it with the
+    candidate's box and make the comparison look complete when it was not.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    out = {}
+    for chunk in text.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        key, sep, body = chunk.partition(":")
+        if not sep or not key.strip():
+            raise pj.ProjectError(f"이미지별 박스는 id:x,y,w,h 형식입니다: {chunk[:40]}")
+        # The last colon is the one before the numbers; a Windows drive letter puts an earlier one in the key.
+        key, sep, body = chunk.rpartition(":")
+        if not sep or not key.strip():
+            raise pj.ProjectError(f"이미지별 박스는 id:x,y,w,h 형식입니다: {chunk[:40]}")
+        name = unquote(key.strip()) if decode else key.strip()
+        out[name] = parse_crop_box(body)
+    return out
+
+
+def _now_stamp():
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def crop_store_path(project):
+    """Where the per-image crop boxes live: `experiments/crops.json` (spec N7).
+
+    A sidecar rather than a field on the candidate record, because a crop is a *reference* the reviewer chose, not
+    something the generator produced - and because a candidate's record is rewritten by other steps. Never inside the
+    image files themselves: the original bytes are never touched.
+    """
+    return Path(project.dir) / "experiments" / "crops.json"
+
+
+def read_crop_store(project):
+    """`{image_id_or_path: {"box": [...], "kind": ..., "image_sha256": ..., "at": ..., "by": ...}}`."""
+    path = crop_store_path(project)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_crop_store(project, data):
+    path = crop_store_path(project)
+    pj.write_json(path, data)
+    return path
+
+
+def _crop_key(project, path):
+    """How one image is named in the crop store: its candidate id when it has one, else its path."""
+    resolved = Path(path).resolve()
+    for record in project.candidates():
+        candidate = project.resolve_file(record.get("file"))
+        if candidate and Path(candidate).resolve() == resolved:
+            return record["id"]
+    for record in project.source_records():
+        source = project.resolve_file(record.get("file") or record.get("src_path"))
+        if source and Path(source).resolve() == resolved:
+            return record["id"]
+    return str(resolved)
+
+
+def crop_for(project, path, *, name=None, store=None):
+    """The stored box for this image under this kind, or None (spec N7).
+
+    `name` selects a box measured as a `face` or an `upper` crop; the store keeps them apart, because a face crop and
+    an upper-body crop are not comparable and mixing them would silently compare different regions.
+    """
+    store = read_crop_store(project) if store is None else store
+    entry = store.get(_crop_key(project, path))
+    if not isinstance(entry, dict):
+        return None
+    if name and str(entry.get("kind") or "") != str(name):
+        return None
+    box = entry.get("box")
+    if not isinstance(box, list) or len(box) != 4:
+        return None
+    return [float(v) for v in box]
+
+
+def set_crop(project, path, box, *, kind="face", by="user"):
+    """Record one image's crop box, with the image's SHA so a changed picture invalidates it (spec N7)."""
+    from . import lineage
+    data = read_crop_store(project)
+    key = _crop_key(project, path)
+    data[key] = {"box": [float(v) for v in box], "kind": str(kind),
+                 "image_sha256": lineage.sha256_file(path) if Path(path).is_file() else None,
+                 "at": _now_stamp(), "by": str(by), "path": str(path)}
+    write_crop_store(project, data)
+    return data[key]
+
+
+def crop_scores(project, candidate_id, box, *, name="face", embedder=None, boxes=None, store=True):
+    """The identity score of the user's crop, against the same crop of every original (spec R7 P2, N7).
+
+    The box arrives in 0~1 fractions. By default it is applied to the candidate **and to every reference original** -
+    a face box is only comparable with other face boxes, which is the rule the scorer already enforces by name. That
+    default assumes the face sits at the same fractions in every picture, which is not true of real datasets: the
+    audit's finding (`review.crop_scores` applying one box to all originals) was that a group shot and a head-and-
+    shoulders portrait put the face in very different places.
+
+    So `boxes` may carry a **per-image** box: `{path_or_id: box}`. Any image it does not name is reported as
+    unmeasured rather than silently scored with the candidate's box, and the result says which references were used.
+    `store=True` writes every box that was used into the project's crop sidecar, so a reloaded page restores what was
+    measured instead of losing it.
+
+    Model residency policy (spec N1): the embedder **stays resident on the GPU between requests** - reload per
+    request would make every re-score pay a model load - so the server process holds roughly the CLIP model's VRAM
+    (about 1.3 GB, measured) even when idle. What changes per request is the *compute*: the /crop-score/ handler
+    takes the common GPU claim for the request span, so concurrent training or generation refuses the re-score with
+    a 503 and the re-score never races a training run for the card.
     """
     from . import score as score_mod
     from .scorers import clip_vision
@@ -611,11 +807,21 @@ def crop_scores(project, candidate_id, box, *, name="face", embedder=None):
     references = score_mod.reference_paths(project)
     if not references:
         raise pj.ProjectError("비교할 사용자 원본이 없습니다")
+    per_image = {str(k): v for k, v in (boxes or {}).items()}
     paths = [Path(p) for p in references]
     paths.append(Path(target))
     crops = {}
+    used, unmeasured = {}, []
     for path in paths:
-        crops[path.name] = {name: _pixel_box(path, box)}
+        is_target = Path(path).resolve() == Path(target).resolve()
+        own = per_image.get(str(path)) or per_image.get(path.name) or per_image.get(_crop_key(project, path))
+        chosen = own if own is not None else box
+        if own is None and per_image and not is_target:
+            # The typed box is the *candidate's* box; a reference the request does not name has no box of its own, so
+            # it cannot be compared with the candidate's crop. Reported, never guessed (spec N7).
+            unmeasured.append(path.name)
+        crops[path.name] = {name: _pixel_box(path, chosen)}
+        used[path.name] = [float(v) for v in chosen]
     if embedder is None:
         embedder = crop_scores.embedder
         if embedder is None:
@@ -623,30 +829,89 @@ def crop_scores(project, candidate_id, box, *, name="face", embedder=None):
     result = clip_vision.identity_scores([Path(target)], [Path(p) for p in references], ids=[candidate_id],
                                          crops=crops, embedder=embedder)
     row = result["rows"][0]
+    if store:
+        try:
+            for path in paths:
+                set_crop(project, path, used[path.name], kind=name)
+        except OSError:
+            pass                     # a read-only project must not fail the measurement over its sidecar
     return {"id": candidate_id, "kind": name, "box": list(box),
+            "boxes": used, "per_image": bool(per_image), "unmeasured": unmeasured,
             "max": row.get(f"crop_{name}_max"), "mean": row.get(f"crop_{name}_mean"),
             "reference_count": row.get("reference_count")}
+
 
 
 crop_scores.embedder = None
 
 
-def make_server(project, port=8195, log=print, quota_plan=None, embedder_factory=None):
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer  # noqa: E402  (imported for the server class)
+
+
+class ExclusiveServer(ThreadingHTTPServer):
+    """A server that refuses to share its port, and says which build is answering (spec N5).
+
+    Windows lets a second `bind()` on a port the first server holds succeed, and requests then reach whichever server
+    started first - so a new review page could print "serving ... at 8195" while the browser talked to an old build
+    left running for days (`duplicate_review_bind`: the second bind succeeded and all eight requests went to the
+    first). `allow_reuse_address = False` plus `SO_EXCLUSIVEADDRUSE` on Windows is what makes the bind fail instead.
+    The started-at stamp and the source digest travel in every response, so a page can be asked which code it is.
+    """
+
+    allow_reuse_address = False
+
+    def server_bind(self):
+        if sys.platform == "win32":
+            import socket
+            # SO_EXCLUSIVEADDRUSE must be set before bind; SO_REUSEADDR (the F/Windows default in some builds) would
+            # otherwise let another process take the port.
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            except (AttributeError, OSError):
+                pass
+        super().server_bind()
+
+
+def code_identity():
+    """Which build of this module is running, so a page can be judged as current or not (spec N5).
+
+    A digest of the server's own source plus the process start time. The audit found a review server started the day
+    before still answering on the port, serving a page that had since lost its crop-score control; the response now
+    carries the identity a person or a test can compare against.
+    """
+    source = Path(__file__).read_bytes()
+    return {"code_sha256": hashlib.sha256(source).hexdigest()[:16],
+            "pid": os.getpid(), "started_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+
+
+def make_server(project, port=8195, log=print, quota_plan=None, embedder_factory=None, claim_factory=None,
+                exclusive=True):
     """Serve the review page for one project: the images, the decisions, and nothing else.
 
     `embedder_factory` builds the CLIP embedder the crop re-score uses, lazily on first use; tests inject a fake so
-    the page's GPU path is exercised without a model.
+    the page's GPU path is exercised without a model. `claim_factory` builds the GPU claim each /crop-score/
+    request takes (spec N1); tests inject one bound to a scratch folder so the page exercises the claim path
+    without touching the real automation/gpu.lock. `exclusive=False` lets a test bind port 0 freely; a real server
+    keeps the default.
     """
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from http.server import BaseHTTPRequestHandler
 
     root = Path(project.dir).resolve()
     embedder_state = {"embedder": None}
+    identity = {**code_identity(), "project": project.card.get("id")}
+
 
     def embedder():
         if embedder_state["embedder"] is None:
             from .scorers import clip_vision
             embedder_state["embedder"] = (embedder_factory or clip_vision.Embedder)()
         return embedder_state["embedder"]
+
+    def build_claim():
+        if claim_factory is not None:
+            return claim_factory()
+        from . import gpu
+        return gpu.claim_gpu(what="crop scoring")
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -657,6 +922,11 @@ def make_server(project, port=8195, log=print, quota_plan=None, embedder_factory
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
+            # Which build and which project answered (spec N5): a page that shows this can be told apart from an old
+            # server that kept the port. The header is on every response so even a plain image request carries it.
+            self.send_header("X-Review-Code", identity["code_sha256"])
+            self.send_header("X-Review-Project", str(identity["project"] or ""))
+            self.send_header("X-Review-Started", identity["started_at"])
             self.end_headers()
             self.wfile.write(data)
 
@@ -680,6 +950,11 @@ def make_server(project, port=8195, log=print, quota_plan=None, embedder_factory
         def do_GET(self):
             split = urllib.parse.urlsplit(self.path)
             path = split.path
+            if path == "/health":
+                # Which code is answering on this port (spec N5). The audit's stale server answered every review
+                # route from yesterday's build; this is the question a person or a GUI can actually ask it.
+                return self._send(200, json.dumps(identity, ensure_ascii=False),
+                                  "application/json; charset=utf-8")
             if path in ("/", "/index.html"):
                 page = root / "review.html"
                 write_page(project, page, quota_plan=quota_plan, log=lambda *_: None)
@@ -694,7 +969,24 @@ def make_server(project, port=8195, log=print, quota_plan=None, embedder_factory
                     if kind not in ("face", "upper", "custom"):
                         raise pj.ProjectError("크롭 이름은 face, upper 또는 custom입니다")
                     box = parse_crop_box((query.get("box") or [""])[0])
-                    row = crop_scores(project, candidate_id, box, name=kind, embedder=embedder())
+                    # A per-image box may arrive as `boxes=<id>:x,y,w,h;<id>:x,y,w,h` (spec N7). Anything it does not
+                    # name is reported as unmeasured rather than scored with the candidate's own box.
+                    boxes = parse_crop_boxes((query.get("boxes") or [""])[0])
+                    # The CLIP model runs on the one GPU, so a re-score takes the common GPU claim for the request
+                    # (spec N1). The model itself stays resident between requests - that policy is documented at
+                    # crop_scores(), and the VRAM it holds shows up in the read-only free-VRAM gate.
+                    claim = build_claim()
+                    from . import gpu as gpu_mod
+                    try:
+                        claim.acquire()
+                    except gpu_mod.GpuBusy as busy:
+                        return self._send(503, json.dumps({"error": str(busy)}, ensure_ascii=False),
+                                          "application/json; charset=utf-8")
+                    try:
+                        row = crop_scores(project, candidate_id, box, name=kind, embedder=embedder(),
+                                          boxes=boxes or None)
+                    finally:
+                        claim.release()
                 except pj.ProjectError as exc:
                     return self._send(400, json.dumps({"error": str(exc)}, ensure_ascii=False),
                                       "application/json; charset=utf-8")
@@ -703,9 +995,42 @@ def make_server(project, port=8195, log=print, quota_plan=None, embedder_factory
                                                       ensure_ascii=False), "application/json; charset=utf-8")
                 log(f"{candidate_id} crop {kind} max {row.get('max')}")
                 return self._send(200, json.dumps(row, ensure_ascii=False), "application/json; charset=utf-8")
+            if path.startswith("/crops/"):
+                # What the page restores after a reload: the boxes measured for this image, per kind (spec N7).
+                wanted = unquote(path[len("/crops/"):])
+                store = read_crop_store(project)
+                rows = {}
+                for key, value in store.items():
+                    if key != wanted and not (isinstance(value, dict) and str(value.get("path") or "").endswith(wanted)):
+                        continue
+                    if isinstance(value, dict):
+                        rows[str(value.get("kind") or "face")] = value
+                return self._send(200, json.dumps({"id": wanted, "crops": rows}, ensure_ascii=False),
+                                  "application/json; charset=utf-8")
             return self._send(404, "not found")
 
         def do_POST(self):
+            split = urllib.parse.urlsplit(self.path)
+            if split.path.startswith("/crop-clear/"):
+                # Forget the crop boxes recorded for one image (spec N7). No picture is touched: the store is a small
+                # JSON sidecar, and the images are the user's originals.
+                candidate_id = unquote(split.path[len("/crop-clear/"):])
+                try:
+                    store = read_crop_store(project)
+                    cleared = 0
+                    for key in list(store):
+                        value = store.get(key)
+                        if key == candidate_id or (isinstance(value, dict)
+                                                   and str(value.get("path") or "").endswith(candidate_id)):
+                            store.pop(key, None)
+                            cleared += 1
+                    if cleared:
+                        write_crop_store(project, store)
+                except OSError as exc:
+                    return self._send(500, json.dumps({"error": str(exc)}, ensure_ascii=False),
+                                      "application/json; charset=utf-8")
+                return self._send(200, json.dumps({"id": candidate_id, "cleared": cleared}, ensure_ascii=False),
+                                  "application/json; charset=utf-8")
             if self.path != "/decide":
                 return self._send(404, "not found")
             length = int(self.headers.get("Content-Length") or 0)
@@ -733,8 +1058,10 @@ def make_server(project, port=8195, log=print, quota_plan=None, embedder_factory
                                         "reason": state.get("reason"),
                                         "fixable": fixable(state)}))
 
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    log(f"serving {root} at http://127.0.0.1:{server.server_address[1]}/")
+    server = ExclusiveServer(("127.0.0.1", port), Handler)
+    server.code_identity = identity
+    log(f"serving {root} at http://127.0.0.1:{server.server_address[1]}/ "
+        f"(code {identity['code_sha256']}, pid {identity['pid']})")
     return server
 
 

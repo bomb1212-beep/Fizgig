@@ -48,6 +48,7 @@ class PipelineApp(tk.Tk):
         self.title("데이터셋 파이프라인 — Fizgig 자동화")
         self.geometry("1060x840")
         self.host = Host(self)
+        self.close_after = False
         style = ttk.Style(self)
         style.configure("Heading.TLabel", font=("맑은 고딕", 11, "bold"))
         style.configure("Muted.TLabel", foreground="#6a7480")
@@ -69,11 +70,30 @@ class PipelineApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.close)
 
     def close(self):
+        """Closing with a stage running ends that stage first (spec N2).
+
+        `cancel` is the same path the 취소 button takes: the stage's own marker first, then everything it started.
+        The window then waits for the stage's process to actually exit before destroying itself, so a tool2 run or a
+        trainer cannot be left behind holding the GPU - destroying immediately would end the Tk loop that reports the
+        result and leave the tree kill unobserved.
+        """
         if self.host.busy:
             if not messagebox.askyesno("실행 중", "단계가 실행 중입니다. 종료하고 닫을까요?\n"
                                                  "(이미 그려진 그림은 남습니다)"):
                 return
+            self.close_after = True
             self.dataset_view.cancel()
+            self._await_stage()
+            return
+        self._destroy_now()
+
+    def _await_stage(self):
+        if self.dataset_view.running is not None:
+            self.after(150, self._await_stage)
+            return
+        self._destroy_now()
+
+    def _destroy_now(self):
         self.dataset_view.destroy()
         self.destroy()
 

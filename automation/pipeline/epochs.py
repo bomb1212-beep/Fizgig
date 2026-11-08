@@ -160,12 +160,80 @@ def eval_dir(project, *, run_id=None):
     return project.dir / "experiments" / "epochs" / name
 
 
+# The manifest's own identity. Two plans are the same plan only when every one of these agrees (spec N3.1): the run,
+# the checkpoint bytes, the images the run learned from, the prompts, the seeds, the size, and the graph/model
+# fingerprints. Without this the file's existence was the whole test, so re-planning after a checkpoint was retrained
+# re-labelled the old pictures as the new checkpoint's evidence.
+PLAN_IDENTITY_KEYS = ("run", "training_snapshot", "size", "seeds", "prompts", "checkpoints", "graph", "models")
+
+
+def plan_identity(manifest):
+    """The canonical JSON of everything that decides what a cell's picture means.
+
+    Deliberately excludes `created_at`, `tasks` and `status`: those describe this manifest's own run, not what a
+    picture in it is evidence of.
+    """
+    payload = {key: manifest.get(key) for key in PLAN_IDENTITY_KEYS}
+    payload["checkpoints"] = [{"epoch": int(row.get("epoch")) if row.get("epoch") is not None else None,
+                               "name": row.get("name"), "sha256": row.get("sha256"),
+                               "size": row.get("size")}
+                              for row in (manifest.get("checkpoints") or [])]
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def plan_id(manifest):
+    """A short, stable name for this plan's identity. Used to keep different plans' pictures apart on disk."""
+    return hashlib.sha256(plan_identity(manifest).encode("utf-8")).hexdigest()[:12]
+
+
+def graph_fingerprint():
+    """What the drawing graph is, independent of which checkpoint it loads.
+
+    The builder's own source is the fingerprint: a prompt that draws one way today has to be recognisable as a
+    different graph tomorrow, and a version string somebody remembers to bump does not do that.
+    """
+    source = Path(krea2_gen.__file__).read_bytes()
+    return {"builder": Path(krea2_gen.__file__).name,
+            "sha256": hashlib.sha256(source).hexdigest()[:16]}
+
+
+def model_fingerprint(family="krea2"):
+    """The model files this grid will load, by path and size, or an empty dict when they cannot be resolved.
+
+    Not a load and not a hash of gigabytes: the resolved paths and their sizes are what a wrong model swap changes,
+    and `models.problems()` already checks existence. A resolver failure is recorded as unknown rather than raised -
+    `plan` without a configured ComfyUI is a legitimate dry run.
+    """
+    try:
+        rows = models.rows(family)
+    except Exception:                      # noqa: BLE001 - an unreadable config must not stop a plan
+        return {}
+    out = {}
+    for row in rows or []:
+        name = row.get("role") or row.get("name")
+        path = row.get("path")
+        if not name or not path:
+            continue
+        try:
+            size = Path(path).stat().st_size
+        except OSError:
+            size = None
+        out[str(name)] = {"path": str(path), "size": size}
+    return out
+
+
 def plan(project, *, run_folder, epochs=None, seeds=EVAL_SEEDS, prompts=None, size=None, snapshot=None,
          log=print):
     """Write the work list for one run's checkpoints. Returns the manifest, which `run()` then executes.
 
     `epochs` narrows the grid to named checkpoints; the default is every usable one, because an epoch that looks bad by
     loss can still be the one that draws the character best and leaving it out would hide it.
+
+    A re-plan of a *different* identity writes itself beside the old plan instead of over it (spec N3.1): the previous
+    manifest and every picture it accounted for stay where they are, under their own `plan-<id>` folder. Only the
+    current plan lives at `epochs.json`; the old ones are `epochs-<id>.json` next to it. Without that, re-planning after
+    a checkpoint changed made the next `run()` see the old PNGs, call them "already done", and `choose()` then accepted
+    bytes that never drew them.
     """
     run_folder = Path(run_folder)
     output = run_folder / "output"
@@ -183,7 +251,8 @@ def plan(project, *, run_folder, epochs=None, seeds=EVAL_SEEDS, prompts=None, si
     prompts = list(prompts or EVAL_PROMPTS)
     seeds = tuple(int(s) for s in seeds)
     size = dict(size or _size_from(project))
-    manifest_path = eval_dir(project, run_id=run_folder.name) / "epochs.json"
+    folder = eval_dir(project, run_id=run_folder.name)
+    manifest_path = folder / "epochs.json"
     manifest = {
         "kind": "epoch_grid",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -197,9 +266,14 @@ def plan(project, *, run_folder, epochs=None, seeds=EVAL_SEEDS, prompts=None, si
         "seeds": list(seeds),
         "prompts": prompts,
         "checkpoints": [{k: row.get(k) for k in ("file", "name", "epoch", "sha256", "size")} for row in chosen],
+        # What drew the pictures, beyond which checkpoint: the builder source and the model files (spec N3.1).
+        "graph": graph_fingerprint(),
+        "models": model_fingerprint(),
         "tasks": [],
         "status": "planned",
     }
+    manifest["plan_id"] = plan_id(manifest)
+    # Cells land under the plan's own folder, so a picture from one plan can never be read as another's work.
     for row in chosen:
         for prompt in prompts:
             for seed in seeds:
@@ -211,13 +285,30 @@ def plan(project, *, run_folder, epochs=None, seeds=EVAL_SEEDS, prompts=None, si
                     "category": prompt.get("category"),
                     "prompt": prompt_for(project.card, prompt),
                     "seed": seed,
-                    "file": f"images/e{int(row['epoch']):03d}/{prompt['id']}__s{seed}.png",
+                    "file": f"plan-{manifest['plan_id']}/e{int(row['epoch']):03d}/{prompt['id']}__s{seed}.png",
                     "status": "pending",
                 })
+    folder.mkdir(parents=True, exist_ok=True)
+    previous = None
+    if manifest_path.is_file():
+        try:
+            previous = _read_json(manifest_path)
+        except (OSError, ValueError):
+            previous = None
+    if previous and plan_id(previous) != manifest["plan_id"]:
+        # Preserve the old plan under its own name before the current one takes `epochs.json`. The old pictures are
+        # already in `plan-<old id>/`, which this plan does not read, so they stay with the manifest that names them.
+        archive = folder / f"epochs-{plan_id(previous)}.json"
+        if not archive.is_file():
+            write_manifest(archive, previous)
+        log(f"[epochs] an earlier plan ({plan_id(previous)}) is kept at {archive.name}; "
+            f"it drew {sum(1 for t in previous.get('tasks') or [] if t.get('status') == 'done')} cell(s)")
+        manifest["supersedes"] = {"plan_id": plan_id(previous), "manifest": archive.name}
     write_manifest(manifest_path, manifest)
     log(f"[epochs] {len(chosen)} checkpoint(s) x {len(prompts)} prompt(s) x {len(seeds)} seed(s) "
-        f"= {len(manifest['tasks'])} image(s) -> {manifest_path.parent}")
+        f"= {len(manifest['tasks'])} image(s) -> {manifest_path.parent} (plan {manifest['plan_id']})")
     return manifest
+
 
 
 def _size_from(project):
@@ -292,11 +383,55 @@ def pending(manifest):
     return [task for task in manifest["tasks"] if task["status"] in ("pending", "failed")]
 
 
+def _sha256_of(path):
+    import hashlib as _hashlib
+    digest = _hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def cell_state(out, task):
+    """Is this cell's picture really the plan's picture? (spec N3.2)
+
+    A file's existence was the whole test before, so a truncated write, a decode failure or a PNG left by a different
+    plan all counted as "already drawn". The checks here are the cheap ones that catch exactly those: the file decodes,
+    its recorded SHA matches when one was recorded, and its checkpoint SHA still equals the plan's. A cell that fails
+    any of them is *not* done - it is re-drawn (or reported, never silently adopted).
+
+    Returns `(state, reason)` where state is "done", "redraw" or "adopt" (a decodable file with no recorded SHA, which
+    can only be the leftover of an interrupted save of this same plan's own picture).
+    """
+    if not out.is_file():
+        return "pending", None
+    try:
+        from PIL import Image
+        with Image.open(out) as image:
+            image.load()
+    except Exception as exc:               # noqa: BLE001 - a broken file is the point, not a crash
+        return "redraw", f"the file does not decode ({type(exc).__name__})"
+    recorded = task.get("sha256")
+    if recorded:
+        actual = _sha256_of(out)
+        if actual != recorded:
+            return "redraw", "the bytes are not the ones this plan recorded"
+        return "done", None
+    # No SHA recorded: the manifest was written after the picture but before the hash (an interrupted save). The file
+    # decodes and its checkpoint is checked by the caller, so it can be adopted - but only by recording what it is,
+    # never by leaving it unaccounted for.
+    return "adopt", None
+
+
 def run(project, manifest, *, client, names, log=print, cancel=None):
-    """Draw the pending cells. A cell whose file already exists is skipped, so rerunning adds no GPU work.
+    """Draw the pending cells. A cell whose file already exists *and checks out* is skipped (spec N3.2).
 
     That skip is the whole resumability story here: the grid is a few hundred images, an evaluation is interrupted by
-    the same things a training run is, and a rerun has to continue rather than start again.
+    the same things a training run is, and a rerun has to continue rather than start again. What was a bare
+    `out.is_file()` is now `cell_state()`: a truncated PNG, a file whose bytes do not match the recorded SHA, or one
+    left by a plan with other checkpoints is re-drawn instead of being counted as work already done.
+
+    Returns `(done, skipped, failed)`.
     """
     manifest_path = manifest_path_of(project, manifest["run"]["folder"])
     exp = manifest_path.parent
@@ -305,11 +440,28 @@ def run(project, manifest, *, client, names, log=print, cancel=None):
     uploaded = {}
     for task in manifest["tasks"]:
         out = exp / task["file"]
-        if out.is_file():
-            if task["status"] != "done":
+        state, reason = cell_state(out, task)
+        if state == "redraw":
+            log(f"  e{int(task['epoch']):03d} {task['prompt_id']} s{task['seed']}: redrawing ({reason})")
+        if state in ("done", "adopt"):
+            checkpoint = by_epoch.get(int(task["epoch"]))
+            # The picture is only this plan's if the checkpoint it was drawn with still has the planned bytes. A
+            # retrained checkpoint under the same name is a different epoch, not a resumable one.
+            if checkpoint and checkpoint.get("sha256") and Path(checkpoint["file"]).is_file() \
+                    and lineage.sha256_file(checkpoint["file"]) != checkpoint.get("sha256"):
+                state = "redraw"
+                reason = "the checkpoint's bytes changed since this plan was written"
+                log(f"  e{int(task['epoch']):03d} {task['prompt_id']} s{task['seed']}: redrawing ({reason})")
+            else:
+                if state == "adopt":
+                    task["sha256"] = _sha256_of(out)
+                    log(f"  e{int(task['epoch']):03d} {task['prompt_id']} s{task['seed']}: adopted an unhashed "
+                        "picture from this plan (recorded its sha256)")
                 task["status"] = "done"
-            skipped += 1
-            continue
+                task.pop("error", None)
+                skipped += 1
+                write_manifest(manifest_path, manifest)
+                continue
         if cancel is not None and cancel():
             log("cancelled")
             break
@@ -334,6 +486,12 @@ def run(project, manifest, *, client, names, log=print, cancel=None):
             out.parent.mkdir(parents=True, exist_ok=True)
             client.run(graph, out, slot_id=task["prompt_id"], method=f"krea2_b_e{int(task['epoch']):03d}",
                        seed=task["seed"])
+            # Verify what the client wrote before calling it done: a client that returns without a complete picture
+            # (a truncated download) must not leave a cell marked "done" for the next resume to trust.
+            check, why = cell_state(out, {k: v for k, v in task.items() if k != "sha256"})
+            if check == "redraw":
+                raise EpochError(f"the written file is not usable: {why}")
+            task["sha256"] = _sha256_of(out)
             task["status"] = "done"
             done += 1
             log(f"  e{int(task['epoch']):03d} {task['prompt_id']} s{task['seed']}: {time.time() - started:.0f}s")
@@ -345,10 +503,17 @@ def run(project, manifest, *, client, names, log=print, cancel=None):
         finally:
             task["seconds"] = round(time.time() - started, 1)
             write_manifest(manifest_path, manifest)
-    manifest["status"] = "ran"
+    # The status says what actually happened, so a caller cannot read a half-drawn grid as a finished one (spec N3.3).
+    if failed and not done and not skipped:
+        manifest["status"] = "failed"
+    elif failed or any(t["status"] in ("pending", "failed") for t in manifest["tasks"]):
+        manifest["status"] = "partial"
+    else:
+        manifest["status"] = "ran"
     write_manifest(manifest_path, manifest)
-    log(f"done {done}, skipped {skipped} already present, failed {failed}")
+    log(f"done {done}, skipped {skipped} already present, failed {failed} ({manifest['status']})")
     return done, skipped, failed
+
 
 
 # ---------------------------------------------------------------------------------------------------- the decision
@@ -392,8 +557,13 @@ def choose(project, *, run_folder, epoch, by="user", note="", log=print):
         "checkpoint_sha256": digest,
         "training_snapshot": (manifest.get("training_snapshot") or {}).get("id"),
         "eval": {"folder": str(manifest_path_of(project, run_folder).parent),
+                 "plan_id": manifest.get("plan_id"),
                  "size": manifest["size"], "seeds": manifest["seeds"],
                  "prompts": [p["id"] for p in manifest["prompts"]]},
+        # Which cells of this epoch actually backed the comparison, and which did not (spec N3.3): a choice recorded
+        # over a half-drawn grid is still a choice, but it must not read as if every cell had been seen.
+        "grid": grid_state(manifest, epoch=int(epoch),
+                           folder=manifest_path_of(project, run_folder).parent),
         "decided": {"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "by": by, "note": note},
     }
     with project.guard():
@@ -408,6 +578,28 @@ def choose(project, *, run_folder, epoch, by="user", note="", log=print):
     log(f"[epochs] epoch {epoch} of {manifest['run']['id']} recorded "
         f"(checkpoint {row['name']}, training snapshot {(entry['training_snapshot'] or 'unknown')})")
     return entry
+
+
+def grid_state(manifest, *, epoch=None, folder=None):
+    """What the grid actually holds for one epoch (or all of them): drawn, pending, failed, unverified.
+
+    `choose()` records this so a person reading the card later can see whether the epoch was judged on a full grid or
+    on three cells out of sixteen - the number the old manifest could not answer, because `status` was just "ran"
+    whatever happened.
+    """
+    tasks = [t for t in manifest["tasks"] if epoch is None or int(t["epoch"]) == int(epoch)]
+    drawn = [t for t in tasks if t.get("status") == "done"]
+    return {
+        "cells": len(tasks),
+        "drawn": len(drawn),
+        "pending": len([t for t in tasks if t.get("status") == "pending"]),
+        "failed": len([t for t in tasks if t.get("status") == "failed"]),
+        # A drawn cell whose recorded SHA cannot be re-read is not evidence anyone can check.
+        "unverified": len([t for t in drawn if not t.get("sha256")]),
+        "status": manifest.get("status"),
+        "plan_id": manifest.get("plan_id"),
+        "folder": str(folder) if folder is not None else None,
+    }
 
 
 def chosen(project, run_folder=None):
@@ -459,44 +651,99 @@ def sheet_clip_path(project, run_folder):
     return manifest_path_of(project, run_folder).parent / "grid_clip.json"
 
 
+def clip_cache_identity(project, run_folder, manifest):
+    """What a cell score is a measurement *of* (spec N3.4).
+
+    A score keyed only by `(prompt_id, epoch, seed)` survives every change that invalidates it: new bytes for the
+    picture, an edited original it is compared against, a re-cropped reference, a different scorer. So the cache is
+    keyed by this identity instead - the picture's SHA, the reference set's SHAs, the crop policy, and the scorer's
+    own name/version - and a mismatched identity means "measure again", never "reuse the old number".
+    """
+    from . import score as score_mod
+    references = []
+    for path in score_mod.reference_paths(project):
+        try:
+            references.append({"path": str(path), "sha256": lineage.sha256_file(path)})
+        except OSError:
+            references.append({"path": str(path), "sha256": None})
+    return {
+        "plan_id": manifest.get("plan_id"),
+        "references": references,
+        # The crop policy in force. There is one today (whole frame); recording it means a future cropped score
+        # cannot be mistaken for a whole-frame one.
+        "crop": "whole-frame",
+        "scorer": clip_vision_descriptor(),
+    }
+
+
+def clip_vision_descriptor():
+    """The scorer's identity: its module name, its model id, and the file it loaded from."""
+    from .scorers import clip_vision
+    path = Path(getattr(clip_vision, "__file__", "") or "")
+    return {
+        "module": "pipeline.scorers.clip_vision",
+        "model": getattr(clip_vision, "MODEL_ID", None) or getattr(clip_vision, "MODEL", None),
+        "source_sha256": lineage.sha256_file(path) if path.is_file() else None,
+    }
+
+
 def sheet_clip_scores(project, run_folder, *, embedder=None, log=print):
-    """{(prompt_id, epoch, seed): clip_max} for every drawn cell, against the user's originals (spec R7 P2).
+    """{(prompt_id, epoch, seed): clip_max} for every drawn cell, against the user's originals (spec R7 P2, N3.4).
 
     This is the auxiliary sort the comparison sheet offers: it says which epoch drew a composition closest to the
     character, per cell, so the human eye starts at the strong candidates. It is a measurement laid over the grid,
     never a decision. The scores are written beside the sheet so it can be re-rendered without touching the GPU.
+
+    The sidecar records the identity it was measured under and the SHA of every cell it scored. A cache whose identity
+    does not hold is not reused: it is replaced, because a stale number here is a wrong hint next to a person's
+    judgement.
     """
     from . import score as score_mod
     from .scorers import clip_vision
     manifest = read_manifest(manifest_path_of(project, run_folder))
-    exp = manifest_path_of(project, run_folder).parent
+    folder = manifest_path_of(project, run_folder).parent
     refs = score_mod.reference_paths(project)
     if not refs:
         raise EpochError("no user originals to compare against, so the grid cannot be scored")
-    cells = [((t["prompt_id"], int(t["epoch"]), int(t["seed"])), exp / t["file"])
-             for t in manifest["tasks"] if (exp / t["file"]).is_file()]
+    cells = [((t["prompt_id"], int(t["epoch"]), int(t["seed"])), folder / t["file"], t)
+             for t in manifest["tasks"] if (folder / t["file"]).is_file()]
     if not cells:
         raise EpochError("no drawn cell to score; run the grid first")
+    identity = clip_cache_identity(project, run_folder, manifest)
     embedder = embedder or clip_vision.Embedder()
     scores = {}
     batch = 8
     for start in range(0, len(cells), batch):
         chunk = cells[start:start + batch]
         result = clip_vision.identity_scores(
-            [path for _key, path in chunk], refs,
-            ids=["|".join(str(part) for part in key) for key, _path in chunk], embedder=embedder)
+            [path for _key, path, _task in chunk], refs,
+            ids=["|".join(str(part) for part in key) for key, _path, _task in chunk], embedder=embedder)
         for row in result["rows"]:
             prompt_id, epoch, seed = str(row["id"]).split("|")
             scores[(prompt_id, int(epoch), int(seed))] = row.get("max_cosine")
     sidecar = sheet_clip_path(project, run_folder)
-    sidecar.write_text(json.dumps({ "|".join(str(part) for part in key): value
-                                    for key, value in scores.items() }, ensure_ascii=False, indent=1),
-                       encoding="utf-8")
+    payload = {
+        "identity": identity,
+        "cells": {"|".join(str(part) for part in key):
+                  {"max": value,
+                   "sha256": lineage.sha256_file(path) if path.is_file() else None}
+                  for key, path, _task in cells for value in [scores.get(key)]},
+    }
+    sidecar.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
     log(f"[epochs] {len(scores)} cell score(s) -> {sidecar}")
     return scores
 
 
-def _read_clip_sidecar(project, run_folder):
+
+def _read_clip_sidecar(project, run_folder, *, manifest=None, log=print):
+    """The cached CLIP sort, but only when it is still a measurement of *these* cells (spec N3.4).
+
+    The old reader returned whatever numbers the file held, keyed by `(prompt_id, epoch, seed)`. That key does not
+    change when the picture behind it is redrawn, when an original it is compared against is edited, or when the
+    scorer changes, so a stale hint could sit next to a person's judgement for ever. Now the sidecar carries the
+    identity it was measured under and each cell's SHA; a sidecar that cannot prove it measured these bytes is
+    discarded with a reason, and the sheet is rendered without the sort rather than with a wrong one.
+    """
     sidecar = sheet_clip_path(project, run_folder)
     if not sidecar.is_file():
         return None
@@ -504,13 +751,43 @@ def _read_clip_sidecar(project, run_folder):
         raw = json.loads(sidecar.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+    if not isinstance(raw, dict):
+        return None
+    cells = raw.get("cells")
+    if not isinstance(cells, dict):
+        # The pre-N3 shape: bare {key: value}. It cannot prove what it measured, so it is not reused.
+        log("[epochs] the CLIP sidecar predates the identity check; ignoring it (re-run sheet --clip)")
+        return None
+    if manifest is None:
+        try:
+            manifest = read_manifest(manifest_path_of(project, run_folder))
+        except EpochError:
+            return None
+    recorded = raw.get("identity")
+    if recorded != clip_cache_identity(project, run_folder, manifest):
+        log("[epochs] the CLIP sidecar was measured under a different identity (references, crop policy, scorer or "
+            "plan changed); ignoring it (re-run sheet --clip)")
+        return None
+    folder = manifest_path_of(project, run_folder).parent
+    by_key = {"|".join((t["prompt_id"], str(int(t["epoch"])), str(int(t["seed"])))): t
+              for t in manifest["tasks"]}
     out = {}
-    for key, value in raw.items():
+    for key, row in cells.items():
         parts = str(key).split("|")
-        if len(parts) != 3 or value is None:
+        if len(parts) != 3 or not isinstance(row, dict) or row.get("max") is None:
             continue
-        out[(parts[0], int(parts[1]), int(parts[2]))] = float(value)
+        task = by_key.get(key)
+        if task is None:
+            continue
+        picture = folder / task["file"]
+        # The picture scored must still be the picture on disk. A redrawn cell invalidates its own number.
+        current = lineage.sha256_file(picture) if picture.is_file() else None
+        if row.get("sha256") and current != row.get("sha256"):
+            log(f"[epochs] cell {key} changed since it was scored; dropping its cached score")
+            continue
+        out[(parts[0], int(parts[1]), int(parts[2]))] = float(row["max"])
     return out
+
 
 
 _CLIP_SORT_TOOLS = """
@@ -561,7 +838,7 @@ def write_sheet(project, run_folder, log=print, clip_scores=None):
     stays a person's.
     """
     if clip_scores is None:
-        clip_scores = _read_clip_sidecar(project, run_folder)
+        clip_scores = _read_clip_sidecar(project, run_folder, log=log)
     manifest = read_manifest(manifest_path_of(project, run_folder))
     exp = manifest_path_of(project, run_folder).parent
     by_key = {(t["prompt_id"], int(t["epoch"]), int(t["seed"])): t for t in manifest["tasks"]}
@@ -659,11 +936,51 @@ def _read_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8-sig"))
 
 
+def run_has_checkpoints(run_folder):
+    """Does this run folder hold at least one `.safetensors` a grid could draw with?
+
+    Counting a run by its folder existing made an aborted run - started, stopped during text-encoder caching, zero
+    checkpoints - a candidate for "the only run", so a project with one good run and one dead one had to be named by
+    hand every time (spec N5 `aborted_run_blocks_find_run`). The folder is still reported, never deleted.
+    """
+    folder = Path(run_folder)
+    for candidate in (folder / "output", folder):
+        if candidate.is_dir() and any(candidate.glob("*.safetensors")):
+            return True
+    return False
+
+
+def run_rows(project):
+    """Every run under the project, with what makes it usable for evaluation (spec N5's run list).
+
+    Returns `[{name, folder, snapshot, checkpoints, usable, state}]`, newest path first. A run with zero checkpoints
+    is `usable: False` and carries the reason in `state`; it is listed because a person needs to see that it exists
+    and that it will not be offered.
+    """
+    base = Path(project.dir) / "seed_lora"
+    if not base.is_dir():
+        return []
+    rows = []
+    for path in sorted(base.glob("*/runs/*")):
+        if not path.is_dir():
+            continue
+        snapshot = path.parent.parent.name
+        output = path / "output"
+        count = len(list((output if output.is_dir() else path).glob("*.safetensors")))
+        state = _run_state(path) or {}
+        rows.append({"name": path.name, "folder": str(path), "snapshot": snapshot,
+                     "checkpoints": count, "usable": count > 0,
+                     "complete": bool(state.get("complete")),
+                     "state": state.get("active_stage") or ("finished" if state.get("complete") else None)})
+    return rows
+
+
 def find_run(project, run_id=None):
-    """The run folder to evaluate: the one named, or the only one the project has.
+    """The run folder to evaluate: the one named, or the only usable one the project has.
 
     The seed snapshot id and the run id are different things and neither can be derived from the other, so this only
-    ever returns a folder it actually found.
+    ever returns a folder it actually found. A run with no checkpoints is not a candidate (spec N5): it cannot be
+    evaluated, and counting it made a project with one live run and one aborted one demand a `--run` every time.
     """
     base = project.dir / "seed_lora"
     runs = sorted((base).glob("*/runs/*")) if base.is_dir() else []
@@ -671,14 +988,24 @@ def find_run(project, run_id=None):
     if run_id:
         for path in runs:
             if path.name == run_id or path.parent.parent.name == run_id:
+                if not run_has_checkpoints(path):
+                    raise EpochError(f"run {path.name} has no checkpoints yet (stopped before the first save); "
+                                     "nothing to evaluate - finish or restart the training run")
                 return path
         raise EpochError(f"no run {run_id!r} under {base}")
     if not runs:
         raise EpochError(f"no training run under {base}; train a seed first")
-    if len(runs) > 1:
+    usable = [path for path in runs if run_has_checkpoints(path)]
+    skipped = [path for path in runs if not run_has_checkpoints(path)]
+    if not usable:
+        raise EpochError("none of the " + str(len(runs)) + " run(s) under " + str(base)
+                         + " has a checkpoint yet: " + ", ".join(path.name for path in skipped))
+    if len(usable) > 1:
         raise EpochError("more than one run under " + str(base) + "; name one with --run: "
-                         + ", ".join(path.name for path in runs))
-    return runs[0]
+                         + ", ".join(path.name for path in usable)
+                         + (f" (skipped, no checkpoints: {', '.join(p.name for p in skipped)})" if skipped else ""))
+    return usable[0]
+
 
 
 def resolve_names(client, log=print):
@@ -758,34 +1085,62 @@ def main(argv=None):
         return 0
 
     if args.command == "run":
-        manifest = read_manifest(manifest_path_of(project, run_folder))
-        client = make_client(args.comfy)
-        if not client.ping():
-            raise EpochError(f"ComfyUI is not answering at {client.url}; start it (see HANDOFF 8.1 for the UTF-8 "
-                             "requirement)")
-        problems = models.problems("krea2", require_optional=("krea2_turbo_lora",))
-        if problems:
-            raise EpochError("model problems: " + "; ".join(problems))
-        names = resolve_names(client)
-        # A GUI (or a person at a terminal) pauses by creating this file; the check happens between cells, so every
-        # picture already drawn stays a complete picture and a rerun picks up from there.
-        cancel = make_cancel(args.cancel_file)
-        run(project, manifest, client=client, names=names, cancel=cancel)
-        if cancel is not None and cancel():
+        # The GPU claim covers the whole grid (spec N1): every cell submits to the same card training may be using.
+        from . import gpu
+        claim = gpu.claim_gpu(what="the epoch grid")
+        claim.acquire()
+        try:
+            manifest = read_manifest(manifest_path_of(project, run_folder))
+            client = make_client(args.comfy)
+            if not client.ping():
+                raise EpochError(f"ComfyUI is not answering at {client.url}; start it (see HANDOFF 8.1 for the UTF-8 "
+                                 "requirement)")
+            problems = models.problems("krea2", require_optional=("krea2_turbo_lora",))
+            if problems:
+                raise EpochError("model problems: " + "; ".join(problems))
+            names = resolve_names(client)
+            # A GUI (or a person at a terminal) pauses by creating this file; the check happens between cells, so every
+            # picture already drawn stays a complete picture and a rerun picks up from there.
+            cancel = make_cancel(args.cancel_file)
+            gpu.vram_gate("krea2", "draw")
+            done, skipped, failed = run(project, manifest, client=client, names=names, cancel=cancel)
+        finally:
+            claim.release()
+        paused = cancel is not None and cancel()
+        if paused:
             print("paused: the remaining cells are still pending, so this command continues them")
+        # The exit code tells the truth about the work (spec N3.3): a grid with any failed cell did not finish, and a
+        # caller that read exit 0 as "the plan is done" would call a half-drawn grid complete. A pause is not a
+        # failure - the pictures that were drawn are intact and a rerun continues - but it is not a finish either,
+        # so it is reported in words while still exiting 0.
+        if failed:
+            print(f"[epochs] {failed} cell(s) failed; {done} drawn, {skipped} already present", file=sys.stderr)
+            return 1
+        if any(t["status"] in ("pending", "failed") for t in manifest["tasks"]):
+            print(f"[epochs] {len(manifest['tasks']) - done - skipped} cell(s) still pending", file=sys.stderr)
+            return 1 if not paused else 0
         return 0
 
     if args.command == "sheet":
         clip_scores = None
         if args.clip:
             # The auxiliary sort needs scores; they cost one scoring pass over the drawn cells and are cached
-            # beside the sheet, so re-rendering costs nothing (spec R7 P2).
-            clip_scores = sheet_clip_scores(project, run_folder, log=log)
+            # beside the sheet, so re-rendering costs nothing (spec R7 P2). The CLIP model runs on the same GPU,
+            # so the scoring pass takes the common claim too (spec N1). `log` was never defined in this scope -
+            # `sheet --clip` died with a NameError before calling the scorer at all (spec N3.4).
+            from . import gpu
+            claim = gpu.claim_gpu(what="the epoch sheet CLIP scoring")
+            claim.acquire()
+            try:
+                clip_scores = sheet_clip_scores(project, run_folder, log=print)
+            finally:
+                claim.release()
         path = write_sheet(project, run_folder, clip_scores=clip_scores)
         if args.serve:
             import webbrowser
             webbrowser.open(path.as_uri())
         return 0
+
 
     if args.command == "choose":
         if args.epoch is None:

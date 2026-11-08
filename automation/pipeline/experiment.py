@@ -981,27 +981,35 @@ def cmd_plan(args):
 
 def cmd_run(args):
     manifest = read_manifest(args.out)
-    settings = models.comfy_settings()
-    client = comfy_mod.Comfy(settings["url"], comfy_root=settings["root"],
-                             timeout=int(settings.get("request_timeout") or 1800),
-                             journal=(AUTO / "state" / "prompt_journal"))
-    if not client.ping():
-        print(f"ComfyUI is not answering at {client.url}", file=sys.stderr)
-        return 1
-    problems = models.problems("krea2", require_optional=("krea2_turbo_lora",))
-    if problems:
-        print("model problems: " + "; ".join(problems), file=sys.stderr)
-        return 1
-    names = resolve_krea2_names(client, models.resolve("krea2"))
-    style_path = models.overrides("krea2").get("krea2_style_lora")
-    if any(t.get("variant") == "c" for t in manifest["tasks"]):
-        names["style_lora"] = client.name_for("lora", style_path) if style_path else None
-    seed_lora = manifest["character"].get("seed_lora") or {}
-    lora_dir = Path(args.lora_dir or seed_lora.get("dir") or "")
-    if not lora_dir.is_dir():
-        print(f"the character LoRA folder does not exist: {lora_dir}", file=sys.stderr)
-        return 1
-    done, skipped, failed, missing = run(args.out, manifest, client=client, names=names, lora_dir=lora_dir)
+    # The GPU claim covers the whole M0 run (spec N1): it submits graphs to the same card training may be using.
+    from . import gpu
+    claim = gpu.claim_gpu(what="the M0 experiment run")
+    claim.acquire()
+    try:
+        settings = models.comfy_settings()
+        client = comfy_mod.Comfy(settings["url"], comfy_root=settings["root"],
+                                 timeout=int(settings.get("request_timeout") or 1800),
+                                 journal=(AUTO / "state" / "prompt_journal"))
+        if not client.ping():
+            print(f"ComfyUI is not answering at {client.url}", file=sys.stderr)
+            return 1
+        problems = models.problems("krea2", require_optional=("krea2_turbo_lora",))
+        if problems:
+            print("model problems: " + "; ".join(problems), file=sys.stderr)
+            return 1
+        names = resolve_krea2_names(client, models.resolve("krea2"))
+        style_path = models.overrides("krea2").get("krea2_style_lora")
+        if any(t.get("variant") == "c" for t in manifest["tasks"]):
+            names["style_lora"] = client.name_for("lora", style_path) if style_path else None
+        seed_lora = manifest["character"].get("seed_lora") or {}
+        lora_dir = Path(args.lora_dir or seed_lora.get("dir") or "")
+        if not lora_dir.is_dir():
+            print(f"the character LoRA folder does not exist: {lora_dir}", file=sys.stderr)
+            return 1
+        gpu.vram_gate("krea2", "draw")
+        done, skipped, failed, missing = run(args.out, manifest, client=client, names=names, lora_dir=lora_dir)
+    finally:
+        claim.release()
     print(f"generated {done}, skipped {skipped}, failed {failed}, missing {missing}")
     return 1 if failed else 0
 

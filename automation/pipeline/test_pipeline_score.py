@@ -72,6 +72,11 @@ class FakeProject:
     def quotas(self, planned):
         return {slot: {"target": int(t), "accepted": 0, "short": int(t)} for slot, t in planned.items()}
 
+    def holdout_entry(self):
+        # spec N4.5: the general reference set excludes the frozen holdout, so every scorer asks the project which
+        # ids those are. A fake that cannot answer would let the exclusion go untested here.
+        return dict(self.card.get("holdout") or {"ids": []})
+
 
 def write_png(path, colour=(255, 255, 255)):
     from PIL import Image

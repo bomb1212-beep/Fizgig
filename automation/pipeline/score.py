@@ -31,15 +31,38 @@ def scores_path(project):
     return project.dir / "experiments" / "scores.json"
 
 
-def reference_paths(project):
-    """The user's originals, which every score is measured against."""
+def reference_paths(project, *, purpose="review"):
+    """The originals a score is measured against (spec N4.5).
+
+    `purpose="review"` is the general case - candidate scoring, the crop re-score, the epoch grid's CLIP sort - and it
+    **excludes the frozen holdout originals**. The holdout exists to measure what the model never saw; scoring
+    candidates against those two pictures as well would make the holdout a reference for selection, which is the
+    quiet version of training on it. `purpose="holdout"` returns exactly those two and nothing else, and is the only
+    caller that may.
+
+    The old version returned all fifteen user originals for every purpose, so the holdout was in the reference set of
+    the ordinary candidate scores (`review_references`: 15 references, 2 of them the holdout).
+    """
+    holdout_ids = set((project.holdout_entry() or {}).get("ids") or [])
+    holdout_files = set()
     out = []
     for record in project.source_records():
         if record.get("origin") != "user":
             continue
+        record_id = record.get("id")
         path = project.resolve_file(record.get("file") or record.get("src_path"))
-        if path and Path(path).is_file():
-            out.append(str(path))
+        if not path or not Path(path).is_file():
+            continue
+        is_holdout = record_id in holdout_ids
+        if purpose == "holdout" and not is_holdout:
+            continue
+        if purpose != "holdout" and is_holdout:
+            # Also remembered so the same picture registered twice (a copy with another id) cannot slip back in.
+            holdout_files.add(Path(path).resolve())
+            continue
+        out.append(str(path))
+    if purpose != "holdout" and holdout_files:
+        out = [path for path in out if Path(path).resolve() not in holdout_files]
     return sorted(out)
 
 
@@ -204,7 +227,16 @@ def main(argv=None):
         print(f'  slots short: {len(short)}')
         return 0
 
-    run(project, scorers=tuple(args.only or ("clip_vision", "arcface")))
+    # The scorers load CLIP/ArcFace weights onto the same GPU training and generation use, so the CLI takes the
+    # common GPU claim for the whole scoring pass (spec N1).
+    from . import gpu
+    claim = gpu.claim_gpu(what="the scoring pass")
+    claim.acquire()
+    try:
+        gpu.vram_gate("scoring", "score")
+        run(project, scorers=tuple(args.only or ("clip_vision", "arcface")))
+    finally:
+        claim.release()
     return 0
 
 

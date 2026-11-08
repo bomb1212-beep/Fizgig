@@ -1140,13 +1140,36 @@ class App(tk.Tk):
                     return
         if self.busy:
             self.tail_logs()
+        elif self.close_after:
+            # A dataset stage owns its own worker and reports completion through `set_busy(False)`, not through this
+            # event queue's "finished". Checking the tab itself is what lets a close-during-a-stage actually close:
+            # before this the window waited for a queue event that a dataset stage never sends (spec N2).
+            self.close_after = False
+            self.destroy()
+            return
         self.after_id = self.after(200, self.poll)
 
     def close(self):
+        """Closing with work in flight ends the work first (spec N2).
+
+        The old path only wrote `automation/stop_requested` and waited for a `poll()` that never looked at
+        `close_after` for a dataset stage: a runner checks that file between stages, but a dataset stage polls its own
+        project marker, so the window could sit there while the stage kept drawing - and the leftover
+        `stop_requested` then made the next seed training refuse with "Automation paused".
+
+        Both kinds of work now go through the same stop: the dataset tab cancels its own stage through
+        `DatasetTab.cancel` (marker, then tree), and a runner operation is paused through its own marker as before.
+        The window closes once the dataset stage's process has actually exited; a runner is given the same polite
+        treatment and its own child tree is ended if it outlives the grace window.
+        """
         if self.busy:
             self.close_after = True
-            self.pause()
-            self.status.set("작업을 안전하게 중단한 뒤 창을 닫습니다. 저장이 끝날 때까지 기다려 주세요.")
+            if getattr(self, "dataset_view", None) is not None and self.dataset_view.running is not None:
+                self.dataset_view.cancel()
+                self.status.set("데이터셋 단계를 중단한 뒤 창을 닫습니다. 저장이 끝날 때까지 기다려 주세요.")
+            else:
+                self.pause()
+                self.status.set("작업을 안전하게 중단한 뒤 창을 닫습니다. 저장이 끝날 때까지 기다려 주세요.")
             return
         if not self.resolve_caption_edit():
             return

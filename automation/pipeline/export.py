@@ -51,16 +51,31 @@ class ExportError(RuntimeError):
 
 
 def _caption_of(entry, captions, card):
-    """The caption that goes into the export, and where it came from.
+    """The caption that goes into the export, and where it came from (spec N6).
 
-    A candidate that already has a caption keeps it: it describes the picture that was drawn, and replacing it with the
-    card's boilerplate would throw away what the reviewer's pipeline actually measured. A picture without one gets the
-    card's caption under the `caption_traits` policy - the same rule the seed uses, so the two sets caption alike.
+    A candidate that already has a caption keeps its wording: it describes the picture that was drawn, and replacing it
+    with the card's boilerplate would throw away what the pipeline actually measured. The card's `caption_traits`
+    policy is applied **to that inherited text as well as to a caption built from the card** - the same rule the seed
+    uses, so the two sets caption alike. Before this, `omit` only applied when a caption was built from scratch, so an
+    inherited caption kept the fixed traits and the default outfit it was supposed to drop.
+
+    Returns `(caption, source, detail)`; `detail` is the policy preview (original text, what was dropped, and the note
+    a person should read when the caption was free prose rather than a tag list).
     """
     text = (entry.get("caption") or captions.get(entry.get("sha256") or "") or "").strip()
     if text:
-        return seed.add_traits(text, card), entry.get("caption_source") or "inherited"
-    return seed.add_traits(seed.card_caption(card), card), "built from the card"
+        source = entry.get("caption_source") or "inherited"
+        original = text
+    else:
+        text = seed.card_caption(card)
+        source = "built from the card"
+        original = ""
+    preview = seed.caption_policy_preview(text, card)
+    detail = {"original_caption": original or None, "policy": preview["policy"], "kind": preview["kind"],
+              "dropped": preview["dropped"], "note": preview["note"],
+              "policy_version": seed.CAPTION_POLICY_VERSION}
+    return preview["after"], source, detail
+
 
 
 def collect(project, *, caps=None, log=print):
@@ -82,7 +97,7 @@ def collect(project, *, caps=None, log=print):
         # is the final training set, and a set that leaves out the ground-truth photographs would train a different
         # kind of model than the seed did. `kind` keeps them distinguishable, and the holdout is already gone because
         # `audit` refuses it before this point.
-        caption, source = _caption_of(row, captions, project.card)
+        caption, source, caption_detail = _caption_of(row, captions, project.card)
         # `kept` carries no generator, so it is read from the candidate record it names; an original has none.
         generator = str((records.get(row["id"]) or {}).get("generator") or "")
         entries.append({
@@ -91,6 +106,9 @@ def collect(project, *, caps=None, log=print):
             "sha256": row["sha256"], "path": row["path"],
             "caption": caption, "caption_source": source,
             "caption_sha256": hashlib.sha256(caption.encode("utf-8")).hexdigest(),
+            # spec N6: the policy and the original text travel with the caption, so a surprising edit is auditable
+            # instead of being a difference nobody can explain later.
+            "caption_policy": caption_detail,
             "slot": row.get("slot") or "", "generation": int(row.get("generation") or 0),
             "edit_depth": int(row.get("edit_depth") or 0),
             "origin": row.get("origin") or "",

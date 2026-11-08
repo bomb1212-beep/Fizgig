@@ -359,8 +359,14 @@ def build_snapshot(project_dir, card, *, exclude=(), holdout=None, sections=None
     return result
 
 
-def run(snapshot, *, only=None, limit=None, cancel_file=None, log=print, on_event=None, dry_run=False):
-    """Run tool2's CLI against the snapshot and return its result JSON, or None when nothing was run."""
+def run(snapshot, *, only=None, limit=None, cancel_file=None, log=print, on_event=None, dry_run=False, claim=None):
+    """Run tool2's CLI against the snapshot and return its result JSON, or None when nothing was run.
+
+    `claim` is the GPU claim the caller holds for this run (spec N1 ownership handoff): the child inherits the
+    protection through the FIZGIG_GPU_LOCK_HEIR env var instead of taking the lock itself (a child that re-acquired
+    would refuse against its own parent), and the claim records the child's pid so a killed parent never turns the
+    orphan's GPU work into a "stale" claim.
+    """
     command = [snapshot["tool2_python"], snapshot["tool2_batch"],
                "--config", snapshot["config"], "--chars", str(Path(snapshot["chars"]).parent),
                "--out", str(Path(snapshot["out"]).parent), "--character", snapshot["character"]]
@@ -377,8 +383,14 @@ def run(snapshot, *, only=None, limit=None, cancel_file=None, log=print, on_even
     if not dry_run:
         command.append("--events")
     log(f"[gen_qwen_edit] {' '.join(command)}")
+    env = dict(os.environ)
+    if claim is not None:
+        env["FIZGIG_GPU_LOCK_HEIR"] = "1"
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                               encoding="utf-8", errors="replace", cwd=str(Path(snapshot["tool2_batch"]).parent))
+                               encoding="utf-8", errors="replace", cwd=str(Path(snapshot["tool2_batch"]).parent),
+                               env=env)
+    if claim is not None:
+        claim.hand_off(process.pid)
     # With --events every stdout line is one JSON event and the human log is on stderr. stderr is drained on its own
     # thread: tool2 logs a lot, and a full stderr pipe would stop the run dead while this loop waits on stdout.
     errors = []
@@ -863,11 +875,27 @@ def main(argv=None):
         return 0
     snapshot = build_snapshot(project_dir, card, exclude=(args.exclude or "").split(",") if args.exclude else (),
                               sections=overrides)
-    result = run(snapshot, only=(args.only or "").split(",") if args.only else None, limit=args.limit,
-                 cancel_file=args.cancel_file, dry_run=args.dry_run)
+    # The GPU claim covers the whole tool2 run (spec N1): a dry-run submits nothing and takes no claim.
+    claim = None
+    if not args.dry_run:
+        from . import gpu
+        claim = gpu.claim_gpu(what="generator A")
+        claim.acquire()
+    try:
+        result = run(snapshot, only=(args.only or "").split(",") if args.only else None, limit=args.limit,
+                     cancel_file=args.cancel_file, dry_run=args.dry_run, claim=claim)
+    finally:
+        if claim is not None:
+            claim.release()
     if result is None:
         return 0
     import_candidates(project_dir, card, snapshot, result)
+    if args.cancel_file and Path(args.cancel_file).is_file():
+        # A pause is not a finish (spec N2). tool2 stops between slots and writes what it drew into the result file,
+        # which is imported above; saying so on stdout is what lets the GUI tell a stopped run from a completed one
+        # instead of reading exit 0 as "the whole plan is done".
+        counts = result.get("summary") or {}
+        print(f"paused: {counts.get('planned', '?')} planned, {counts.get('done', '?')} drawn, the rest still pending")
     return 0
 
 
