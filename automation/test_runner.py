@@ -349,3 +349,303 @@ class FreeBeforeTrainingTests(unittest.TestCase):
             self.assertEqual(runner.free_comfy_before_training(cfg, client=fake, log=lambda *_: None), "busy")
         finally:
             comfy_mod.Comfy = original
+
+
+class CloudQueueTests(unittest.TestCase):
+    """`run`/`caption` take the queue lock first; local segments claim gpu.lock per job; cloud jobs never claim it."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.runs = self.root / "runs"
+        self.auto = self.root / "auto"
+        self.auto.mkdir()
+        self.root.joinpath("caption_instructions.txt").write_bytes(
+            (runner.AUTO / "caption_instructions.txt").read_bytes())
+        self.root.joinpath("caption_instructions_anime.txt").write_bytes(
+            (runner.AUTO / "caption_instructions_anime.txt").read_bytes())
+        self._old = {key: runner._PATH_OVERRIDES.get(key) for key in ("config", "todo", "runs")}
+        runner._PATH_OVERRIDES["runs"] = self.runs
+        runner._PATH_OVERRIDES["todo"] = self.root / "todo.json"
+        runner._PATH_OVERRIDES["config"] = self.root / "config.json"
+        (self.root / "config.json").write_text(json.dumps(
+            {"target_steps": 2, "max_images_per_job": 10, "rank": 8, "save_every_steps_approx": 1,
+             "learning_rate": 0.0002, "adaptive_lr": True, "adaptive_lr_min": 0.0002, "adaptive_lr_max": 0.0004,
+             "megapixels": 0.25, "caption_base_url": "http://127.0.0.1:18080/v1",
+             "caption_model": "gemma", "caption_max_output_tokens": 300, "sample_prompts": ["{trigger}, portrait"]}), encoding="utf-8")
+        self.datasets = {}
+        from PIL import Image
+        for name, color in (("a", "red"), ("b", "blue"), ("c", "green")):
+            ds = self.root / f"ds_{name}"
+            ds.mkdir()
+            Image.new("RGB", (16, 16), color).save(ds / "one.png")
+            self.datasets[name] = ds
+        # The cloud job has captions already; the local jobs rely on the fake Gemma.
+        (self.datasets["b"] / "one.txt").write_text("trg, a caption", encoding="utf-8")
+        self.todo = self.root / "todo.json"
+
+    def tearDown(self):
+        for key, value in self._old.items():
+            if value is None:
+                runner._PATH_OVERRIDES.pop(key, None)
+            else:
+                runner._PATH_OVERRIDES[key] = value
+        self.temp.cleanup()
+
+    def write_todo(self, jobs):
+        self.todo.write_text(json.dumps(jobs), encoding="utf-8")
+
+    def job(self, name, *, backend=None):
+        job = {"id": f"job{name}", "enabled": True, "trigger": "trg",
+               "dataset_root": str(self.datasets[name])}
+        if backend == "modal":
+            job["backend"] = "modal"
+            job["modal_gpu"] = "L40S"
+            job["family"] = "krea2"
+        return job
+
+    class FakeClaim:
+        def __init__(self, recorder, what):
+            self.recorder, self.what = recorder, what
+
+        def acquire(self):
+            self.recorder.append(("acquire", self.what))
+
+        def release(self):
+            self.recorder.append(("release", self.what))
+
+    def run_main(self, argv, execute_recorder, claim_recorder):
+        runner_locks = []
+
+        def fake_claim_gpu(automation_dir=None, *, what="generation"):
+            return CloudQueueTests.FakeClaim(claim_recorder, what)
+
+        class FakeGemma:
+            def __init__(self, cfg, run, cancelled=None):
+                self.cfg = cfg
+
+            def __enter__(self):
+                self = self
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def caption(self, path, instructions):
+                return "trg, a caption", {"total": 1}
+
+        with patch.object(runner, "AUTO", self.auto), \
+             patch.object(runner, "execute", side_effect=lambda run, cfg, n: execute_recorder.append(cfg["id"])), \
+             patch.object(runner, "GemmaServer", FakeGemma), \
+             patch.object(runner.model_paths, "problems", return_value=[]), \
+             patch.object(runner, "free_comfy_before_training", return_value="no-server"), \
+             patch("pipeline.gpu.vram_gate", lambda *a, **k: None), \
+             patch("pipeline.gpu.take_queue_lock", lambda *a, **k: None), \
+             patch("pipeline.gpu.claim_gpu", side_effect=fake_claim_gpu), \
+             patch.object(sys, "argv", argv):
+            runner.main()
+        return runner_locks
+
+    def test_mixed_queue_runs_in_order_and_claims_gpu_only_for_local_jobs(self):
+        self.write_todo([self.job("a"), self.job("b", backend="modal"), self.job("c")])
+        executed, claims = [], []
+        self.run_main(["runner.py", "run"], executed, claims)
+        self.assertEqual(executed, ["joba", "jobb", "jobc"])
+        acquires = [what for action, what in claims if action == "acquire"]
+        releases = [what for action, what in claims if action == "release"]
+        self.assertEqual(acquires, ["run joba", "run jobc"])   # the Modal job never claims the GPU
+        self.assertEqual(releases, acquires)
+
+    def test_cloud_job_with_missing_caption_refuses_before_any_work(self):
+        (self.datasets["b"] / "one.txt").unlink()
+        self.write_todo([self.job("b", backend="modal")])
+        executed, claims = [], []
+        with self.assertRaisesRegex(ValueError, "cannot caption"):
+            self.run_main(["runner.py", "run"], executed, claims)
+        self.assertEqual(executed, [])
+        self.assertEqual(claims, [])
+
+    def test_plan_for_a_cloud_job_is_offline_and_posix(self):
+        self.write_todo([self.job("b", backend="modal")])
+        self.run_main(["runner.py", "plan"], [], [])
+        plans = list(self.runs.glob("jobb-*/launch_plan.json"))
+        self.assertEqual(len(plans), 1)
+        doc = json.loads(plans[0].read_text(encoding="utf-8"))
+        self.assertEqual(doc["family"], "krea2")
+        for stage in doc["stages"]:
+            for arg in stage["cmd"]:
+                self.assertNotIn("\\", str(arg))
+                self.assertNotRegex(str(arg), r"^[A-Za-z]:")
+        for path, _content in doc["files"]:
+            self.assertTrue(path.startswith("/runs/"))
+            self.assertNotIn("\\", path)
+
+
+class DoctorCloudTests(unittest.TestCase):
+    """`doctor` checks the Modal side for cloud jobs and never fails cloud-only runs on local GPU/model gaps."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.runs = self.root / "runs"
+        self.auto = self.root / "auto"
+        self.auto.mkdir()
+        self._old = {key: runner._PATH_OVERRIDES.get(key) for key in ("config", "todo", "runs")}
+        runner._PATH_OVERRIDES["runs"] = self.runs
+        runner._PATH_OVERRIDES["todo"] = self.root / "todo.json"
+        runner._PATH_OVERRIDES["config"] = self.root / "config.json"
+        ds = self.root / "ds"
+        ds.mkdir()
+        from PIL import Image
+        Image.new("RGB", (16, 16), "red").save(ds / "one.png")
+        (ds / "one.txt").write_text("trg, a caption", encoding="utf-8")
+        self.root.joinpath("caption_instructions.txt").write_bytes(
+            (runner.AUTO / "caption_instructions.txt").read_bytes())
+        (self.root / "config.json").write_text(json.dumps(
+            {"target_steps": 2, "max_images_per_job": 10, "rank": 8, "save_every_steps_approx": 1,
+             "learning_rate": 0.0002, "adaptive_lr": True, "adaptive_lr_min": 0.0002,
+             "adaptive_lr_max": 0.0004, "megapixels": 0.25,
+             "caption_base_url": "http://127.0.0.1:18080/v1",
+             "caption_model": "gemma", "caption_max_output_tokens": 300, "sample_prompts": ["{trigger}, portrait"]}), encoding="utf-8")
+        self.ds = ds
+
+    def tearDown(self):
+        for key, value in self._old.items():
+            if value is None:
+                runner._PATH_OVERRIDES.pop(key, None)
+            else:
+                runner._PATH_OVERRIDES[key] = value
+        self.temp.cleanup()
+
+    def todo(self, jobs):
+        (self.root / "todo.json").write_text(json.dumps(jobs), encoding="utf-8")
+
+    def modal_job(self):
+        return {"id": "cloudjob", "enabled": True, "trigger": "trg", "dataset_root": str(self.ds),
+                "backend": "modal", "family": "krea2"}
+
+    def fake_modal_module(self, **behavior):
+        import types
+
+        class NotFoundError(Exception):
+            pass
+
+        class Function:
+            @staticmethod
+            def from_name(app_name, name):
+                if behavior.get("deployed") is None:
+                    raise NotFoundError(f"NotFoundError: {app_name}.{name}")
+                return types.SimpleNamespace(remote=lambda: behavior["deployed"])
+
+        class Volume:
+            @staticmethod
+            def from_name(name, create_if_missing=False):
+                raise AssertionError("doctor must not touch volumes")
+
+        return types.SimpleNamespace(Function=Function, Volume=Volume,
+                                     exception=types.SimpleNamespace(NotFoundError=NotFoundError))
+
+    def test_doctor_for_modal_jobs_passes_without_local_cuda(self):
+        self.todo([self.modal_job()])
+        saved = sys.modules.get("modal")
+        sys.modules["modal"] = self.fake_modal_module(deployed=None)   # app not deployed yet is not a failure
+        try:
+            with patch.object(sys, "argv", ["runner.py", "doctor"]):
+                runner.main()   # must not raise: CUDA absence is not a cloud-job failure (torch is never imported)
+        finally:
+            if saved is None:
+                sys.modules.pop("modal", None)
+            else:
+                sys.modules["modal"] = saved
+
+    def test_doctor_reports_a_missing_modal_package(self):
+        self.todo([self.modal_job()])
+        saved = sys.modules.get("modal")
+        sys.modules["modal"] = None     # `import modal` raises ImportError
+        try:
+            with patch.object(sys, "argv", ["runner.py", "doctor"]):
+                with self.assertRaisesRegex(ValueError, "modal"):
+                    runner.main()
+        finally:
+            if saved is None:
+                sys.modules.pop("modal", None)
+            else:
+                sys.modules["modal"] = saved
+
+    def test_doctor_fails_on_a_modal_job_with_missing_captions(self):
+        (self.ds / "one.txt").unlink()
+        self.todo([self.modal_job()])
+        saved = sys.modules.get("modal")
+        sys.modules["modal"] = self.fake_modal_module(deployed=None)
+        try:
+            with patch.object(sys, "argv", ["runner.py", "doctor"]), \
+                 patch("torch.cuda.is_available", return_value=True):
+                with self.assertRaisesRegex(ValueError, "caption"):
+                    runner.main()
+        finally:
+            if saved is None:
+                sys.modules.pop("modal", None)
+            else:
+                sys.modules["modal"] = saved
+
+
+class SyncCancelTests(unittest.TestCase):
+    """`sync` does nothing on an empty queue; `cancel --job` finds the remote run to cancel."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.runs = self.root / "runs"
+        self.runs.mkdir(parents=True)
+        self._old = {key: runner._PATH_OVERRIDES.get(key) for key in ("runs", "config", "todo")}
+        runner._PATH_OVERRIDES["runs"] = self.runs
+        # modal_backend imports the sys.path runner, which owns its own override table: set it too, or the
+        # default runs root points at the real automation/runs (and its project seed folders).
+        import runner as sys_runner
+        self.sys_runner = sys_runner
+        self._old_sys = sys_runner._PATH_OVERRIDES.get("runs")
+        sys_runner._PATH_OVERRIDES["runs"] = self.runs
+
+    def tearDown(self):
+        for key, value in self._old.items():
+            if value is None:
+                runner._PATH_OVERRIDES.pop(key, None)
+            else:
+                runner._PATH_OVERRIDES[key] = value
+        if self._old_sys is None:
+            self.sys_runner._PATH_OVERRIDES.pop("runs", None)
+        else:
+            self.sys_runner._PATH_OVERRIDES["runs"] = self._old_sys
+        self.temp.cleanup()
+
+    def test_sync_on_an_empty_queue_is_a_clean_exit(self):
+        with patch.object(sys, "argv", ["runner.py", "sync"]):
+            runner.main()   # no exception
+
+    def test_cancel_finds_the_matching_run_and_reports_ids(self):
+        run = self.runs / "job-abc123"
+        run.mkdir()
+        (run / "state.json").write_text(json.dumps(
+            {"remote": {"call_id": "fc-1", "run_key": "job-abc123", "status": "submitted",
+                        "gpu": "L40S", "submitted_at": "2026-11-10T21:00:00",
+                        "dataset_fingerprint": "f" * 64}}), encoding="utf-8")
+        from cloud import modal_backend
+        calls = []
+        with patch.object(modal_backend, "cancel", side_effect=lambda r, **k: calls.append(str(r))), \
+             patch.object(sys, "argv", ["runner.py", "cancel", "--job", "job"]):
+            runner.main()
+        self.assertEqual(calls, [str(run)])
+
+    def test_cancel_with_several_matches_asks_for_a_narrower_scope(self):
+        for suffix in ("aaa111", "bbb222"):
+            run = self.runs / f"job-{suffix}"
+            run.mkdir()
+            (run / "state.json").write_text(json.dumps({"remote": {"call_id": "fc-1", "status": "submitted"}}),
+                                            encoding="utf-8")
+        with patch.object(sys, "argv", ["runner.py", "cancel", "--job", "job"]):
+            with self.assertRaisesRegex(ValueError, "several runs"):
+                runner.main()
+
+    def test_cancel_with_nothing_found_says_so_and_does_not_raise(self):
+        with patch.object(sys, "argv", ["runner.py", "cancel", "--job", "nosuchjob"]):
+            runner.main()   # prints "no remote run found"; not an error

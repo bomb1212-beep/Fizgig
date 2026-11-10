@@ -1028,5 +1028,60 @@ class _patched:
         return False
 
 
-if __name__ == "__main__":
-    unittest.main()
+class SeedBackendTests(Base):
+    """`--backend`/`--modal-gpu`: the Modal choice travels with the seed config into the project's own folder."""
+
+    def setUp(self):
+        super().setUp()
+        self.project.import_sources([self.original("a.png"), self.original("b.png")], log=lambda *_: None)
+        self.snapshot = seed.build_snapshot(self.project, log=lambda *_: None)
+
+    def test_local_is_the_default_and_nothing_changes(self):
+        config = seed.runner_config(self.project, self.snapshot, epochs=10)
+        self.assertEqual(config["backend"], "local")
+        self.assertEqual(config["modal_gpu"], "L40S")
+
+    def test_modal_selection_travels_into_the_config(self):
+        config = seed.runner_config(self.project, self.snapshot, epochs=10,
+                                    backend="modal", modal_gpu="a100-80gb")
+        self.assertEqual(config["backend"], "modal")
+        self.assertEqual(config["modal_gpu"], "A100-80GB")
+
+    def test_the_global_cloud_block_travels_with_the_project_config(self):
+        base = dict(seed.models.config())
+        base["cloud"] = {"modal": {"poll_seconds": 9}}
+        config = seed.runner_config(self.project, self.snapshot, backend="modal", base=base)
+        self.assertEqual(config["cloud"]["modal"]["poll_seconds"], 9)
+
+    def test_modal_refuses_a_non_krea2_family(self):
+        with self.assertRaises(pj.ProjectError):
+            seed.runner_config(self.project, self.snapshot, family="qwen_image21", backend="modal")
+
+    def test_modal_gpu_must_be_known(self):
+        with self.assertRaisesRegex(pj.ProjectError, "modal_gpu"):
+            seed.runner_config(self.project, self.snapshot, backend="modal", modal_gpu="H200")
+
+    def test_the_project_runner_folder_records_the_selection(self):
+        folder = seed.prepare_runner(self.project, self.snapshot,
+                                     config=seed.runner_config(self.project, self.snapshot,
+                                                               backend="modal", modal_gpu="H100"),
+                                     log=lambda *_: None)
+        config = json.loads((folder / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(config["backend"], "modal")
+        self.assertEqual(config["modal_gpu"], "H100")
+
+    def test_main_passes_the_modal_selection_through(self):
+        import pipeline.seed as seed_module
+        trained = []
+        with _patched(seed_module, "train",
+                      lambda _project, snapshot, **k: trained.append({"snapshot": snapshot, **k}) or self.root / "runs"):
+            seed.main(["--project", str(self.project.dir), "--build", "--train",
+                       "--backend", "modal", "--modal-gpu", "RTX-PRO-6000"])
+        self.assertEqual(len(trained), 1)
+        self.assertEqual(trained[0]["config"]["backend"], "modal")
+        self.assertEqual(trained[0]["config"]["modal_gpu"], "RTX-PRO-6000")
+
+    def test_main_rejects_an_unknown_backend(self):
+        with self.assertRaises(SystemExit) as caught:
+            seed.main(["--project", str(self.project.dir), "--build", "--train", "--backend", "kaggle"])
+        self.assertEqual(caught.exception.code, 2)

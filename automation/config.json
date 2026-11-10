@@ -54,5 +54,25 @@
       "python": "G:/데이터셋 통합작성툴/qwen 2.1 edit/.venv/Scripts/python.exe",
       "batch": "G:/데이터셋 통합작성툴/qwen 2.1 edit/dataset_batch.py"
     }
+  },
+  "cloud": {
+    "modal": {
+      "poll_seconds": 30,
+      "overhead_minutes": 15,
+      "sec_per_step": {
+        "L40S": 1.6,
+        "A100-80GB": 1.3,
+        "RTX-PRO-6000": 0.9,
+        "H100": 0.8
+      },
+      "gpu_rate": {
+        "L40S": 1.95,
+        "A100-80GB": 2.50,
+        "RTX-PRO-6000": 3.03,
+        "H100": 3.95
+      },
+      "cpu_rate": 0.047,
+      "memory_rate": 0.008
+    }
   }
 }

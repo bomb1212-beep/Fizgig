@@ -363,6 +363,39 @@ def todo_path(automation_dir=None):
     return base / "todo.json"
 
 
+def _normalize_backend(backend):
+    value = str(backend or "local").strip().lower()
+    if value not in ("local", "modal"):
+        raise ExportError(f"unknown backend {value!r}; known: local, modal")
+    return value
+
+
+def _canonical_gpu(modal_gpu):
+    try:
+        from cloud import spec as cloud_spec
+    except Exception as exc:
+        raise ExportError("the Modal backend files are missing (automation/cloud/spec.py)") from exc
+    gpu = str(modal_gpu or cloud_spec.DEFAULT_GPU).strip().lower()
+    canonical = {name.lower(): name for name in cloud_spec.GPUS}.get(gpu)
+    if canonical is None:
+        raise ExportError(f"unknown modal_gpu {gpu!r}; known: {', '.join(cloud_spec.GPUS)}")
+    return canonical
+
+
+def _modal_family_scope(families, backend):
+    """(supported, unsupported) final families for a Modal todo run; unsupported is what must be reported."""
+    if backend != "modal":
+        return list(families), []
+    try:
+        from cloud import spec as cloud_spec
+        supported_key = cloud_spec.SUPPORTED_FAMILY
+    except Exception:
+        supported_key = "krea2"
+    supported = [family for family in families if family == supported_key]
+    unsupported = [family for family in families if family != supported_key]
+    return supported, unsupported
+
+
 def read_todo(path):
     data = pj.read_json(path)
     if data is None:
@@ -372,16 +405,28 @@ def read_todo(path):
     return data
 
 
-def plan_todos(project, manifest, *, families=None, automation_dir=None):
+def plan_todos(project, manifest, *, families=None, automation_dir=None, backend="local", modal_gpu="L40S"):
     """The job entries that would train on this export, one per family, without writing anything.
 
     The spec asks after an export whether to add a tool1 todo whose `dataset_root` is this snapshot, per final family.
     This returns them so a caller can show them first; `add_todos` writes. `dataset_root` is left to tool1's
     `config.json` unless a family needs its own, because the exported folder is the same for both.
+
+    With backend="modal" only the families the Modal backend supports are returned (krea2); when the export names
+    none of them, or the caller pins Modal to an unsupported family, an ExportError with the reason is raised.
     """
     families = list(families or manifest.get("families") or [])
     if not families:
         raise ExportError("the export names no final family, so there is nothing to plan a training job for")
+    backend = _normalize_backend(backend)
+    gpu = _canonical_gpu(modal_gpu)
+    if backend == "modal":
+        requested = families
+        supported, unsupported = _modal_family_scope(requested, backend)
+        if not supported:
+            raise ExportError(f"Modal supports krea2 only; this export names {', '.join(requested)} - "
+                              f"no Modal training job can be prepared for it")
+        families = supported
     existing = {str(job.get("id") or "") for job in read_todo(todo_path(automation_dir))}
     export_id = manifest["id"]
     out = []
@@ -389,13 +434,20 @@ def plan_todos(project, manifest, *, families=None, automation_dir=None):
         # The id carries the export and the family: re-running the same export adds nothing, and a new export is a new
         # job rather than a silent overwrite of the old one's settings.
         job_id = f"{project.card.get('id')}_{export_id}_{family}"
-        out.append({
+        entry = {
             "id": job_id, "family": family, "enabled": False,
             "trigger": project.card.get("trigger") or project.card.get("id"),
             "dataset_root": manifest.get("dataset") or manifest.get("base"),
             "export": export_id, "export_manifest": str(Path(manifest.get("base") or "") / "export_manifest.json"),
             "present": job_id in existing,
-        })
+        }
+        if backend == "modal":
+            entry["backend"] = "modal"
+            entry["modal_gpu"] = gpu
+        else:
+            # Explicit so a mixed todo list shows where each job will run.
+            entry["backend"] = "local"
+        out.append(entry)
     return out
 
 
@@ -417,27 +469,40 @@ def training_gate(manifest_path):
     return manifest
 
 
-def add_todos(project, manifest, *, families=None, automation_dir=None, enable=False, log=print):
+def add_todos(project, manifest, *, families=None, automation_dir=None, enable=False, log=print,
+              backend="local", modal_gpu="L40S"):
     """Add the planned jobs to `todo.json` without duplicating one that is already there.
 
     Written disabled by default. Starting a training run is the user's call and consumes hours of GPU time, so this
     adds the entry and leaves it off rather than queuing work nobody asked for. A broken export gets no job at all:
     the todo would carry the folder's path, and a training run that opens it would either fail or train on files the
-    manifest does not declare.
+    manifest does not declare. With backend="modal" only krea2 jobs are prepared; the scope is printed either way.
     """
     base = Path(manifest.get("base") or "")
     problems = validate(base)
     if problems:
         raise ExportError(f"the export {manifest.get('id')} is not intact, so no training job will be added: "
                           + "; ".join(problems[:5]))
+    backend = _normalize_backend(backend)
+    gpu = _canonical_gpu(modal_gpu)
+    requested = list(families or manifest.get("families") or [])
+    _supported, unsupported = _modal_family_scope(requested, backend)
+    if unsupported:
+        log(f"[export] Modal prepares krea2 jobs only; skipping: {', '.join(unsupported)}")
     path = todo_path(automation_dir)
     jobs = read_todo(path)
-    known = {str(job.get("id") or "") for job in jobs}
-    planned = plan_todos(project, manifest, families=families, automation_dir=automation_dir)
+    by_id = {str(job.get("id") or ""): job for job in jobs}
+    planned = plan_todos(project, manifest, families=families, automation_dir=automation_dir,
+                         backend=backend, modal_gpu=gpu)
     added = []
     for job in planned:
-        if job["id"] in known:
-            log(f'[export] todo {job["id"]} already exists; not adding it again')
+        if job["id"] in by_id:
+            existing_backend = str(by_id[job["id"]].get("backend") or "local")
+            if existing_backend != backend:
+                log(f'[export] todo {job["id"]} already exists with backend={existing_backend} '
+                    f'(selected {backend}); keeping the existing one')
+            else:
+                log(f'[export] todo {job["id"]} already exists; not adding it again')
             continue
         entry = {key: value for key, value in job.items() if key != "present"}
         entry["enabled"] = bool(enable)
@@ -462,6 +527,10 @@ def main(argv=None):
     parser.add_argument("--families", nargs="*", help="which final families to plan a training job for")
     parser.add_argument("--add", action="store_true", help="write the jobs into todo.json")
     parser.add_argument("--enable", action="store_true", help="add them enabled, so a run would pick them up")
+    parser.add_argument("--backend", choices=("local", "modal"), default="local",
+                        help="with todos: where the prepared jobs will run (default: local)")
+    parser.add_argument("--modal-gpu", default="L40S",
+                        help="with --backend modal: the GPU to train on (default: L40S)")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     project = pj.Project.open(args.project)
@@ -522,18 +591,27 @@ def main(argv=None):
         if not manifest:
             raise ExportError(f"no export {target} under {base_dir(project)}")
         if args.add:
-            report = add_todos(project, manifest, families=args.families, enable=args.enable)
+            report = add_todos(project, manifest, families=args.families, enable=args.enable,
+                               backend=args.backend, modal_gpu=args.modal_gpu)
             if args.json:
                 print(json.dumps(report, ensure_ascii=False, indent=1))
             return 0
-        planned = plan_todos(project, manifest, families=args.families)
+        planned = plan_todos(project, manifest, families=args.families,
+                             backend=args.backend, modal_gpu=args.modal_gpu)
         if args.json:
             print(json.dumps(planned, ensure_ascii=False, indent=1))
             return 0
-        print(f"export {target}: a training job for each of {len(planned)} family/families")
+        if args.backend == "modal":
+            _supported, unsupported = _modal_family_scope(list(args.families or manifest.get("families") or []),
+                                                          "modal")
+            if unsupported:
+                print(f"Modal skips non-krea2 families: {', '.join(unsupported)}")
+        scope = "modal (krea2 only)" if args.backend == "modal" else "local"
+        print(f"export {target}: a training job for each of {len(planned)} family/families [{scope}]")
         for job in planned:
+            where = f"{job.get('backend')}, GPU {job.get('modal_gpu')}" if job.get("backend") == "modal" else "local"
             state = "already in todo.json" if job["present"] else "would be added"
-            print(f'  {job["id"]}  dataset_root={job["dataset_root"]}  ({state})')
+            print(f'  {job["id"]}  dataset_root={job["dataset_root"]}  [{where}]  ({state})')
         print("\nrun with --add to write them; they are added disabled unless --enable is given")
         return 0
 

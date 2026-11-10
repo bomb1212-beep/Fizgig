@@ -37,12 +37,32 @@ active; delete a stale <LORA_OUTPUT_DIR>/.pause_requested (the trainer would sto
 already at Max Train Epochs.
 """
 import os
+import posixpath
 import re
 from dataclasses import dataclass, field
 
 PRECISION_LABELS = {"auto": "Auto (fits your free VRAM)", "bf16": "bf16 (full precision)",
                     "int8": "INT8 (8-bit, fastest)", "nf4": "4-bit NF4 (smallest)"}
 PAIR_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+
+
+@dataclass(frozen=True)
+class PlanTarget:
+    """Where the plan will run. `None` (every existing caller) is the local machine.
+
+    A remote target (the Modal backend) builds its commands with POSIX paths, models are read as
+    the declared `/models/...` mapping instead of being stat'ed on this machine, and the file /
+    caption checks run against `check_image_folder` ??the prepared local data that will be
+    uploaded ??rather than the remote paths the commands use.
+    """
+    posix: bool = True
+    python: str = ""
+    repo_dir: str = ""
+    image_folder: str = ""
+    cache_root: str = ""
+    dataset_config: str = ""
+    output_dir: str = ""
+    check_image_folder: str = ""   # local folder checked for images/captions; remote path when empty
 
 
 @dataclass
@@ -64,6 +84,26 @@ class LaunchPlan:
 def _s(x):
     """A value from the inputs as trimmed text ("" for None) - they may arrive as numbers."""
     return "" if x is None else str(x).strip()
+
+
+def _remote(target):
+    return bool(target is not None and getattr(target, "posix", False))
+
+
+def _pathmod(target):
+    return posixpath if _remote(target) else os.path
+
+
+def _check_folder(inputs, target):
+    """The folder the file/caption checks look at. Remote targets check the prepared local data."""
+    folder = _s(inputs.get("image_folder"))
+    if _remote(target) and getattr(target, "check_image_folder", ""):
+        return target.check_image_folder
+    return folder
+
+
+def _posix_absolute(path):
+    return bool(path) and posixpath.isabs(path) and "\\" not in path and not re.match(r"^[A-Za-z]:", path)
 
 
 def _model(inputs, desc, role):
@@ -180,11 +220,15 @@ def edit_instruction(inputs):
 
 
 # ---------------------------------------------------------------------------------------------------- problems
-def problems(desc, inputs):
+def problems(desc, inputs, target=None):
     """What the family's own checks refuse: an edit's or a slider's pairs, a prompt slider's prompts, and every
-    required model file (plus the training adapter while it is on) set and on disk."""
+    required model file (plus the training adapter while it is on) set and on disk. With a remote target the
+    model files are validated as declared (non-empty absolute POSIX paths); the remote container verifies
+    their sizes before training."""
     errors = []
     folder = _s(inputs.get("image_folder"))
+    if _remote(target):
+        folder = _check_folder(inputs, target)
     if ft_on(desc, inputs):
         for key, label in (("FAMILY_FT_ROTATIONS", "Rotations"), ("FAMILY_FT_SAVE_EVERY", "Save every"),
                            ("FAMILY_FT_ROTATE_EVERY", "Epochs per window")):
@@ -259,16 +303,20 @@ def problems(desc, inputs):
         path = (inputs.get("models") or {}).get(f.pref_key, "")
         if not path:
             errors.append(f"{f.label} path is empty (set it on the Preferences tab)")
+        elif _remote(target):
+            if not _posix_absolute(path):
+                errors.append(f"{f.label} path for the remote target must be an absolute POSIX path: {path}")
         elif not os.path.exists(path):
             errors.append(f"{f.label} file does not exist: {path}")
     return errors
 
 
 # ---------------------------------------------------------------------------------------------------- commands
-def cache_command(desc, inputs, stage):
+def cache_command(desc, inputs, stage, target=None):
     """families/cache.py: latents with the family's VAE, text with its text encoder."""
+    pp = _pathmod(target)
     model = _model(inputs, desc, "vae" if stage == "latents" else "text_encoder")
-    cmd = [inputs["python"], os.path.join(inputs["repo_dir"], desc.cache_script), "--family", desc.key,
+    cmd = [inputs["python"], pp.join(inputs["repo_dir"], desc.cache_script), "--family", desc.key,
            "--stage", stage, "--dataset_config", inputs["DATASET_CONFIG"], "--model", model]
     if stage == "latents":
         cmd.append("--skip_existing")   # validated against the current bucket
@@ -294,11 +342,12 @@ def _state_flags(st):
     return flags
 
 
-def train_command(desc, inputs, plan):
+def train_command(desc, inputs, plan, target=None):
     """families/train.py. Model paths from the description's roles, training settings from the run's settings,
     previews from the sample settings. Preview prompt files and console lines go into `plan`."""
+    pp = _pathmod(target)
     st = inputs
-    cmd = [st["python"], os.path.join(st["repo_dir"], desc.train_script), "--family", desc.key,
+    cmd = [st["python"], pp.join(st["repo_dir"], desc.train_script), "--family", desc.key,
            "--dit", _model(st, desc, "dit"),
            "--dataset_config", st["DATASET_CONFIG"],
            "--output_dir", st["LORA_OUTPUT_DIR"], "--output_name", st["LORA_NAME"],
@@ -413,7 +462,7 @@ def train_command(desc, inputs, plan):
     trig = _s(st.get("METADATA_TRIGGER_PHRASE")) or _s(st.get("caption_trigger"))
     if trig and trig.lower() != "trigger_word":
         cmd += ["--metadata_trigger_phrase", trig]
-    cmd += _preview_flags(desc, st, plan, cmd)
+    cmd += _preview_flags(desc, st, plan, cmd, target)
     if slider_on(desc, st):
         if desc.slider_ultra_blocks and st.get("FAMILY_SLIDER_ULTRA"):
             cmd += ["--train_blocks", ",".join(desc.slider_ultra_blocks)]
@@ -436,15 +485,17 @@ def train_command(desc, inputs, plan):
     return cmd
 
 
-def _preview_flags(desc, st, plan, cmd):
+def _preview_flags(desc, st, plan, cmd, target=None):
     """The preview flags, and the prompt file they read (added to plan.files)."""
+    pp = _pathmod(target)
+    remote = _remote(target)
     sm = st.get("samples") or {}
     out = []
     if not sm.get("enabled"):
         return out
     sp = desc.preview_speed()
     speed_path = (st.get("models") or {}).get(sp.pref_key, "") if sp and sp.pref_key else ""
-    if speed_path and os.path.exists(speed_path):
+    if speed_path and (remote or os.path.exists(speed_path)):
         dflt = desc.preview_speed_defaults()[1]
         try:
             ts = float(str(st.get("FAMILY_TURBO_STRENGTH", "") or dflt))
@@ -454,18 +505,18 @@ def _preview_flags(desc, st, plan, cmd):
             out += ["--speed_lora", speed_path]
             if abs(ts - dflt) > 1e-9:
                 out += ["--speed_lora_strength", f"{max(0.0, min(2.0, ts)):g}"]
-    samples_dir = st.get("samples_dir") or os.path.join(_s(st.get("LORA_OUTPUT_DIR")), "sample")
+    samples_dir = st.get("samples_dir") or pp.join(_s(st.get("LORA_OUTPUT_DIR")), "sample")
     prompts = None
     if edit_on(desc, st):              # edit previews: the edit instruction, not the Samples-tab prompts
         instr = edit_instruction(st)
         if instr:
-            prompts = os.path.join(samples_dir, f"{desc.key}_edit_prompt.txt")
+            prompts = pp.join(samples_dir, f"{desc.key}_edit_prompt.txt")
             plan.dirs.append(samples_dir)
             plan.files.append((prompts, instr + "\n"))
     elif slider_on(desc, st):          # slider previews: the dial on its own picture, not the Samples tab
         own = (st.get("FAMILY_SLIDER_BASE") if slider_on(desc, st, "prompts")
                else st.get("FAMILY_SLIDER_CAPTION"))
-        prompts = os.path.join(samples_dir, f"{desc.key}_slider_prompt.txt")
+        prompts = pp.join(samples_dir, f"{desc.key}_slider_prompt.txt")
         plan.dirs.append(samples_dir)
         plan.files.append((prompts, (str(own or "").strip() or "a photo") + "\n"))   # the trainer reads the captions
     else:
@@ -479,7 +530,7 @@ def _preview_flags(desc, st, plan, cmd):
                 lines.append(ln)
         plan.dirs.append(samples_dir)            # the sample folder exists either way
         if lines or _sample_image(desc, sm):     # a reference alone previews too ('generate from this picture')
-            prompts = os.path.join(samples_dir, f"{desc.key}_prompts.txt")
+            prompts = pp.join(samples_dir, f"{desc.key}_prompts.txt")
             plan.files.append((prompts, "\n".join(lines) + "\n"))
     every = str(sm.get("every") or "").strip()
     if prompts and every.isdigit() and int(every) > 0:
@@ -527,19 +578,21 @@ def _sample_image(desc, sm):
 
 
 # ---------------------------------------------------------------------------------------------------- dataset
-def cache_dir_for(cache_root, image_dir):
+def cache_dir_for(cache_root, image_dir, *, posix=False):
     """`<cache_root>/<folder name>-<hash of full path>`: one cache folder per image folder. The trainer builds its
     item list by globbing the cache folder, so two datasets sharing one would train on each other's leftovers; the
-    hash keeps it stable per folder and unique across same-named folders (case and trailing slash normalised)."""
+    hash keeps it stable per folder and unique across same-named folders (case and trailing slash normalised).
+    Pass `posix=True` when the target is a remote (Linux) host so the spelling is `/`-separated everywhere."""
     import hashlib
+    pp = posixpath if posix else os.path
     norm = image_dir.lower().replace("\\", "/").rstrip("/")
     h = hashlib.sha1(norm.encode("utf-8")).hexdigest()[:8]
     nm = "".join(c if (c.isalnum() or c in "-_") else "_"
-                 for c in os.path.basename(image_dir.rstrip("/\\"))) or "dataset"
-    return os.path.join(cache_root, f"{nm}-{h}")
+                 for c in pp.basename(image_dir.rstrip("/\\"))) or "dataset"
+    return pp.join(cache_root, f"{nm}-{h}")
 
 
-def dataset_toml(desc, inputs):
+def dataset_toml(desc, inputs, *, posix=False):
     """The dataset TOML for the run: the training folder at Target Megapixels (a square of that area on the
     16-pixel grid), an edit's originals or a slider's -1 end as its control folder, and its own cache folder.
     Raises ValueError on a Target Megapixels or Batch Size that is not a number."""
@@ -561,28 +614,29 @@ def dataset_toml(desc, inputs):
         lines.append(f'control_directory = "{_s(inputs.get("FAMILY_SLIDER_DIR")).replace(chr(92), "/")}"')
     root = _s(inputs.get("cache_root"))
     if root and folder:
-        lines.append(f'cache_directory = "{cache_dir_for(root, folder).replace(chr(92), "/")}"')
+        lines.append(f'cache_directory = "{cache_dir_for(root, folder, posix=posix).replace(chr(92), "/")}"')
     reg = ft_reg_dir(desc, inputs)
     if reg:                              # a fine-tune's regularisation set: its own block (and cache folder)
         lines += ["", "[[datasets]]", f'image_directory = "{reg.replace(chr(92), "/")}"']
         if root:
-            lines.append(f'cache_directory = "{cache_dir_for(root, reg).replace(chr(92), "/")}"')
+            lines.append(f'cache_directory = "{cache_dir_for(root, reg, posix=posix).replace(chr(92), "/")}"')
         lines.append("is_reg = true")
     return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------------------------------------------- the plan
-def start_problems(desc, inputs):
+def start_problems(desc, inputs, target=None):
     """Everything Start refuses, in the order the desktop app lists it: the shared checks (fizgig.families.checks)
     with the family's own (problems) in their place. The dataset TOML is written by the plan itself, so only its
-    path is required here."""
+    path is required here. With a remote target the image/caption checks read the prepared local data."""
     from fizgig.families import checks
     v = inputs
+    check_folder = _check_folder(v, target)
     out = checks.learning_rate(v)
     out += checks.network(v, lokr=str(v.get("NETWORK_TYPE", "")).startswith("LoKR"))
     out += checks.numbers(v)
     out += checks.dataset_config(v.get("DATASET_CONFIG"), must_exist=False)
-    out += problems(desc, inputs)
+    out += problems(desc, inputs, target)
     out += checks.learning_rate_range(v)
     out += checks.context_lora(v)
     raw_swap = str(v.get("blocks_swap") or "").strip()
@@ -591,24 +645,33 @@ def start_problems(desc, inputs):
     out += checks.run(v, blocks_swap=swap, swap_max=max(0, desc.n_blocks - 2), arch_label=desc.gui_label,
                       name_error=checks.tidy_name(v.get("LORA_NAME"))[1])
     from fizgig.dataset.image_dataset import IMAGE_EXTENSIONS
-    out += checks.training_folder(_s(v.get("image_folder")), _s(v.get("caption_ext", ".txt")),
+    out += checks.training_folder(check_folder, _s(v.get("caption_ext", ".txt")),
                                   check_captions=not slider_on(desc, inputs, "prompts"),
                                   media_exts={e.lower() for e in IMAGE_EXTENSIONS})
     return out
 
 
-def plan(desc, inputs):
-    """The whole launch: problems first (a plan with problems must not start), then the stages in order."""
+def plan(desc, inputs, *, target=None):
+    """The whole launch: problems first (a plan with problems must not start), then the stages in order.
+
+    With a remote `target` the commands keep POSIX paths, the model files are trusted as declared (the
+    remote container verifies their sizes), and the checks read the prepared local data."""
     from fizgig.families.checks import tidy_name
+    remote = _remote(target)
+    pp = _pathmod(target)
     inputs = dict(inputs)
+    if remote:
+        # Resume flows through the remote checkpoints (remote_exec attaches --resume to the latest one),
+        # never through a path carried in the job settings.
+        inputs.pop("RESUME_TRAINING", None)
     folder = _s(inputs.get("image_folder"))
-    if folder and not os.path.isabs(folder):
-        inputs["image_folder"] = os.path.abspath(folder)     # the subprocesses run from the Fizgig folder
+    if folder and not pp.isabs(folder):
+        inputs["image_folder"] = pp.abspath(folder)     # the subprocesses run from the Fizgig folder
     inputs["LORA_NAME"] = tidy_name(_s(inputs.get("LORA_NAME")))[0]
-    p = LaunchPlan(problems=start_problems(desc, inputs))
+    p = LaunchPlan(problems=start_problems(desc, inputs, target))
     if not p.problems:
         try:
-            p.dataset_toml = dataset_toml(desc, inputs)
+            p.dataset_toml = dataset_toml(desc, inputs, posix=remote)
         except (TypeError, ValueError):
             p.problems.append("Target Megapixels (Dataset) must be a number above 0")
     missing = [k for k in ("python", "repo_dir", "DATASET_CONFIG", "LORA_OUTPUT_DIR", "NETWORK_DIM", "NETWORK_ALPHA",
@@ -618,9 +681,9 @@ def plan(desc, inputs):
     if p.problems:
         return p                        # nothing to write or run
     p.files.append((inputs["DATASET_CONFIG"], p.dataset_toml))
-    train = train_command(desc, inputs, p)
+    train = train_command(desc, inputs, p, target)
     if caches(desc, inputs):
-        p.stages += [Stage("Cache Preparation", cache_command(desc, inputs, "latents")),
-                     Stage("Text Encoder Caching", cache_command(desc, inputs, "text"))]
+        p.stages += [Stage("Cache Preparation", cache_command(desc, inputs, "latents", target)),
+                     Stage("Text Encoder Caching", cache_command(desc, inputs, "text", target))]
     p.stages.append(Stage("Training", train))
     return p

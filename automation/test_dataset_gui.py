@@ -32,10 +32,13 @@ class GuiTests(unittest.TestCase):
         self.auto.mkdir()
         make_project(self.auto, "fixture", candidates=3,
                      decisions={"c_0": {"decision": "accept"}, "c_1": {"decision": "reject"}})
+        self._sync_patch = patch.object(dataset_tab.DatasetTab, "_launch_initial_sync", lambda self: None)
+        self._sync_patch.start()
         self.app = dataset_gui.PipelineApp(automation_dir=str(self.auto))
         self.app.withdraw()
 
     def tearDown(self):
+        self._sync_patch.stop()
         try:
             self.app.destroy()
         except tk.TclError:
@@ -72,6 +75,26 @@ class GuiTests(unittest.TestCase):
             self.app.close()
         self.assertEqual(self.app.dataset_view.after_ids, [],
                          "closing cancels the tab's callbacks before the interpreter dies")
+
+
+    def test_closing_while_a_modal_stage_runs_does_not_cancel_remotely(self):
+        self.app.host.busy = True
+        tab = self.app.dataset_view
+        tab.running = "seed_train"
+        tab.running_backend = "modal"
+        tab.remote_cancel_file = self.auto / "projects" / "fixture" / "cancel_remote.request"
+
+        def fake_terminate(tab_self):
+            tab_self.running = None   # the real one lets the worker thread notice; collapse for the wiring test
+            return True
+
+        with patch.object(dataset_gui.messagebox, "askyesno", return_value=True), \
+             patch.object(dataset_tab.DatasetTab, "terminate_local", autospec=True,
+                          side_effect=fake_terminate) as spy:
+            self.app.close()
+        spy.assert_called_once()
+        self.assertFalse((self.auto / "projects" / "fixture" / "cancel_remote.request").exists(),
+                         "closing must never cancel the remote run")
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
 
+import proctree
 import runner
 import dataset_tab
 from local_caption import LocalClient
@@ -305,6 +306,7 @@ class App(tk.Tk):
         self.close_after = False
         self.process = None
         self.current_run = None
+        self.current_backend = "local"
         self.stage = None
         self.tail_offsets = {}
         self.review_run = None
@@ -968,6 +970,8 @@ class App(tk.Tk):
         self.selected_jobs = [j["id"] for j in jobs]
         self.pause_requested = False
         self.current_run = self.stage = None
+        self.current_backend = "local"
+        self.pause_button.configure(text="일시정지")
         self.tail_offsets.clear()
         self.stage_buffers.clear()
         self.set_busy(True)
@@ -1001,6 +1005,20 @@ class App(tk.Tk):
     def pause(self):
         if not self.busy or self.operation == "doctor":
             return
+        if getattr(self, "current_backend", "local") == "modal":
+            # A Modal run has no local checkpoint to pause at; the button is "원격 취소".
+            if self.current_run is not None:
+                try:
+                    (self.current_run / "cancel_remote.request").write_text("GUI cancel\n", encoding="utf-8")
+                except OSError as exc:
+                    messagebox.showerror("원격 취소", str(exc), parent=self)
+                    return
+                self.pause_button.configure(state="disabled")
+                self.status.set("원격 취소 요청됨 - 원격 작업을 취소합니다(체크포인트는 남습니다)")
+                self.log(self.status.get())
+            else:
+                self.log("아직 원격 작업이 제출되지 않았습니다 - 제출 전에는 취소할 수 없습니다")
+            return
         try:
             (AUTO / "stop_requested").write_text("GUI pause\n", encoding="utf-8")
             if self.current_run is not None:
@@ -1024,6 +1042,11 @@ class App(tk.Tk):
             if data["kind"] == "run":
                 self.current_run = Path(data["path"])
                 self.tail_offsets[self.current_run / "gemma_server.log"] = data.get("gemma_offset", 0)
+                self.current_backend = str(data.get("backend") or "local")
+                if self.current_backend == "modal":
+                    self.pause_button.configure(text="원격 취소")
+                else:
+                    self.pause_button.configure(text="일시정지")
                 if self.pause_requested:
                     self.pause()
             elif data["kind"] == "stage":
@@ -1165,8 +1188,21 @@ class App(tk.Tk):
         if self.busy:
             self.close_after = True
             if getattr(self, "dataset_view", None) is not None and self.dataset_view.running is not None:
+                if getattr(self.dataset_view, "running_backend", None) == "modal":
+                    self.dataset_view.terminate_local()
+                    self.status.set("원격은 계속 진행합니다. 로컬 추적만 종료했으며, 다음에 열 때 결과를 받습니다.")
+                    return
                 self.dataset_view.cancel()
                 self.status.set("데이터셋 단계를 중단한 뒤 창을 닫습니다. 저장이 끝날 때까지 기다려 주세요.")
+            elif getattr(self, "current_backend", "local") == "modal":
+                # A Modal run keeps going on Modal: only the local tracking ends. No pause markers, no remote cancel.
+                self.log("원격에서 계속 진행 중 - 다음에 열 때 결과를 받습니다")
+                if self.process is not None and self.process.poll() is None:
+                    pid = getattr(self.process, "pid", None)
+                    proctree.stop_tree(pid, grace=1, log=lambda text: self.log(text))
+                self.close_after = False
+                self.destroy()
+                return
             else:
                 self.pause()
                 self.status.set("작업을 안전하게 중단한 뒤 창을 닫습니다. 저장이 끝날 때까지 기다려 주세요.")

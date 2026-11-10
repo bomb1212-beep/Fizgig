@@ -434,5 +434,153 @@ class StatusTests(unittest.TestCase):
         self.assertNotIn("완료", tab.status.get())
 
 
+class ModalLocationTests(unittest.TestCase):
+    """The 학습 위치 dropdown: Modal adds --backend/--modal-gpu to the two training buttons; the rest stays local."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.auto = Path(self.temp.name) / "automation"
+        self.auto.mkdir()
+        self.folder = make_project(self.auto, "p", runs=[("char-good", "snap1", [10])],
+                                   epoch=10, exports=["aaa111222333"])
+        dataset_tab.DatasetTab._reset_sync_claim()
+
+    def tearDown(self):
+        dataset_tab.DatasetTab._reset_sync_claim()
+
+    def tab(self, location="로컬"):
+        tab = dataset_tab.DatasetTab.__new__(dataset_tab.DatasetTab)
+        tab.app = _App(self.auto)
+        tab.auto = self.auto
+        tab.running = None
+        tab.running_backend = None
+        tab.remote_cancel_file = None
+        tab._roots = {"p": self.folder}
+        tab.project = _Widget("p")
+        tab.location = _Widget(location)
+        tab.run = _Widget("")
+        tab.epoch = _Widget("")
+        tab.export_choice = _Widget("")
+        tab.status = _Widget("")
+        tab.info = _Widget("")
+        tab.log = _Widget("")
+        tab._buttons = {key: _Widget(key) for key, *_ in dataset_tab.STAGES}
+        tab.run_combo = _Widget()
+        tab.epoch_combo = _Widget()
+        tab.export_combo = _Widget()
+        tab.pause_button = _Widget("pause")
+        tab.cancel_button = _Widget("cancel")
+        tab.events = __import__("queue").Queue()
+        tab.last_log_path = None
+        tab.started_at = None
+        tab.pause_noted = False
+        tab.cancel_report = None
+        tab.cancel_requested = False
+        tab.pause_requested = False
+        tab.cancel_file = None
+        tab.process = None
+        tab.worker = None
+        tab.log_lines = []
+        return tab
+
+    def clicked(self, tab, key):
+        seen = []
+        with patch.object(tab, "_run_stage", lambda _key, _label, argv, cancelable: seen.append(argv)):
+            tab.start(key)
+        self.assertEqual(len(seen), 1, key)
+        return seen[0]
+
+    def test_local_seed_train_argv_is_unchanged(self):
+        tab = self.tab("로컬")
+        tab.refresh_info()
+        argv = self.clicked(tab, "seed_train")
+        self.assertNotIn("--backend", argv)
+        self.assertNotIn("--modal-gpu", argv)
+        self.assertEqual(argv[argv.index("pipeline.seed"):argv.index("pipeline.seed") + 2],
+                         ["pipeline.seed", "--build"])
+        self.assertTrue(argv[-2] == "--project")
+
+    def test_modal_seed_train_appends_backend_and_gpu(self):
+        tab = self.tab("Modal")
+        tab.refresh_info()
+        argv = self.clicked(tab, "seed_train")
+        self.assertIn("--backend", argv)
+        self.assertEqual(argv[argv.index("--backend") + 1], "modal")
+        self.assertEqual(argv[argv.index("--modal-gpu") + 1], "L40S")
+        self.assertTrue(argv[-2] == "--project")
+        self.assertEqual(tab.running_backend, "modal")
+        self.assertTrue(str(tab.remote_cancel_file).endswith("cancel_remote.request"))
+
+    def test_modal_todos_keeps_the_picked_export_and_adds_the_backend(self):
+        tab = self.tab("Modal")
+        tab.refresh_info()
+        argv = self.clicked(tab, "todos")
+        self.assertIn("--backend", argv)
+        self.assertEqual(argv[argv.index("--backend") + 1], "modal")
+        self.assertEqual(argv[argv.index("--modal-gpu") + 1], "L40S")
+        self.assertIn("--id", argv)
+        self.assertEqual(argv[argv.index("--id") + 1], "aaa111222333")
+        self.assertEqual(tab.running_backend, None)   # todos is not a streaming stage
+        self.assertIsNone(tab.remote_cancel_file)
+
+    def test_modal_guidance_is_shown_for_both_training_buttons(self):
+        tab = self.tab("Modal")
+        tab.refresh_info()
+        with patch.object(tab, "_append") as append:
+            self.clicked(tab, "seed_train")
+        text = "".join(str(call.args[0]) for call in append.call_args_list)
+        self.assertIn("Modal", text)
+        with patch.object(tab, "_append") as append:
+            self.clicked(tab, "todos")
+        text = "".join(str(call.args[0]) for call in append.call_args_list)
+        self.assertIn("Modal", text)
+        self.assertIn("todo", text)
+
+    def test_explicit_cancel_writes_the_remote_request_and_kills_nothing(self):
+        tab = self.tab("Modal")
+        tab.refresh_info()
+        self.clicked(tab, "seed_train")
+        tab.running = "seed_train"   # the real _run_stage sets this; the fake above does not
+        with patch.object(dataset_tab.proctree, "stop_tree") as stop:
+            tab.cancel()
+            stop.assert_not_called()
+        request = self.folder / "cancel_remote.request"
+        self.assertTrue(request.is_file())
+        self.assertEqual(request.read_text(encoding="utf-8"), "cancel\n")
+        self.assertEqual(tab.cancel_report, {"remote": True})
+        self.assertEqual(tab.status.get(), "원격 취소 대기 중")
+
+    def test_a_modal_stage_ends_the_local_tracking_only(self):
+        tab = self.tab("Modal")
+        tab.refresh_info()
+        self.clicked(tab, "seed_train")
+        tab.running = "seed_train"
+        with patch.object(dataset_tab.proctree, "stop_tree", return_value={"graceful": False, "killed": True,
+                                                                            "targets": [], "alive": []}) as stop:
+            self.assertTrue(tab.terminate_local())
+            stop.assert_called_once()
+        self.assertIsNone(tab.running_backend)
+        self.assertIsNone(tab.remote_cancel_file)
+        self.assertFalse((self.folder / "cancel_remote.request").exists(),
+                         "ending local tracking must not cancel the remote run")
+
+    def test_initial_sync_is_claimed_once_per_process(self):
+        tab = self.tab()
+        with patch.object(dataset_tab.DatasetTab, "_launch_initial_sync") as launch:
+            tab._start_initial_sync()
+            tab._start_initial_sync()
+            launch.assert_called_once()
+
+    def test_two_hosts_share_the_single_initial_sync(self):
+        first = self.tab()
+        second = self.tab()
+        second.app = _App(self.auto)
+        with patch.object(dataset_tab.DatasetTab, "_launch_initial_sync") as launch:
+            first._start_initial_sync()
+            second._start_initial_sync()
+            launch.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

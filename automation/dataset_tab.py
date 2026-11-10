@@ -248,7 +248,23 @@ def stage_command(automation_dir, project_dir, spec):
 # `gen_qwen_edit` and `ph3_edit` were added by spec N2 - both already took `--cancel-file` and poll it at a slot
 # boundary, and both leave every finished picture imported-able, so a pause there is a real pause. The resume contract
 # holds because each records what it drew before the next slot; a rerun skips what is on disk.
+# The stages whose CLI takes `--cancel-file`, mapped to whether a pause there leaves resumable work.
+#
+# The audience for this table is the pause button: a module named here gets the marker and is offered "일시정지"; one
+# not named is terminated outright, because claiming a killed process paused would be a lie about the data on disk.
+# `gen_qwen_edit` and `ph3_edit` were added by spec N2 - both already took `--cancel-file` and poll it at a slot
+# boundary, and both leave every finished picture imported-able, so a pause there is a real pause. The resume contract
+# holds because each records what it drew before the next slot; a rerun skips what is on disk.
 CANCELABLE = {"epochs", "batch_gen", "fix", "gen_qwen_edit", "ph3_edit"}
+
+# The two buttons the Modal choice applies to. Everything else stays local by construction.
+MODAL_STAGES = ("seed_train", "todos")
+
+# The GUI always asks for this card; it is the L40S price/performance recommendation in the design.
+MODAL_GPU = "L40S"
+
+# Where the tab passes the remote-cancel hook to the subprocess (the runner reads it at follow() time).
+REMOTE_CANCEL_ENV = "FIZGIG_REMOTE_CANCEL_REQUEST"
 
 
 # How long a cancelled stage gets to stop on its own before its process tree is ended. A stage that polls its marker
@@ -260,6 +276,24 @@ CANCEL_GRACE = proctree.DEFAULT_GRACE
 class DatasetTab:
     """The "데이터셋 생성" tab. Owns its widgets, its worker and its log; the App owns only the frame."""
 
+    # One background sync per process at window open, shared by the two hosts (a stand-alone window and the main
+    # window) so they never schedule two. Resettable in tests.
+    _sync_lock = threading.Lock()
+    _sync_started = False
+
+    @classmethod
+    def _try_claim_initial_sync(cls):
+        with cls._sync_lock:
+            if cls._sync_started:
+                return False
+            cls._sync_started = True
+            return True
+
+    @classmethod
+    def _reset_sync_claim(cls):
+        with cls._sync_lock:
+            cls._sync_started = False
+
     def __init__(self, app, parent, *, automation_dir=None):
         self.app = app
         self.parent = parent
@@ -268,15 +302,18 @@ class DatasetTab:
         self.process = None
         self.worker = None
         self.running = None            # the stage key currently running
+        self.running_backend = None    # "modal" or None for the current stage (Modal stages only)
         self.cancel_requested = False
         self.pause_requested = False
         self.cancel_file = None
+        self.remote_cancel_file = None
         self.cancel_report = None      # what the tree kill reported, once the cancel worker has finished
         self.pause_noted = False       # set when the stage's own output says it stopped for a pause
         self.started_at = None
         self.last_log_path = None      # the file this run's output was also written to
         self.log_lines = []
         self.project = tk.StringVar()
+        self.location = tk.StringVar(value="로컬")
         self.run = tk.StringVar()           # the seed run the epoch stages work on (spec N5)
         self.epoch = tk.StringVar()         # the epoch a person picked in this tab (spec N5)
         self.export_choice = tk.StringVar()  # the published export the final todo step would use (spec N5)
@@ -294,6 +331,7 @@ class DatasetTab:
         self.refresh_projects()
         self.after_ids = []
         self._schedule_poll()
+        self._start_initial_sync()
 
     # ---------------------------------------------------------------- widgets
 
@@ -310,6 +348,11 @@ class DatasetTab:
         self.combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_info())
         self.app.controls.append((self.combo, "readonly"))
         self.app.button(header, "새로고침", self.refresh_projects).pack(side="left")
+        ttk.Label(header, text="학습 위치", style="Muted.TLabel").pack(side="right", padx=(8, 0))
+        self.location_combo = ttk.Combobox(header, textvariable=self.location, state="readonly", width=9,
+                                           values=("로컬", "Modal"))
+        self.location_combo.pack(side="right", padx=(4, 12))
+        self.app.controls.append((self.location_combo, "readonly"))
         ttk.Label(header, textvariable=self.status, style="Muted.TLabel").pack(side="right")
 
         ttk.Label(tab, textvariable=self.info, style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 4))
@@ -397,6 +440,15 @@ class DatasetTab:
                 break
             if kind == "line":
                 self._append(payload)
+            elif kind == "sync_line":
+                self._append(payload)
+            elif kind == "sync_done":
+                if payload == 0:
+                    self._append("— sync 완료: 회수된 런은 목록에 반영됩니다\n")
+                else:
+                    self._append(f"— sync 실패 (종료 코드 {payload}) · 위 로그에서 원인을 확인하세요\n")
+                self.refresh_projects()
+                self.refresh_info()
             elif kind == "process":
                 self.process = payload
             elif kind == "cancel_report":
@@ -612,7 +664,17 @@ class DatasetTab:
         if spec is None:
             return
         spec = self._with_picked_export(self._with_picked_run(spec))
+        location = getattr(self, "location", None)
+        modal = bool(location is not None and location.get() == "Modal" and key in MODAL_STAGES)
+        if modal:
+            spec = spec + ("--backend", "modal", "--modal-gpu", MODAL_GPU)
+            if key == "seed_train":
+                self._append("학습 위치: Modal (krea2, L40S) - 제출 후 이 창을 닫아도 원격에서 계속 진행합니다.\n")
+            else:
+                self._append("학습 위치: Modal - todo가 backend=modal로 추가됩니다. 학습은 실행할 때 원격에서 진행됩니다.\n")
         argv = stage_command(self.auto, folder, spec)
+        self.running_backend = "modal" if (modal and key == "seed_train") else None
+        self.remote_cancel_file = (folder / "cancel_remote.request") if self.running_backend == "modal" else None
         self._run_stage(key, self._label(key), argv, cancelable=spec[0] in CANCELABLE)
 
     def _with_picked_run(self, spec):
@@ -690,6 +752,13 @@ class DatasetTab:
                 inherited = os.environ.get("PYTHONPATH")
                 environment = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8",
                                "PYTHONPATH": search + (os.pathsep + inherited if inherited else "")}
+                remote_cancel = getattr(self, "remote_cancel_file", None)
+                if remote_cancel is not None:
+                    try:
+                        Path(remote_cancel).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    environment[REMOTE_CANCEL_ENV] = str(remote_cancel)
                 with subprocess.Popen(argv, cwd=str(root), stdout=subprocess.PIPE,
                                       stderr=subprocess.STDOUT, encoding="utf-8", errors="replace",
                                       bufsize=1, stdin=subprocess.DEVNULL, env=environment,
@@ -737,6 +806,21 @@ class DatasetTab:
         """
         if self.running is None:
             return
+        remote_cancel = getattr(self, "remote_cancel_file", None)
+        if remote_cancel is not None:
+            # A cloud stage is cancelled by asking the runner to cancel the remote call (spec Section 7.3):
+            # the local tree is left alone, the remote checkpoints stay, and the order of events does the rest.
+            try:
+                Path(remote_cancel).write_text("cancel\n", encoding="utf-8")
+            except OSError as exc:
+                messagebox.showerror("취소", str(exc), parent=self.parent)
+                return
+            self.cancel_requested = True
+            self.cancel_report = {"remote": True}
+            self._append("… 원격 취소 요청 전송: 러너가 확인하면 Modal 작업을 취소합니다\n")
+            self.status.set("원격 취소 대기 중")
+            self.cancel_button.configure(state="disabled")
+            return
         self.cancel_requested = True
         self._append("… 취소 요청: 정상 중단을 요청하고, 남으면 소유한 프로세스 트리를 종료합니다\n")
         self.status.set("취소 중")
@@ -775,9 +859,14 @@ class DatasetTab:
             except OSError:
                 pass
         self.app.set_busy(False)
+        self.running_backend = None
+        self.remote_cancel_file = None
         report = self.cancel_report or {}
         if self.cancel_requested:
-            verdict = f"{self._label(key)} 취소됨 · 이미 그린 항목은 남아 있습니다"
+            if report.get("remote"):
+                verdict = f"{self._label(key)} 원격 취소됨 · 체크포인트는 남아 있습니다"
+            else:
+                verdict = f"{self._label(key)} 취소됨 · 이미 그린 항목은 남아 있습니다"
             if report.get("alive"):
                 # Saying "취소됨" over a surviving process would be the same lie as calling a crash a pause.
                 verdict += f' · 경고: {len(report["alive"])}개 프로세스가 남아 있습니다 {report["alive"]}'
@@ -797,6 +886,53 @@ class DatasetTab:
         self.status.set(verdict)
         self._append(f"■ {verdict}\n")
 
+
+    # ---------------------------------------------------------------- initial sync
+    def _start_initial_sync(self):
+        """Schedule the one background `runner sync` per process at window open (spec Section 6/Phase 6)."""
+        if DatasetTab._try_claim_initial_sync():
+            self._launch_initial_sync()
+
+    def _launch_initial_sync(self):
+        """Spawn `runner.py sync` in the background; its lines and the finish come back through the event queue."""
+        root = Path(self.auto).parent
+        python = root / "venv" / "Scripts" / "python.exe"
+        if not Path(python).is_file():
+            python = Path(sys.executable)
+        environment = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8",
+                       "PYTHONPATH": os.pathsep.join((str(self.auto), str(root / "src")))}
+
+        def work():
+            try:
+                with subprocess.Popen([str(python), "-B", "-u", str(Path(self.auto) / "runner.py"), "sync"],
+                                      cwd=str(root), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                      text=True, encoding="utf-8", errors="replace", bufsize=1,
+                                      stdin=subprocess.DEVNULL, env=environment,
+                                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)) as proc:
+                    assert proc.stdout is not None
+                    for line in proc.stdout:
+                        self.events.put(("sync_line", line))
+                    code = proc.wait()
+            except Exception as exc:  # noqa: BLE001 - a broken sync must never take the tab down
+                self.events.put(("sync_line", f"sync 실행 오류: {exc}\n"))
+                code = 1
+            self.events.put(("sync_done", code))
+
+        threading.Thread(target=work, daemon=True, name="fizgig-initial-sync").start()
+
+    def terminate_local(self):
+        """End only this window's tracking of a cloud stage; the remote run keeps going (spec Section 7.4)."""
+        if self.running is None:
+            return False
+        self.cancel_requested = False
+        self.running_backend = None
+        self.remote_cancel_file = None
+        self._append("로컬 추적만 종료합니다 - 원격에서 계속 진행 중이며, 다음에 열 때 결과를 받습니다\n")
+        self.status.set("로컬 추적 종료됨 · 원격은 계속 진행 중")
+        proc = self.process
+        pid = getattr(proc, "pid", None)
+        proctree.stop_tree(pid, grace=1, log=lambda text: self._append(text + "\n"))
+        return True
 
     def _append(self, text):
         if not text:

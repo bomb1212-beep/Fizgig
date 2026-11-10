@@ -82,6 +82,12 @@ class PipelineApp(tk.Tk):
                                                  "(이미 그려진 그림은 남습니다)"):
                 return
             self.close_after = True
+            tab = self.dataset_view
+            if getattr(tab, "running_backend", None) == "modal":
+                # A Modal stage ends locally only: the remote run keeps going, and sync picks it up next time.
+                tab.terminate_local()
+                self._await_stage()
+                return
             self.dataset_view.cancel()
             self._await_stage()
             return

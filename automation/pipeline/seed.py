@@ -781,13 +781,20 @@ def build_snapshot(project, *, log=print, policy=SEED_POLICY):
 
 
 def runner_config(project, snapshot, *, family="krea2", epochs=30, rank=None, learning_rate=None,
-                  megapixels=None, base=None):
+                  megapixels=None, base=None, backend="local", modal_gpu="L40S"):
     """The runner settings for this snapshot: a project's own config, holding only what this run needs."""
     base = dict(base or models.config())
     card = project.card
     images = len(snapshot["inputs"])
+    backend = str(backend or "local").strip().lower()
+    if backend not in ("local", "modal"):
+        raise pj.ProjectError(f"unknown backend {backend!r}; known: local, modal")
+    modal_gpu = _canonical_modal_gpu(modal_gpu)
+    if backend == "modal" and family != "krea2":
+        raise pj.ProjectError(f"the Modal backend supports the krea2 family only; got {family!r}")
     config = {
         **{k: v for k, v in base.items() if k.startswith("caption_")},
+        **({"cloud": base["cloud"]} if isinstance(base.get("cloud"), dict) else {}),
         # The model paths travel with the run: without them the runner falls back to prefs.json, which may point at
         # model folders that no longer exist (that is exactly what M0 fixed).
         "models": base.get("models"),
@@ -808,11 +815,28 @@ def runner_config(project, snapshot, *, family="krea2", epochs=30, rank=None, le
         "megapixels": float(megapixels or base.get("megapixels") or 0.25),
         # The captions are already written and were curated: this run must not invent or overwrite any.
         "caption_policy": "preserve",
+        # Where the seed training runs: the default is unchanged local behavior; the Modal choice travels
+        # with the job into the project's own runner config.
+        "backend": backend,
+        "modal_gpu": modal_gpu,
         "sample_prompts": card.get("sample_prompts") or [
             "{trigger}, korean webtoon style, upper body, front view, looking at viewer, white background",
             "{trigger}, korean webtoon style, full body, standing, looking at viewer, white background"],
     }
     return config
+
+
+def _canonical_modal_gpu(modal_gpu):
+    """The allowlist lives in cloud.spec; a bad value is refused here rather than at submission time."""
+    try:
+        from cloud import spec as cloud_spec
+    except Exception as exc:
+        raise pj.ProjectError("the Modal backend files are missing (automation/cloud/spec.py)") from exc
+    gpu = str(modal_gpu or cloud_spec.DEFAULT_GPU).strip().lower()
+    canonical = {name.lower(): name for name in cloud_spec.GPUS}.get(gpu)
+    if canonical is None:
+        raise pj.ProjectError(f"unknown modal_gpu {gpu!r}; known: {', '.join(cloud_spec.GPUS)}")
+    return canonical
 
 
 def prepare_runner(project, snapshot, *, config=None, log=print):
@@ -907,6 +931,10 @@ def main(argv=None):
     parser.add_argument("--rank", type=int, help="with --train: override the LoRA rank")
     parser.add_argument("--learning-rate", type=float, help="with --train: override the learning rate")
     parser.add_argument("--megapixels", type=float, help="with --train: override the training resolution budget")
+    parser.add_argument("--backend", choices=("local", "modal"), default="local",
+                        help="with --train: where the seed run trains (default: local)")
+    parser.add_argument("--modal-gpu", default="L40S",
+                        help="with --backend modal: the GPU to train on (default: L40S)")
     args = parser.parse_args(argv)
     if args.train and not args.build:
         parser.error("--train needs --build: it trains the snapshot that command writes")
@@ -939,13 +967,19 @@ def main(argv=None):
             # Training needs the snapshot to exist first, and reuses it when it is already published and intact, so a
             # rerun after a crash trains the same images rather than rebuilding them under a new id.
             config = runner_config(project, snapshot, epochs=args.epochs, rank=args.rank,
-                                   learning_rate=args.learning_rate, megapixels=args.megapixels)
+                                   learning_rate=args.learning_rate, megapixels=args.megapixels,
+                                   backend=args.backend, modal_gpu=args.modal_gpu)
             print(f"training {config['id']}: {len(snapshot['inputs'])} image(s) x {args.epochs} epochs "
-                  f"= {config['target_steps']} steps, save every ~{config['save_every_steps_approx']}")
+                  f"= {config['target_steps']} steps, save every ~{config['save_every_steps_approx']} "
+                  f"[{config['backend']}{' / ' + config['modal_gpu'] if config['backend'] == 'modal' else ''}]")
             runs = train(project, snapshot, config=config)
             print(f"run folder {runs}")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except (pj.ProjectError, ValueError, RuntimeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)

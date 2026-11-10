@@ -1,0 +1,3 @@
+# Optional dependencies for the Modal cloud-training backend (installed into the Fizgig venv).
+# The offline test suite does NOT need these. See docs/superpowers/specs/2026-11-10-modal-cloud-training-design.md §11.
+modal>=1.1

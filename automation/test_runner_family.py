@@ -315,5 +315,151 @@ class CompletionTests(unittest.TestCase):
         self.assertEqual(runner.output_state(self.run, self.cfg, self.epochs), (False, False))
 
 
+class ModalPlanTests(unittest.TestCase):
+    """Phase 1: a plan built for the Modal target carries no Windows paths and uses the declared remote models."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        (self.root / "images").mkdir()
+        from PIL import Image
+        Image.new("RGB", (32, 32), "red").save(self.root / "images" / "a.png")
+        (self.root / "images" / "a.txt").write_text("suamom, a red image", encoding="utf-8")
+        self.cfg = runner.settings({"id": "modaljob", "trigger": "suamom",
+                                    "dataset_root": str(self.root / "images"),
+                                    "family": "krea2", "backend": "modal",
+                                    "sample_prompts": ["{trigger}, portrait"]})
+        from fizgig.families.launch import PlanTarget
+        self.target = PlanTarget(posix=True, python="/opt/venv/bin/python", repo_dir="/tmp/code",
+                                 image_folder="/runs/modaljob-abc123/run/images",
+                                 cache_root="/runs/modaljob-abc123/run/cache",
+                                 dataset_config="/runs/modaljob-abc123/run/dataset.toml",
+                                 output_dir="/runs/modaljob-abc123/run/output",
+                                 check_image_folder=str(self.root / "images"))
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def plan(self):
+        return runner.launch_plan(self.root, self.cfg, 4, target=self.target)
+
+    @staticmethod
+    def looks_windows(text):
+        import re as _re
+        return "\\" in text or bool(_re.match(r"^[A-Za-z]:", text)) or ".exe" in text.lower()
+
+    def test_three_stages_and_no_windows_paths(self):
+        result = self.plan()
+        self.assertEqual([s.name for s in result.stages],
+                         ["Cache Preparation", "Text Encoder Caching", "Training"])
+        argv = [arg for stage in result.stages for arg in stage.cmd]
+        for path, _content in result.files:
+            argv.append(path)
+        argv += list(result.dirs)
+        for item in argv:
+            self.assertFalse(self.looks_windows(str(item)), f"Windows path leaked into the remote plan: {item}")
+        self.assertEqual(result.stages[0].cmd[0], "/opt/venv/bin/python")
+        self.assertTrue(result.stages[0].cmd[1].startswith("/tmp/code/src/fizgig/families/cache.py"))
+
+    def test_the_declared_remote_models_reach_the_training_command(self):
+        train = self.plan().stages[-1].cmd
+        self.assertEqual(train[train.index("--dit") + 1],
+                         "/models/diffusion_models/krea2_raw_bf16.safetensors")
+        self.assertEqual(train[train.index("--speed_lora") + 1],
+                         "/models/loras/krea2_turbo_lora_rank_64_bf16.safetensors")
+        text = train[train.index("--text_encoder") + 1]
+        self.assertEqual(text, "/models/text_encoders/qwen3vl_4b_fp8_scaled.safetensors")
+
+    def test_the_remote_toml_uses_posix_separators(self):
+        result = self.plan()
+        toml = dict(result.files)["/runs/modaljob-abc123/run/dataset.toml"]
+        self.assertIn('image_directory = "/runs/modaljob-abc123/run/images"', toml)
+        self.assertIn('cache_directory = "/runs/modaljob-abc123/run/cache/images-', toml)
+        self.assertNotIn("\\", toml)
+
+    def test_the_local_plan_is_unchanged(self):
+        result = runner.launch_plan(self.root, dict(self.cfg, backend="local"), 4)
+        self.assertNotEqual(result.stages[-1].cmd[0], "/opt/venv/bin/python")
+
+
+class ModalSettingsTests(unittest.TestCase):
+    def test_backend_is_case_insensitive_and_defaults_to_local(self):
+        self.assertEqual(runner.settings({"id": "jobx", "trigger": "t", "dataset_root": "D:/ds",
+                                          "backend": "MODAL", "family": "krea2"})["backend"], "modal")
+        self.assertEqual(runner.settings({"id": "jobx", "trigger": "t", "dataset_root": "D:/ds"})["backend"], "local")
+
+    def test_modal_gpu_is_canonicalized(self):
+        cfg = runner.settings({"id": "jobx", "trigger": "t", "dataset_root": "D:/ds",
+                               "family": "krea2", "backend": "modal", "modal_gpu": "a100-80gb"})
+        self.assertEqual(cfg["modal_gpu"], "A100-80GB")
+        cfg = runner.settings({"id": "jobx", "trigger": "t", "dataset_root": "D:/ds",
+                               "family": "krea2", "backend": "modal"})
+        self.assertEqual(cfg["modal_gpu"], "L40S")
+
+    def test_modal_only_allows_krea2(self):
+        with self.assertRaises(ValueError):
+            runner.settings({"id": "jobx", "trigger": "t", "dataset_root": "D:/ds",
+                             "family": "qwen_image21", "backend": "modal"})
+
+    def test_unknown_gpu_and_unknown_backend_are_refused(self):
+        with self.assertRaises(ValueError):
+            runner.settings({"id": "jobx", "trigger": "t", "dataset_root": "D:/ds",
+                             "family": "krea2", "backend": "modal", "modal_gpu": "H200"})
+        with self.assertRaises(ValueError):
+            runner.settings({"id": "jobx", "trigger": "t", "dataset_root": "D:/ds", "backend": "kaggle"})
+
+    def test_explicit_local_keeps_the_legacy_version(self):
+        self.assertEqual(version_of(dict(LEGACY_CFG, backend="local")), LEGACY_VERSION)
+
+    def test_cloud_cost_and_gpu_settings_never_move_the_folder(self):
+        noisy = dict(LEGACY_CFG, cloud={"modal": {"poll_seconds": 1}}, modal_gpu="H100")
+        self.assertEqual(version_of(noisy), LEGACY_VERSION)
+
+    def test_a_modal_run_lands_in_its_own_folder(self):
+        modal = version_of(dict(LEGACY_CFG, backend="modal", family="krea2"))
+        self.assertNotEqual(modal, LEGACY_VERSION)
+        # ...and changing the GPU does not rename it.
+        self.assertEqual(version_of(dict(LEGACY_CFG, backend="modal", family="krea2", modal_gpu="H100")), modal)
+
+
+class CloudPrepareTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.dataset = root / "dataset"
+        self.dataset.mkdir()
+        from PIL import Image
+        Image.new("RGB", (8, 8), "red").save(self.dataset / "a.png")
+        Image.new("RGB", (8, 8), "blue").save(self.dataset / "b.png")
+        (self.dataset / "b.txt").write_text("suamom, a blue image", encoding="utf-8")
+        self.runs = root / "runs"
+        self._old_runs = runner._PATH_OVERRIDES.get("runs")
+        runner._PATH_OVERRIDES["runs"] = self.runs
+        self.cfg = runner.settings({"id": "cloudjob", "trigger": "suamom",
+                                    "dataset_root": str(self.dataset),
+                                    "family": "krea2", "backend": "modal",
+                                    "sample_prompts": ["{trigger}, portrait"]})
+
+    def tearDown(self):
+        if self._old_runs is None:
+            runner._PATH_OVERRIDES.pop("runs", None)
+        else:
+            runner._PATH_OVERRIDES["runs"] = self._old_runs
+        self.temp.cleanup()
+
+    def test_a_modal_prepare_does_not_fill_missing_captions(self):
+        run, images, _instructions = runner.prepare(self.cfg)
+        missing = runner.cloud_missing_captions(images)
+        self.assertEqual([Path(item["source"]).name for item in missing], ["a.png"])
+        written = list((run / "images").glob("*.txt"))
+        self.assertEqual(len(written), 1)   # only b.txt made it into the working copy
+
+    def test_the_inventory_fingerprint_covers_images_and_captions(self):
+        run, images, _instructions = runner.prepare(self.cfg)
+        fp = runner.inventory_fingerprint(run)
+        self.assertTrue(fp)
+        self.assertEqual(fp, runner.digest([(item["sha256"], str(item.get("caption") or "")) for item in images]))
+
+
 if __name__ == "__main__":
     unittest.main()

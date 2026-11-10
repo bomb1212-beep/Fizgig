@@ -967,5 +967,73 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(disk, sorted(entry["file"] for entry in first["images"]))
 
 
+class ModalTodoTests(unittest.TestCase):
+    """`export todos --backend modal`: only krea2 jobs, the scope shown, and existing todos kept in place."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.automation = self.root / "automation"
+        self.automation.mkdir()
+        (self.automation / "todo.json").write_text("[]", encoding="utf-8")
+        self.project = FakeProject(self.root / "projects" / "p", card={"id": "p", "trigger": "suamom"})
+        self.manifest = write_minimal_export(self.root / "exports" / "abc123")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_modal_prepares_only_krea2_and_tags_the_jobs(self):
+        jobs = export.plan_todos(self.project, self.manifest, automation_dir=self.automation,
+                                 backend="modal", modal_gpu="a100-80gb")
+        self.assertEqual([job["family"] for job in jobs], ["krea2"])
+        self.assertEqual(jobs[0]["backend"], "modal")
+        self.assertEqual(jobs[0]["modal_gpu"], "A100-80GB")
+
+    def test_modal_without_krea2_is_refused_with_the_reason(self):
+        manifest = dict(self.manifest, families=["qwen_image21"])
+        with self.assertRaisesRegex(export.ExportError, "krea2"):
+            export.plan_todos(self.project, manifest, automation_dir=self.automation, backend="modal")
+
+    def test_modal_with_an_explicit_unsupported_family_is_refused(self):
+        with self.assertRaisesRegex(export.ExportError, "krea2"):
+            export.plan_todos(self.project, self.manifest, automation_dir=self.automation,
+                              families=["qwen_image21"], backend="modal")
+
+    def test_modal_with_a_mixed_export_skips_and_logs_the_rest(self):
+        logs = []
+        manifest = dict(self.manifest, families=["krea2", "qwen_image21"])
+        report = export.add_todos(self.project, manifest, automation_dir=self.automation,
+                                  backend="modal", log=lambda *a: logs.append(" ".join(str(x) for x in a)))
+        self.assertEqual([job["family"] for job in report["added"]], ["krea2"])
+        self.assertTrue(any("qwen_image21" in line for line in logs))
+
+    def test_an_unknown_gpu_is_refused(self):
+        with self.assertRaisesRegex(export.ExportError, "unknown modal_gpu"):
+            export.plan_todos(self.project, self.manifest, automation_dir=self.automation,
+                              backend="modal", modal_gpu="H200")
+
+    def test_an_existing_todo_keeps_its_location_and_the_log_says_so(self):
+        (self.automation / "todo.json").write_text(
+            json.dumps([{"id": "p_abc123_krea2", "enabled": True, "backend": "modal",
+                         "modal_gpu": "L40S", "trigger": "suamom"}]),
+            encoding="utf-8")
+        logs = []
+        export.add_todos(self.project, self.manifest, automation_dir=self.automation, backend="local",
+                         log=lambda *a: logs.append(" ".join(str(x) for x in a)))
+        written = json.loads((self.automation / "todo.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(written), 2)     # qwen_image21 local job added, modal krea2 kept untouched
+        kept = next(job for job in written if job["id"] == "p_abc123_krea2")
+        self.assertEqual(kept["backend"], "modal")
+        self.assertTrue(any("backend=modal" in line and "selected local" in line for line in logs))
+
+    def test_added_modal_jobs_are_disabled_by_default(self):
+        report = export.add_todos(self.project, self.manifest, automation_dir=self.automation,
+                                  backend="modal", log=lambda *_: None)
+        written = json.loads((self.automation / "todo.json").read_text(encoding="utf-8"))
+        modal_jobs = [job for job in written if job.get("backend") == "modal"]
+        self.assertTrue(modal_jobs)
+        self.assertTrue(all(job["enabled"] is False for job in modal_jobs))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -25,8 +25,10 @@ EVENTS = False
 DEFAULT_FAMILY = "qwen_image21"
 # Settings that describe the pipeline plumbing rather than the training run: which files the runner resolves them to
 # is checked on disk before anything loads, and hashing them would move every existing run to a new version directory
-# the moment the block is added. The family is hashed only when it is not the default, for the same reason.
-PIPELINE_SETTINGS = ("comfy", "models", "pipeline", "pipeline_model_paths")
+# the moment the block is added. The family is hashed only when it is not the default, for the same reason. `cloud`
+# (cost/polling), `backend` and `modal_gpu` are plumbing for the same reason: `backend` is folded back in only for a
+# non-local backend, so a Modal run never lands in the same folder as the identical local run.
+PIPELINE_SETTINGS = ("comfy", "models", "pipeline", "pipeline_model_paths", "cloud", "backend", "modal_gpu")
 # Caption instructions per project kind (spec 4 M1). A 2D character and a photo want different words out of the same
 # local model, and the file a run used is part of its caption identity, so switching kind re-captions rather than
 # silently mixing two styles in one dataset.
@@ -56,6 +58,11 @@ def todo_path():
 def runs_root():
     return _PATH_OVERRIDES.get("runs") or (AUTO / "runs")
 
+
+def queue_lock_path():
+    """The queue lock the GUIs watch. `--queue-lock` moves it for a run that is not the user's queue (tests)."""
+    return _PATH_OVERRIDES.get("queue_lock") or (AUTO / "queue.lock")
+
 def emit_event(kind, **values):
     if EVENTS:
         print(EVENT_PREFIX + json.dumps({"kind": kind, **values}, ensure_ascii=False), flush=True)
@@ -67,7 +74,7 @@ def check_pause():
 def queue_owner_running():
     """Read-only liveness check; never signal an existing Windows training process."""
     try:
-        pid = int((AUTO / "queue.lock").read_text(encoding="utf-8").strip())
+        pid = int(queue_lock_path().read_text(encoding="utf-8").strip())
         if pid <= 0:
             return False
         if os.name == "nt":
@@ -104,9 +111,41 @@ def write_json(path, obj):
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
+
+def epochs_for(target_steps, n):
+    """The one epoch calculation planning, cost estimation and completion checks all use."""
+    return max(1, math.floor(target_steps / n + 0.5))
+
+BACKENDS = ("local", "modal")
+
+
+def backend_of(cfg):
+    return str(cfg.get("backend") or "local").strip().lower()
+
+
 def settings(job):
     cfg = read_json(config_path())
     cfg.update(job)
+    # backend / modal_gpu are normalized up front so every caller sees the same shape. Modal is the cloud path and
+    # supports the krea2 family only; the local backend keeps every existing behaviour.
+    backend = backend_of(cfg)
+    if backend not in BACKENDS:
+        raise ValueError(f"unknown backend {backend!r}; known: " + ", ".join(BACKENDS))
+    cfg["backend"] = backend
+    if backend == "modal":
+        from cloud import spec as cloud_spec
+        gpu = str(cfg.get("modal_gpu") or cloud_spec.DEFAULT_GPU).strip().lower()
+        canonical = {name.lower(): name for name in cloud_spec.GPUS}.get(gpu)
+        if canonical is None:
+            raise ValueError(f"unknown modal_gpu {gpu!r}; known: " + ", ".join(cloud_spec.GPUS))
+        cfg["modal_gpu"] = canonical
+        family = str(cfg.get("family") or DEFAULT_FAMILY).strip()
+        if family != cloud_spec.SUPPORTED_FAMILY:
+            raise ValueError(f"the Modal backend supports the {cloud_spec.SUPPORTED_FAMILY} family only; "
+                             f"got {family!r}")
+    else:
+        # Informational only for local runs; never hashed, never used to gate anything.
+        cfg["modal_gpu"] = str(cfg.get("modal_gpu") or "L40S").strip() or "L40S"
     required = ("id", "dataset_root", "target_steps", "max_images_per_job", "rank", "save_every_steps_approx",
                 "caption_base_url", "caption_model", "caption_max_output_tokens")
     missing = [key for key in required if key not in cfg]
@@ -168,6 +207,11 @@ def version_settings(cfg):
     family = family_of(cfg)
     if family != DEFAULT_FAMILY:
         out["family"] = family
+    # A non-local backend makes the run a different run, in a different folder; an explicit `backend: local` does
+    # not (it is the default the old behaviour assumed).
+    backend = backend_of(cfg)
+    if backend != "local":
+        out["backend"] = backend
     return out
 
 def caption_profile(cfg):
@@ -284,7 +328,7 @@ def caches_valid(run, family=None):
         return False
 
 def output_state(run, cfg, epochs):
-    """(training_ok, preview_ok) — two verdicts, because a missing preview is not a missing LoRA.
+    """(training_ok, preview_ok) - two verdicts, because a missing preview is not a missing LoRA.
 
     Fizgig turns previews off when VRAM is tight and trains on regardless. Judging the run by its previews made such a
     finished run look unfinished and trained it again from scratch. The final LoRA and the saved training state are the
@@ -319,11 +363,31 @@ def preview_missing(run, cfg, epochs):
                 "(Fizgig turns previews off when VRAM is short). Not retraining.")
     return ""
 
+def inventory_fingerprint(run):
+    """Fingerprint of the adopted original image+caption inventory (from the manifest).
+
+    Stored next to the working `images/` fingerprint so a run records both what it started from and what it
+    actually trained on; the Modal backend compares the original inventory before accepting a remote result.
+    """
+    try:
+        manifest = read_json(Path(run) / "dataset_manifest.json")
+        return digest([(item.get("sha256"), str(item.get("caption") or "")) for item in manifest.get("images", [])])
+    except Exception:
+        return None
+
+
+def cloud_missing_captions(images):
+    """The adopted originals without a non-empty caption. Cloud jobs refuse to run rather than caption or reuse."""
+    return [item for item in images if not str(item.get("caption") or "").strip()]
+
+
 def prepare(cfg):
+    cloud = backend_of(cfg) == "modal"
     run, images, rejected, instructions = context(cfg)
     folder = run / "images"
     folder.mkdir(parents=True, exist_ok=True)
-    sources = caption_sources(cfg, instructions, exclude=run)
+    # A cloud run never fills gaps from earlier runs' captions; missing captions are refused before submission.
+    sources = [] if cloud else caption_sources(cfg, instructions, exclude=run)
     reused = 0
     for item in images:
         source = Path(item["source"])
@@ -347,7 +411,8 @@ def prepare(cfg):
         print(f"Reused {reused} captions from matching earlier settings.", flush=True)
     gemma_log = run / "gemma_server.log"
     emit_event("run", path=str(run), job=cfg["id"], images=len(images),
-               gemma_offset=gemma_log.stat().st_size if gemma_log.exists() else 0)
+               gemma_offset=gemma_log.stat().st_size if gemma_log.exists() else 0,
+               backend=backend_of(cfg))
     return run, images, instructions
 
 def captions(run, cfg, instructions, limit=None):
@@ -388,26 +453,40 @@ def captions(run, cfg, instructions, limit=None):
             print(f"Caption {i}/{len(pending)}: {path.name[:16]}", flush=True)
             emit_event("caption", done=i, total=len(pending))
 
-def launch_plan(run, cfg, n):
+def launch_plan(run, cfg, n, *, target=None):
     """The family's preset, the run's settings, and the family's own preview defaults, as Fizgig's planner takes them.
 
     The preset supplies what a run's settings do not name (optimizer, precision, EMA, the family's own switches); the
     run's settings win where they are set, which is how a todo item overrides a family default (spec 4 M1).
+
+    With `target` (a fizgig.families.launch.PlanTarget) the plan is built for a non-local host: POSIX paths, the
+    declared remote model mapping instead of this machine's files, and the prepared local data as the check folder.
     """
     from fizgig.families.registry import get
     from fizgig.families.launch import plan
     family = family_of(cfg)
     desc = get(family)
     # Batch=1, accumulation=1, repeat=1: one image is one step per epoch.
-    epochs = max(1, math.floor(cfg["target_steps"] / n + 0.5))
+    epochs = epochs_for(cfg["target_steps"], n)
     every = max(1, math.ceil(cfg["save_every_steps_approx"] / n))
     inputs = dict(desc.presets[0][1])
-    inputs.update(python=sys.executable, repo_dir=str(ROOT), models=model_paths.resolve(family, cfg),
-        image_folder=str(run / "images"), caption_ext=".txt", batch_size=1,
+    if target is None:
+        python, repo_dir = sys.executable, str(ROOT)
+        models = model_paths.resolve(family, cfg)
+        image_folder, cache_root = str(run / "images"), str(run / "cache")
+        dataset_config, output_dir = str(run / "dataset.toml"), str(run / "output")
+    else:
+        from cloud import spec as cloud_spec
+        python, repo_dir = target.python, target.repo_dir
+        models = cloud_spec.role_model_map(desc)
+        image_folder, cache_root = target.image_folder, target.cache_root
+        dataset_config, output_dir = target.dataset_config, target.output_dir
+    inputs.update(python=python, repo_dir=repo_dir, models=models,
+        image_folder=image_folder, caption_ext=".txt", batch_size=1,
         megapixels=cfg["megapixels"], enable_bucket=True, no_upscale=True,
-        cache_root=str(run / "cache"), enable_cache=True, blocks_swap="Auto (detect from GPU)",
-        DATASET_CONFIG=str(run / "dataset.toml"), LORA_NAME=cfg["id"],
-        LORA_OUTPUT_DIR=str(run / "output"), NETWORK_DIM=cfg["rank"], NETWORK_ALPHA=cfg["rank"],
+        cache_root=cache_root, enable_cache=True, blocks_swap="Auto (detect from GPU)",
+        DATASET_CONFIG=dataset_config, LORA_NAME=cfg["id"],
+        LORA_OUTPUT_DIR=output_dir, NETWORK_DIM=cfg["rank"], NETWORK_ALPHA=cfg["rank"],
         LEARNING_RATE=cfg["learning_rate"], MAX_TRAIN_EPOCHS=epochs, SAVE_EVERY_N_EPOCHS=every,
         SEED=cfg.get("seed", 42), ADAPTIVE_LR=cfg["adaptive_lr"],
         ADAPTIVE_LR_MIN=cfg["adaptive_lr_min"], ADAPTIVE_LR_MAX=cfg["adaptive_lr_max"],
@@ -419,7 +498,7 @@ def launch_plan(run, cfg, n):
         samples={"enabled": True, "every": every, "width": desc.preview_width, "height": desc.preview_height,
                  "steps": desc.preview_steps, "cfg": desc.preview_cfg, "seed": 42,
                  "prompts": [p.replace("{trigger}", cfg["trigger"]) for p in cfg["sample_prompts"]]})
-    result = plan(desc, inputs)
+    result = plan(desc, inputs, target=target)
     print(f"Target {cfg['target_steps']}; {n} steps/epoch x {epochs} epochs = ~{n * epochs} steps "
           f"({family}, {desc.arch_id}).")
     if result.problems:
@@ -429,6 +508,14 @@ def launch_plan(run, cfg, n):
 def execute(run, cfg, n):
     family = family_of(cfg)
     desc = model_paths.description(family)
+    epochs = epochs_for(cfg["target_steps"], n)
+    fingerprint = working_fingerprint(run)
+    inv_fingerprint = inventory_fingerprint(run)
+    if backend_of(cfg) == "modal":
+        # The cloud path owns its state machine; nothing local runs (no GPU, no Gemma, no local model files).
+        from cloud import modal_backend
+        return modal_backend.execute(run, cfg, n, epochs=epochs, fingerprint=fingerprint,
+                                     inventory_fingerprint=inv_fingerprint)
     if LocalClient(cfg).listening():
         raise RuntimeError(f"Gemma server is still running. Close it before {family} GPU training, then rerun.")
     result = launch_plan(run, cfg, n)
@@ -439,13 +526,14 @@ def execute(run, cfg, n):
         Path(path).write_text(content, encoding="utf-8")
     state_path = run / "state.json"
     state = read_json(state_path) if state_path.exists() else {"completed_stages": []}
-    fingerprint = working_fingerprint(run)
-    epochs = max(1, math.floor(cfg["target_steps"] / n + 0.5))
+
     # A state written by another family is not a state this run can resume: different cache files, different
     # architecture, different trainer.
     if state.get("family") not in (None, family):
         print(f"Run state belongs to {state['family']}; starting {family} from the top.", flush=True)
         state = {"completed_stages": []}
+    if inv_fingerprint:
+        state["inventory_fingerprint"] = inv_fingerprint
     state["family"] = family
     state["arch_id"] = desc.arch_id
     cached_ok = caches_valid(run, family)
@@ -538,6 +626,42 @@ def execute(run, cfg, n):
     write_json(state_path, state)
     print(f"DONE: {run / 'output'}", flush=True)
 
+def doctor_cloud(failures, jobs):
+    """The Modal-side checks for jobs with backend=modal: package, token/workspace, deployment, family, captions.
+
+    Local CUDA/models/ComfyUI are deliberately not checked for cloud jobs. `settings()` already refuses a Modal job
+    whose family is not krea2, so it shows up here as a per-job error."""
+    try:
+        import modal  # noqa: F401  - presence is the check
+    except ImportError:
+        failures.append("the `modal` package is not installed; run "
+                        ".\\venv\\Scripts\\python.exe -m pip install -r automation\\cloud\\requirements.txt "
+                        "then .\\venv\\Scripts\\python.exe -m modal token new")
+        return
+    from cloud import client as cloud_client, spec as cloud_spec
+    try:
+        client = cloud_client.ModalClient(log=print)
+        deployed = client.deployed_version()
+        local_version = cloud_spec.local_deployment_version()
+        if deployed is None:
+            print("Modal app 'fizgig-train' is not deployed yet; the first submit deploys it")
+        elif deployed != local_version:
+            print(f"Modal app deployed at {deployed}, local build is {local_version}; the first submit redeploys")
+        else:
+            print(f"Modal app 'fizgig-train' deployed, version {deployed}")
+    except Exception as exc:
+        failures.append(f"Modal is not reachable (check the token and the workspace): {exc}")
+    for job in jobs:
+        cfg = settings(job)
+        images, _rejected = inventory(cfg)
+        missing = cloud_missing_captions(images)
+        family = family_of(cfg)
+        print(f"{job['id']}: {family}, {len(images)} readable images, {len(missing)} missing captions")
+        if missing:
+            names = ", ".join(Path(item["source"]).name for item in missing[:5])
+            failures.append(f"{job['id']}: {len(missing)} adopted image(s) have no caption (e.g. {names})")
+
+
 def doctor_models(failures, used=None):
     """Report every family's model files, marking broken paths, and return the families that are fully ready.
 
@@ -611,7 +735,7 @@ def _variant_nodes(variant):
 def main():
     global EVENTS
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["doctor", "prepare", "caption", "plan", "run", "status"])
+    parser.add_argument("command", choices=["doctor", "prepare", "caption", "plan", "run", "status", "sync", "cancel"])
     parser.add_argument("--job", action="append")
     parser.add_argument("--events", action="store_true", help="Structured progress for the desktop GUI")
     parser.add_argument("--limit", type=int, help="Caption at most N pending photos (caption command only)")
@@ -620,13 +744,44 @@ def main():
     parser.add_argument("--todo", help="job list (default automation/todo.json)")
     parser.add_argument("--runs-dir", help="where runs are written (default automation/runs); the pipeline points "
                                            "this at the project folder")
+    parser.add_argument("--queue-lock", help="queue lock file (default automation/queue.lock, which the GUIs "
+                                             "watch); a run that is not the user's queue, such as a test, "
+                                             "points this elsewhere")
     args = parser.parse_args()
     EVENTS = args.events
-    for key, value in (("config", args.config), ("todo", args.todo), ("runs", args.runs_dir)):
+    for key, value in (("config", args.config), ("todo", args.todo), ("runs", args.runs_dir),
+                       ("queue_lock", args.queue_lock)):
         if value:
             _PATH_OVERRIDES[key] = Path(value).resolve()
     if args.limit is not None and (args.command != "caption" or args.limit <= 0):
         parser.error("--limit must be positive and can only be used with caption")
+    if args.command == "sync":
+        # Recover finished remote runs (and retry remote cleanup); never submits anything. No queue lock.
+        from cloud import modal_backend
+        roots = modal_backend.default_runs_roots_for_sync([Path(args.runs_dir)]) if args.runs_dir else None
+        summary = modal_backend.sync(roots=roots, log=print)
+        if summary["failed"]:
+            names = ", ".join(name for name, _ in summary["failed"])
+            raise ValueError(f"sync: {len(summary['failed'])} remote run(s) reported errors: {names}")
+        return
+    if args.command == "cancel":
+        if not args.job:
+            parser.error("cancel requires --job <id>")
+        from cloud import modal_backend
+        for job_id in args.job:
+            roots = [Path(args.runs_dir)] if args.runs_dir else None
+            matches = modal_backend.find_runs(job_id, roots=roots)
+            if not matches:
+                print(f"{job_id}: no remote run found", flush=True)
+                continue
+            if len(matches) > 1 and not args.runs_dir:
+                for match in matches:
+                    print(f"  {match}", flush=True)
+                raise ValueError(f"{job_id}: several runs match; narrow with --runs-dir (e.g. the "
+                                 f"project seed folder)")
+            for run in matches:
+                modal_backend.cancel(run, log=print)
+        return
     jobs = [j for j in read_json(todo_path()) if j.get("enabled", True)
             and (not args.job or j["id"] in args.job)]
     if not jobs or len({j['id'] for j in jobs}) != len(jobs):
@@ -643,27 +798,35 @@ def main():
             except Exception as exc:  # noqa: BLE001 - a broken export is a refused run, whatever the reason
                 raise ValueError(f"job {job['id']}: {exc}") from exc
     if args.command == "doctor":
-        import torch
-        cuda = torch.cuda.is_available()
-        failures = [] if cuda else ["CUDA is not available."]
-        print("Python:", sys.executable, "CUDA:", cuda)
-        for job in jobs:
-            cfg = settings(job)
-            client = LocalClient(cfg)
-            print("Local caption model:", cfg["caption_model"], "at", client.base)
-            print("Gemma server:", "ready" if client.ready() else "not running; auto-start on caption")
-            if client.ready():
-                client.verify_model()
-            executable_key = "caption_server_exe" if cfg.get("caption_launch_mode") == "direct" else "caption_start_script"
-            for key in (executable_key, "caption_model_file", "caption_mmproj_file"):
-                path = cfg.get(key, "")
-                exists = bool(path) and Path(path).is_file()
-                print(key, "OK" if exists else "MISSING", path)
-                if not exists and cfg.get("caption_auto_start", True):
-                    failures.append("Missing " + key)
-        ready = doctor_models(failures, used={family_of(settings(job)) for job in jobs})
-        print("Families ready to train:", ", ".join(ready) if ready else "none")
-        doctor_comfy(failures)
+        local_jobs = [j for j in jobs if backend_of(settings(j)) != "modal"]
+        modal_jobs = [j for j in jobs if backend_of(settings(j)) == "modal"]
+        failures = []
+        if local_jobs:
+            import torch
+            cuda = torch.cuda.is_available()
+            failures = [] if cuda else ["CUDA is not available."]
+            print("Python:", sys.executable, "CUDA:", cuda)
+            for job in local_jobs:
+                cfg = settings(job)
+                client = LocalClient(cfg)
+                print("Local caption model:", cfg["caption_model"], "at", client.base)
+                print("Gemma server:", "ready" if client.ready() else "not running; auto-start on caption")
+                if client.ready():
+                    client.verify_model()
+                executable_key = "caption_server_exe" if cfg.get("caption_launch_mode") == "direct" else "caption_start_script"
+                for key in (executable_key, "caption_model_file", "caption_mmproj_file"):
+                    path = cfg.get(key, "")
+                    exists = bool(path) and Path(path).is_file()
+                    print(key, "OK" if exists else "MISSING", path)
+                    if not exists and cfg.get("caption_auto_start", True):
+                        failures.append("Missing " + key)
+            ready = doctor_models(failures, used={family_of(settings(job)) for job in local_jobs})
+            print("Families ready to train:", ", ".join(ready) if ready else "none")
+            doctor_comfy(failures)
+        elif modal_jobs:
+            print("cloud jobs only; skipping local CUDA/model/ComfyUI checks")
+        if modal_jobs:
+            doctor_cloud(failures, modal_jobs)
         for job in jobs:
             cfg = settings(job)
             images, rejected = inventory(cfg)
@@ -671,52 +834,85 @@ def main():
         if failures:
             raise ValueError("Environment check failed: " + "; ".join(failures))
         return
-    lock = AUTO / "queue.lock"
+    lock = queue_lock_path()
     from pipeline import gpu as pipeline_gpu
-    # One GPU, one resource lock (spec N1): training, generation and scoring all take the same atomic claim on
-    # gpu.lock, so no two-side pre-check is trusted to keep them apart. The queue lock keeps its queue-serialization
-    # role and gains the same dead-owner rule the GPU claim uses. `run` and `caption` hold the GPU claim from here
-    # until training ends, because the Gemma caption server holds VRAM for the whole span too (spec N1.5).
-    gpu_claim = pipeline_gpu.claim_gpu(what=f"{args.command} run") if args.command in ("run", "caption") else None
+    # One queue lock for everything that runs or captions (cloud-only jobs included). gpu.lock covers only the
+    # local captions/cache/training span (spec N1); cloud jobs never claim it. The queue lock is taken first (spec N1).
+    pipeline_gpu.take_queue_lock(lock)
     try:
-        if gpu_claim is not None:
-            gpu_claim.acquire()          # raises GpuBusy when another GPU job is live
-        pipeline_gpu.take_queue_lock(lock)
-        try:
-            for job in jobs:
-                cfg = settings(job)
+        for job in jobs:
+            cfg = settings(job)
+            local = backend_of(cfg) != "modal"
+            claim = None
+            try:
+                if args.command in ("caption", "run") and local:
+                    claim = pipeline_gpu.claim_gpu(what=f"{args.command} {cfg['id']}")
+                    claim.acquire()          # raises GpuBusy when another GPU job is live
                 if args.command == "status":
                     run, _, _, _ = context(cfg)
                     print(cfg["id"], read_json(run / "state.json") if (run / "state.json").exists() else "not started")
+                    if backend_of(cfg) == "modal":
+                        from cloud import modal_backend
+                        try:
+                            modal_backend.follow(run, cfg, once=True)
+                        except Exception as exc:
+                            print(f"{cfg['id']}: remote check failed: {exc}", flush=True)
                     continue
                 run, images, instructions = prepare(cfg)
-                if args.command in ("caption", "run"):
+                if args.command == "caption":
+                    captions(run, cfg, instructions, limit=args.limit)
+                if args.command == "run":
                     # Check training model readiness before loading the caption model.
-                    if args.command == "run":
+                    if backend_of(cfg) == "modal":
+                        # Cloud runs never call Gemma or reuse past captions: refuse instead of captioning.
+                        missing = cloud_missing_captions(images)
+                        if missing:
+                            names = ", ".join(Path(item["source"]).name for item in missing[:5])
+                            raise ValueError(
+                                f"{cfg['id']}: {len(missing)} adopted image(s) have no caption (e.g. {names}); "
+                                f"Modal runs cannot caption - caption them first, or run this job locally with "
+                                f"caption_policy=missing-only")
+                    else:
                         blocked = model_paths.problems(family_of(cfg))
                         if blocked:
                             raise ValueError("Models not ready: " + "; ".join(blocked))
-                    captions(run, cfg, instructions, limit=args.limit)
+                        # Check training model readiness before loading the caption model.
+                        captions(run, cfg, instructions, limit=args.limit)
                 if args.command == "plan":
+                    if backend_of(cfg) == "modal":
+                        # The plan works offline: build the remote plan without touching Modal.
+                        from cloud import modal_backend
+                        fingerprint = working_fingerprint(run)
+                        epochs = epochs_for(cfg["target_steps"], len(images))
+                        plan = modal_backend.remote_plan(run, cfg, len(images),
+                                                         run_key=f"{cfg['id']}-{fingerprint[:12]}",
+                                                         attempt_id="plan",
+                                                         fingerprint=fingerprint,
+                                                         inventory_fingerprint=inventory_fingerprint(run),
+                                                         code_sha256="", epochs=epochs)
+                        write_json(run / "launch_plan.json", plan)
+                        print("Remote plan saved:", run / "launch_plan.json")
+                        continue
                     result = launch_plan(run, cfg, len(images))
                     write_json(run / "launch_plan.json", {"stages": [{"name": s.name, "cmd": s.cmd} for s in result.stages],
                                                            "files": result.files})
                     print("Plan saved:", run / "launch_plan.json")
                 if args.command == "run":
-                    # The release-then-gate order matters: freeing the idle server may be what makes the gate pass,
-                    # and a busy server refuses the start before the gate is even consulted (spec N1.4).
-                    if free_comfy_before_training(cfg) == "busy":
-                        raise ValueError("ComfyUI still has requests running; not starting training under it - wait "
-                                         "for the requests to finish (nothing is cancelled)")
-                    # The read-only VRAM gate (spec N1.6): refuse a start that would not fit; an unreadable number
-                    # or an unmeasured family/kind only warns and proceeds.
-                    pipeline_gpu.vram_gate(family_of(cfg), "train", config=cfg)
+                    if backend_of(cfg) != "modal":
+                        # The release-then-gate order matters: freeing the idle server may be what makes the gate
+                        # pass, and a busy server refuses the start before the gate is even consulted (spec N1.4).
+                        if free_comfy_before_training(cfg) == "busy":
+                            raise ValueError("ComfyUI still has requests running; not starting training under it - wait "
+                                             "for the requests to finish (nothing is cancelled)")
+                        # The read-only VRAM gate (spec N1.6): refuse a start that would not fit; an unreadable number
+                        # or an unmeasured family/kind only warns and proceeds.
+                        pipeline_gpu.vram_gate(family_of(cfg), "train", config=cfg)
                     execute(run, cfg, len(images))
-        finally:
-            lock.unlink(missing_ok=True)
+            finally:
+                if claim is not None:
+                    claim.release()
     finally:
-        if gpu_claim is not None:
-            gpu_claim.release()
+        lock.unlink(missing_ok=True)
 
 
 def free_comfy_before_training(cfg, *, client=None, log=print):

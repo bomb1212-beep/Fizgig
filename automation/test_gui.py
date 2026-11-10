@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 import automation_gui as gui
+import dataset_tab
 import runner
 
 
@@ -48,7 +49,8 @@ if command=='run':
         time.sleep(.03)
 print('fixture completed',flush=True)
 ''', encoding="utf-8")
-        self.patches = [patch.object(gui, "AUTO", self.auto), patch.object(runner, "AUTO", self.auto)]
+        self.patches = [patch.object(gui, "AUTO", self.auto), patch.object(runner, "AUTO", self.auto),
+                        patch.object(dataset_tab.DatasetTab, "_launch_initial_sync", lambda self: None)]
         for item in self.patches:
             item.start()
         self.app = gui.App()
@@ -207,3 +209,96 @@ print('fixture completed',flush=True)
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GuiModalTests(unittest.TestCase):
+    """A runner job whose backend is Modal: the pause button becomes remote cancel, and close only ends the local tail."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="gui-modal-test-", dir=runner.AUTO)
+        self.root = Path(self.temp.name)
+        self.auto = self.root / "automation"
+        self.auto.mkdir()
+        self.source = self.root / "source"
+        self.source.mkdir()
+        from PIL import Image
+        Image.new("RGB", (32, 32), "red").save(self.source / "one.png")
+        (self.source / "one.txt").write_text("a red image", encoding="utf-8")
+        self.cfg = runner.read_json(runner.AUTO / "config.json")
+        self.cfg["dataset_root"] = str(self.source)
+        runner.write_json(self.auto / "config.json", self.cfg)
+        runner.write_json(self.auto / "todo.json", [
+            {"id": "modaljob", "trigger": "test", "enabled": True, "backend": "modal",
+             "family": "krea2", "dataset_root": str(self.source)}])
+        runner.write_json(self.auto / "llm_profiles.json", {})
+        (self.auto / "caption_instructions.txt").write_text("Describe the colors.", encoding="utf-8")
+        (self.auto / "runner.py").write_text('''import json,sys,time
+from pathlib import Path
+auto=Path(__file__).parent
+command=sys.argv[1]
+print('fixture arguments: '+json.dumps(sys.argv[1:]), flush=True)
+if command=='run':
+    run=auto/'modal-fixture-run'
+    run.mkdir(exist_ok=True)
+    print('@@FIZGIG_EVENT@@'+json.dumps({'kind':'run','path':str(run),'backend':'modal'}),flush=True)
+    for i in range(6000):
+        if (run/'cancel_remote.request').exists():
+            print('fixture cancelled',flush=True)
+            sys.exit(0)
+        time.sleep(0.05)
+print('fixture completed',flush=True)
+''', encoding="utf-8")
+        self.patches = [patch.object(gui, "AUTO", self.auto), patch.object(runner, "AUTO", self.auto),
+                        patch.object(dataset_tab.DatasetTab, "_launch_initial_sync", lambda self: None)]
+        for item in self.patches:
+            item.start()
+        self.app = gui.App()
+        self.app.withdraw()
+        self.wait_for(lambda: not self.app.review_busy)
+
+    def wait_for(self, predicate, timeout=10):
+        end = time.monotonic() + timeout
+        while not predicate() and time.monotonic() < end:
+            self.app.update()
+            time.sleep(.01)
+        self.app.update()
+        self.assertTrue(predicate(), "GUI operation did not finish")
+
+    def tearDown(self):
+        if self.app.busy:
+            try:
+                self.app.pause()
+                self.wait_for(lambda: not self.app.busy)
+            except tk.TclError:
+                pass
+        try:
+            self.app.destroy()
+        except tk.TclError:
+            pass
+        for item in reversed(self.patches):
+            item.stop()
+        self.temp.cleanup()
+
+    def start_modal_run(self):
+        self.app.selected_jobs = None
+        self.app.jobs = [{"id": "modaljob", "trigger": "test", "enabled": True, "backend": "modal",
+                          "family": "krea2", "dataset_root": str(self.source)}]
+        self.app.start("run")
+        self.wait_for(lambda: self.app.current_run is not None)
+        self.wait_for(lambda: self.app.current_backend == "modal")
+
+    def test_pause_button_becomes_remote_cancel(self):
+        self.start_modal_run()
+        self.assertEqual(str(self.app.pause_button["text"]), "원격 취소")
+        self.app.pause()
+        request = self.app.current_run / "cancel_remote.request"
+        self.assertTrue(request.is_file())
+        self.assertEqual(str(self.app.pause_button["state"]), "disabled")
+
+    def test_close_with_a_modal_run_cancels_nothing_remotely(self):
+        self.start_modal_run()
+        proc = self.app.process
+        self.app.close()
+        self.assertFalse((self.app.current_run / "cancel_remote.request").exists(),
+                         "closing must not write the remote cancel request")
+        self.assertIsNotNone(proc.poll())
