@@ -24,6 +24,7 @@
   ],
   "comfy": {
     "url": "http://127.0.0.1:8190",
+    "extra_urls": ["http://127.0.0.1:8192"],
     "root": "G:/Lakis/ComfyUI",
     "workdir": "G:/Lakis",
     "python": "G:/Lakis/python_embeded/python.exe",

@@ -242,6 +242,22 @@ class RunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Environment check failed"):
                 runner.main()
 
+    def test_doctor_only_fails_on_families_the_jobs_use(self):
+        problems = {"krea2": [], "qwen_image21": ["Qwen Image 2.1 DiT file does not exist: x"]}
+        with patch.object(runner.model_paths, "families", return_value=["qwen_image21", "krea2"]), \
+             patch.object(runner.model_paths, "rows", return_value=[]), \
+             patch.object(runner.model_paths, "problems", side_effect=lambda f: problems[f]), \
+             patch("builtins.print"):
+            failures = []
+            self.assertEqual(runner.doctor_models(failures, used={"krea2"}), ["krea2"])
+            self.assertEqual(failures, [])
+            failures = []
+            runner.doctor_models(failures, used={"qwen_image21"})
+            self.assertEqual(failures, ["[qwen_image21] Qwen Image 2.1 DiT file does not exist: x"])
+            failures = []
+            runner.doctor_models(failures)
+            self.assertEqual(len(failures), 1)
+
 if __name__ == "__main__":
     unittest.main()
 

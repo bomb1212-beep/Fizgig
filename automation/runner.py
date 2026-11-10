@@ -538,8 +538,12 @@ def execute(run, cfg, n):
     write_json(state_path, state)
     print(f"DONE: {run / 'output'}", flush=True)
 
-def doctor_models(failures):
-    """Report every family's model files, marking broken paths, and return the families that are fully ready."""
+def doctor_models(failures, used=None):
+    """Report every family's model files, marking broken paths, and return the families that are fully ready.
+
+    Only a family in `used` (the families the selected jobs train) can fail the check: an installed-but-unused
+    family with missing files is shown as not ready, not as a reason the whole environment is broken.
+    `used=None` keeps the old rule that every family counts."""
     ready = []
     for family in model_paths.families():
         print(f"[{family}]")
@@ -549,10 +553,12 @@ def doctor_models(failures):
             state = "OK" if row["exists"] else ("MISSING" if row["required"] or row["path"] else "unset")
             print(f"  {row['pref_key']:<26} {state:<8} {needed:<9} [{row['source']}] {row['path']}")
         blocked = model_paths.problems(family)
-        if blocked:
+        if not blocked:
+            ready.append(family)
+        elif used is None or family in used:
             failures.extend(f"[{family}] {p}" for p in blocked)
         else:
-            ready.append(family)
+            print("  (not used by the selected jobs; not counted as a failure)")
     return ready
 
 def doctor_comfy(failures):
@@ -655,7 +661,7 @@ def main():
                 print(key, "OK" if exists else "MISSING", path)
                 if not exists and cfg.get("caption_auto_start", True):
                     failures.append("Missing " + key)
-        ready = doctor_models(failures)
+        ready = doctor_models(failures, used={family_of(settings(job)) for job in jobs})
         print("Families ready to train:", ", ".join(ready) if ready else "none")
         doctor_comfy(failures)
         for job in jobs:
