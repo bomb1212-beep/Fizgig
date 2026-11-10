@@ -611,7 +611,7 @@ class DatasetTab:
         spec = next((s for name, _label, s, _hint in STAGES if name == key), None)
         if spec is None:
             return
-        spec = self._with_picked_run(spec)
+        spec = self._with_picked_export(self._with_picked_run(spec))
         argv = stage_command(self.auto, folder, spec)
         self._run_stage(key, self._label(key), argv, cancelable=spec[0] in CANCELABLE)
 
@@ -631,6 +631,18 @@ class DatasetTab:
         if row is None:
             return spec
         return spec + ("--run", row["name"])
+
+    def _with_picked_export(self, spec):
+        """Append `--id <export>` to the final-training step, so it plans jobs for the export the drop-down shows.
+
+        Without it `export todos` falls back to the newest published export: picking an older one and clicking
+        "최종 학습 준비" added a training job for a different set than the one on screen. With no export picked the
+        CLI's own fallback (and its "nothing published" error) still applies.
+        """
+        if tuple(spec[:2]) != ("export", "todos"):
+            return spec
+        export_id = self._export_selected()
+        return spec + ("--id", export_id) if export_id else spec
 
     def _run_stage(self, key, label, argv, *, cancelable):
         """Launch one subprocess and mark the tab busy. Shared by the buttons and the epoch chooser."""

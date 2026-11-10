@@ -255,6 +255,45 @@ class PickTests(unittest.TestCase):
         self.assertIn("aaa111222333", tab.export_choice.get())
         self.assertEqual(tab._export_selected(), "aaa111222333")
 
+    def clicked(self, tab, key):
+        """The argv the button `key` would launch, captured instead of started."""
+        seen = []
+        with patch.object(tab, "_run_stage", lambda _key, _label, argv, cancelable: seen.append(argv)):
+            tab.start(key)
+        self.assertEqual(len(seen), 1, key)
+        return seen[0]
+
+    def test_the_final_training_button_uses_the_picked_export_not_the_newest(self):
+        # The todos button passed no `--id`, so `export todos` fell back to the newest export whatever the drop-down
+        # showed: picking an older export and clicking "최종 학습 준비" added a job for a different training set.
+        write_json(self.folder / "exports" / "bbb444555666" / "export_manifest.json",
+                   {"id": "bbb444555666", "created_at": "2026-11-09T10:00:00",
+                    "counts": {"images": 36, "refused": 72}, "policy": "export-v2"})
+        tab = self.tab()
+        tab.refresh_info()
+        self.assertTrue(tab.export_choice.get().startswith("bbb444555666"), "the newest is the default")
+        older = next(label for label in tab.export_combo.values if label.startswith("aaa111222333"))
+        tab.export_choice.set(older)
+        argv = self.clicked(tab, "todos")
+        self.assertIn("--id", argv)
+        self.assertEqual(argv[argv.index("--id") + 1], "aaa111222333")
+        self.assertEqual(argv[argv.index("pipeline.export"):argv.index("pipeline.export") + 3],
+                         ["pipeline.export", "todos", "--add"])
+
+    def test_without_a_published_export_the_final_training_button_adds_no_id(self):
+        folder = make_project(self.auto, "q", runs=[("char-good", "snap1", [10])])
+        tab = self.tab()
+        tab._roots = {"q": folder}
+        tab.project = _Widget("q")
+        tab.refresh_info()
+        self.assertNotIn("--id", self.clicked(tab, "todos"))
+
+    def test_only_the_final_training_button_takes_the_export(self):
+        tab = self.tab()
+        tab.refresh_info()
+        for key in ("export", "score", "audit"):
+            self.assertNotIn("--id", self.clicked(tab, key), key)
+
 
 class ChooseEpochTests(unittest.TestCase):
     """Recording an epoch happens only on an explicit click, through the CLI's own `choose`."""

@@ -458,7 +458,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="pipeline.export", description=__doc__.splitlines()[0])
     parser.add_argument("command", choices=("list", "show", "publish", "verify", "todos"))
     parser.add_argument("--project", required=True)
-    parser.add_argument("--id", help="the export id to show or verify")
+    parser.add_argument("--id", help="the export id to show, verify or plan training jobs for (todos: newest if omitted)")
     parser.add_argument("--families", nargs="*", help="which final families to plan a training job for")
     parser.add_argument("--add", action="store_true", help="write the jobs into todo.json")
     parser.add_argument("--enable", action="store_true", help="add them enabled, so a run would pick them up")
