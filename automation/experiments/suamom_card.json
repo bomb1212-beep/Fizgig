@@ -8,10 +8,10 @@
   "fixed_traits": [],
   "outfits": {"default": ""},
   "tool2": {
-    "config": "G:/데이터셋 통합작성툴/qwen 2.1 edit/dataset_jobs.json",
+    "config": "G:/데이터셋 통합작성툴/apps/dataset_gen/dataset_jobs.json",
     "character": "수아맘",
-    "dataset": "G:/데이터셋 통합작성툴/qwen 2.1 edit/dataset/수아맘",
-    "characters": "G:/데이터셋 통합작성툴/qwen 2.1 edit/characters/수아맘"
+    "dataset": "G:/데이터셋 통합작성툴/data/generated/수아맘",
+    "characters": "G:/데이터셋 통합작성툴/data/characters/수아맘"
   },
   "seed_lora": {
     "name": "suamom_v1",
