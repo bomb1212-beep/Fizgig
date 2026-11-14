@@ -10,7 +10,7 @@ from pathlib import Path
 
 from pipeline import batch_gen, lineage, ph3_edit, project as pj, seed
 
-SOURCE = "G:/데이터셋 통합작성툴/Fizgig_auto/automation/pipeline/seed.py"
+SOURCE = str(Path(__file__).resolve().parent / "seed.py")
 
 
 def _png(path, tag="x"):

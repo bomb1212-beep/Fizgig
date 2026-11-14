@@ -188,7 +188,7 @@ def _elapsed_since(iso):
 
 
 def default_runs_roots():
-    roots = [Path(runner._PATH_OVERRIDES.get("runs") or (runner.AUTO / "runs"))]
+    roots = [runner.runs_root()]
     try:
         from pipeline import project as pipeline_project
         projects = pipeline_project.projects_dir()

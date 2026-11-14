@@ -649,3 +649,47 @@ class SyncCancelTests(unittest.TestCase):
     def test_cancel_with_nothing_found_says_so_and_does_not_raise(self):
         with patch.object(sys, "argv", ["runner.py", "cancel", "--job", "nosuchjob"]):
             runner.main()   # prints "no remote run found"; not an error
+
+
+class RunsRootTests(unittest.TestCase):
+    """pipeline.runs_dir in the config decides where runs are written; --runs-dir still wins (restructure spec 4.1)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=runner.AUTO)
+        self.root = Path(self.temp.name)
+        self._old = {key: runner._PATH_OVERRIDES.get(key) for key in ("config", "runs")}
+        runner._PATH_OVERRIDES["config"] = self.root / "config.json"
+        runner._PATH_OVERRIDES.pop("runs", None)
+
+    def tearDown(self):
+        self.temp.cleanup()
+        for key, value in self._old.items():
+            if value is None:
+                runner._PATH_OVERRIDES.pop(key, None)
+            else:
+                runner._PATH_OVERRIDES[key] = value
+
+    def test_configured_runs_dir_is_used(self):
+        (self.root / "config.json").write_text(
+            json.dumps({"pipeline": {"runs_dir": "../../data/runs"}}), encoding="utf-8")
+        self.assertEqual(runner.runs_root(), runner.ROOT / ".." / ".." / "data" / "runs")
+
+    def test_an_absolute_runs_dir_is_used_asis(self):
+        (self.root / "config.json").write_text(
+            json.dumps({"pipeline": {"runs_dir": str(self.root / "runs")}}), encoding="utf-8")
+        self.assertEqual(runner.runs_root(), self.root / "runs")
+
+    def test_without_a_config_value_the_default_stays(self):
+        (self.root / "config.json").write_text(json.dumps({}), encoding="utf-8")
+        self.assertEqual(runner.runs_root(), runner.AUTO / "runs")
+
+    def test_a_missing_config_file_still_defaults(self):
+        runner._PATH_OVERRIDES["config"] = self.root / "absent.json"
+        self.assertEqual(runner.runs_root(), runner.AUTO / "runs")
+
+    def test_the_cli_override_beats_the_config(self):
+        (self.root / "config.json").write_text(
+            json.dumps({"pipeline": {"runs_dir": str(self.root / "from-config")}}), encoding="utf-8")
+        cli = self.root / "from-cli"
+        runner._PATH_OVERRIDES["runs"] = cli
+        self.assertEqual(runner.runs_root(), cli)

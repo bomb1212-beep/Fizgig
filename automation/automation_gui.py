@@ -581,7 +581,7 @@ class App(tk.Tk):
                 self.external_monitor = False
                 self.events.put(("finished", 1))
                 return
-            candidates = sorted((AUTO / "runs").glob("*/state.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+            candidates = sorted(runner.runs_root().glob("*/state.json"), key=lambda p: p.stat().st_mtime, reverse=True)
         except OSError:
             # The runner can unlink its lock between the liveness check and this read.
             return

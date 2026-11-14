@@ -56,7 +56,18 @@ def todo_path():
 
 
 def runs_root():
-    return _PATH_OVERRIDES.get("runs") or (AUTO / "runs")
+    """Where runs are written: --runs-dir wins, then pipeline.runs_dir in the config (a relative path hangs off the
+    Fizgig_auto root like every other configured path), then the old automation/runs default."""
+    override = _PATH_OVERRIDES.get("runs")
+    if override:
+        return override
+    try:
+        configured = str(((read_json(config_path()).get("pipeline") or {}).get("runs_dir")) or "").strip()
+    except (OSError, ValueError):  # no config or unreadable: behave exactly like the old default-only world
+        configured = ""
+    if configured:
+        return Path(model_paths.resolve_path(configured))
+    return AUTO / "runs"
 
 
 def queue_lock_path():
