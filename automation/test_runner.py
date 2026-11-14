@@ -72,7 +72,9 @@ class RunnerTests(unittest.TestCase):
         resolved = {key: str(model) for key in ("qwen21_dit", "qwen21_vae", "qwen21_text_encoder",
                                                 "qwen21_training_adapter")}
         with patch.object(runner.model_paths, "resolve", return_value=resolved):
-            result = runner.launch_plan(self.root, self.cfg, 32)
+            # The step target is pinned here: the live config.json's value is the user's to change, and the epoch count
+            # below is 3000 steps over 32 images.
+            result = runner.launch_plan(self.root, {**self.cfg, "target_steps": 3000}, 32)
         self.assertEqual([s.name for s in result.stages], ["Cache Preparation", "Text Encoder Caching", "Training"])
         cmd = result.stages[-1].cmd
         self.assertEqual(cmd[cmd.index("--max_train_epochs") + 1], "94")
