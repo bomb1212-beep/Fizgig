@@ -139,6 +139,25 @@ class SnapshotTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             gen.build_snapshot(self.project, card, paths=self.paths, log=lambda *_: None)
 
+    def test_a_card_without_an_input_folder_follows_tool2s_moved_characters_folder(self):
+        # tool2's config can move its data folders (`paths`, relative to tool2's own folder); a card that names no
+        # input folder has to look where tool2 itself would, not beside the config where the folder used to be.
+        moved = self.dir / "shared" / "characters" / "tester"
+        moved.mkdir(parents=True)
+        (moved / "moved.png").write_bytes(b"IMG-moved")
+        cfg = json.loads(self.config.read_text(encoding="utf-8"))
+        cfg["paths"] = {"characters": "shared/characters"}
+        self.config.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+        card = {"id": "tester", "tool2": {"config": str(self.config), "character": "tester"}}
+        snap = gen.build_snapshot(self.project, card, paths=self.paths, log=lambda *_: None)
+        self.assertEqual({Path(r["src_path"]).name for r in snap["sources"]}, {"moved.png"})
+
+    def test_a_card_without_an_input_folder_defaults_to_the_folder_beside_the_config(self):
+        card = {"id": "tester", "tool2": {"config": str(self.config), "character": "tester"}}
+        snap = gen.build_snapshot(self.project, card, paths=self.paths, log=lambda *_: None)
+        self.assertEqual({Path(r["src_path"]).name for r in snap["sources"]},
+                         {"front.png", "side.png", "anchor_refined_fullbody_x_s1.png"})
+
     def test_a_missing_tool2_cli_is_refused(self):
         with self.assertRaises(ValueError):
             gen.build_snapshot(self.project, self.card, paths={"python": sys.executable, "batch": "nope.py"},

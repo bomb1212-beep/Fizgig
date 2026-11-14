@@ -281,7 +281,11 @@ def build_snapshot(project_dir, card, *, exclude=(), holdout=None, sections=None
         raise ValueError(f"tool2's CLI is missing: {batch or '(not configured)'}")
     graph_version = tool_graph_version(batch, tool2_cfg.get("models") or {})
 
-    chars_root = Path(char.get("characters") or (config_path.parent / "characters" / folder))
+    # A card that names no input folder gets the one tool2 itself would read: its config's `paths.characters`
+    # (relative to tool2's own folder, as tool2 resolves it), else the `characters` folder beside the config.
+    moved = (tool2_cfg.get("paths") or {}).get("characters")
+    default_chars = (batch.parent / moved).resolve() if moved else config_path.parent / "characters"
+    chars_root = Path(char.get("characters") or (default_chars / folder))
     if not chars_root.is_dir():
         raise ValueError(f"the character's input folder does not exist: {chars_root}")
     holdout = {**holdout_from_card(card), **(holdout or {})}
