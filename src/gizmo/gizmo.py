@@ -977,6 +977,20 @@ _NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 
 def _run(cmd, **kw):
+    """subprocess.run with the window suppressed and the output captured.
+
+    Text mode is forced to UTF-8. ffmpeg writes its banner in UTF-8 on every platform, but
+    `text=True` alone decodes with the LOCALE codec — cp949 on a Korean Windows, cp1252 on a
+    Western one. One Korean character in a filename or a metadata tag then kills subprocess's
+    reader thread on a UnicodeDecodeError, and `run` hands back stderr=None rather than raising:
+    the caller's next re.search blames the FILE for something that was only ever the codepage
+    ("expected string or bytes-like object, got 'NoneType'"). Naming the encoding, and replacing
+    the handful of bytes that still will not decode, keeps the parse working on any machine.
+    """
+    as_text = kw.pop("text", None), kw.pop("universal_newlines", None)
+    if any(as_text):
+        kw.setdefault("encoding", "utf-8")
+        kw.setdefault("errors", "replace")
     return subprocess.run(cmd, capture_output=True, creationflags=_NO_WINDOW, **kw)
 
 
@@ -5523,7 +5537,7 @@ class Gizmo:
         try:
             cmd = build_scene_scan_command(self.ffmpeg, src, threshold)
             self._chop_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                                               stderr=subprocess.PIPE, text=True,
+                                               stderr=subprocess.PIPE, encoding="utf-8",
                                                errors="replace", creationflags=_NO_WINDOW)
             last_shown = -5.0
             for line in self._chop_proc.stderr:

@@ -3270,6 +3270,10 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             previews(max_train_epochs + ftr.epochs_done)
         logger.info(f"Fine-tune complete -> {final}")
         return final
+    # the final LoRA gets its own previews even when its epoch is off the cadence (or a resume began at the end): the
+    # automation's review reads the last epoch's pictures. Before the save, so it carries its own as the thumbnail.
+    if sample_every_n_epochs and (not _preview_due(max_train_epochs) or start_epoch >= max_train_epochs):
+        previews(max_train_epochs)
     save_lora(final, max_train_epochs)
     # the last epoch under its number too (#176): a resumed run that extends this one ends on the same plain name, and
     # without a numbered copy that epoch would be overwritten and lost
