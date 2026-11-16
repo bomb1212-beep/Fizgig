@@ -14,6 +14,9 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PY = sys.executable
+LINUX = sys.platform.startswith("linux")
+UPDATER = "./update_fizgig.sh" if LINUX else "update_fizgig.bat"
+ROCM_UPDATER = "./install_fizgig_rocm.sh (run it again)" if LINUX else "update_fizgig_rocm.bat"
 
 # Which torch the venv has, probed in a child so this process never imports torch: exit 10 = a ROCm/HIP build,
 # 11 = anything else (CUDA/CPU), 12 = torch missing or broken. Distinct codes so a failed import is never mistaken
@@ -75,10 +78,21 @@ def cuda_deps():
         print()
         print("ERROR: This looks like an AMD ROCm install.")
         print()
-        print("  update_fizgig.bat installs CUDA packages from requirements.txt and would")
+        print(f"  {UPDATER} installs CUDA packages from requirements.txt and would")
         print("  overwrite your ROCm PyTorch / bitsandbytes stack.")
         print()
-        print("  Use instead:  update_fizgig_rocm.bat")
+        print(f"  Use instead:  {ROCM_UPDATER}")
+        sys.exit(1)
+    if sys.version_info < (3, 11):
+        # PyTorch 2.15 has no Python 3.10 wheels, so the install below can't resolve: say what to do instead.
+        print()
+        print(f"ERROR: Fizgig now needs Python 3.11 or newer; this install's Python is {sys.version_info[0]}."
+              f"{sys.version_info[1]}.")
+        print()
+        print("  1. Install Python 3.12 from https://www.python.org/downloads/")
+        print("     (on Windows, tick \"Add Python to PATH\").")
+        print("  2. Run install_fizgig.bat (Linux: python3.12 install_fizgig.py). It rebuilds Fizgig's")
+        print("     Python environment on 3.12. Your models, datasets, LoRAs and settings are kept.")
         sys.exit(1)
     ensure_uv()
     if run([PY, "uv_install_deps.py", "requirements.txt", "venv"]) != 0:
@@ -138,7 +152,7 @@ def rocm_deps():
             fail("Failed to install the bitsandbytes wheel.")
     # Refresh the launcher env. Stay --experimental unless rocm_env.bat pins BNB_ROCM_VERSION.
     experimental = True
-    env_bat = os.path.join(HERE, "rocm_env.bat")
+    env_bat = os.path.join(HERE, "user_data", "rocm_env.bat")
     if os.path.exists(env_bat):
         experimental = "bnb_rocm_version=" not in open(env_bat, encoding="utf-8", errors="replace").read().lower()
     if experimental:
@@ -190,18 +204,196 @@ def clear_old_stage2():
             pass
 
 
+# The venv's own health, probed in a child (this process never imports torch): torch imports, sees the GPU, its
+# triton pairs with it, and bitsandbytes loads its CUDA library. A half-finished upgrade can leave torch reporting the
+# new version while one of the others is broken, so the version alone is not enough.
+_HEALTH = r"""
+import json, sys
+sys.path.insert(0, "src")
+r = {}
+try:
+    import torch
+    r["torch"] = torch.__version__.split("+")[0]
+    r["gpu"] = bool(torch.cuda.is_available())
+except Exception as e:
+    r["err"] = f"PyTorch won't import ({type(e).__name__}: {e})"[:200]
+else:
+    if not r["gpu"]:
+        r["err"] = "PyTorch can't see the GPU"
+        r["driver"] = True
+    else:
+        try:
+            from fizgig.utils.capabilities import triton_matches_torch
+            ok, why = triton_matches_torch()
+            if not ok:
+                r["err"] = why
+        except Exception:
+            pass
+        if "err" not in r and "--rocm" not in sys.argv:
+            try:
+                import bitsandbytes.functional as F
+                F.quantize_4bit(torch.zeros(64, device="cuda", dtype=torch.float16))
+            except Exception as e:
+                r["err"] = f"bitsandbytes can't load its CUDA library ({type(e).__name__})"
+print(json.dumps(r))
+"""
+COUNTDOWN_S = 10
+
+
+def venv_health(rocm=False):
+    """{"torch", "gpu", "err"?, "driver"?} from the venv, or {"err": ...} when even the probe fails."""
+    import json
+    try:
+        out = subprocess.run([PY, "-c", _HEALTH] + (["--rocm"] if rocm else []), cwd=HERE, capture_output=True,
+                             text=True, timeout=300).stdout.strip().splitlines()
+        return json.loads(out[-1]) if out else {"err": "the Python environment didn't answer"}
+    except Exception as e:
+        return {"err": f"the Python environment didn't answer ({type(e).__name__})"}
+
+
+def pinned_torch():
+    try:
+        m = re.search(r"^torch==([\w.]+)", open(os.path.join(HERE, "requirements.txt"), encoding="utf-8").read(), re.M)
+        return m.group(1) if m else None
+    except OSError:
+        return None
+
+
+def interactive():
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def read_key(seconds):
+    """One key press (lower-case), or None after `seconds`. Windows: any key, no Enter. Elsewhere: the key, then Enter."""
+    import time
+    end = time.time() + seconds
+    if os.name == "nt":
+        import msvcrt
+        while time.time() < end:
+            if msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                return " " if ch in ("\r", "\n") else ch.lower()
+            time.sleep(0.05)
+        return None
+    import select
+    r, _, _ = select.select([sys.stdin], [], [], seconds)
+    if not r:
+        return None
+    line = sys.stdin.readline()
+    return (line.strip()[:1] or " ").lower()
+
+
+def countdown(prompt, seconds):
+    """Show `prompt` counting down; return the key pressed, or None when it runs out."""
+    import time
+    end = time.time() + seconds
+    while True:
+        left = int(round(end - time.time()))
+        if left <= 0:
+            print()
+            return None
+        sys.stdout.write(f"\r{prompt.format(s=left)}   ")
+        sys.stdout.flush()
+        k = read_key(1 if os.name == "nt" else min(1, left))
+        if k is not None:
+            print()
+            return k
+
+
+def confirm_rebuild():
+    print()
+    print("Rebuild deletes the Python environment (the venv folder) and installs it again from scratch:")
+    print("several GB to download. Your models, datasets, LoRAs and settings are not touched.")
+    k = countdown("Delete and rebuild?  [Y] yes   [N] no   (no in {s} s)", 30)
+    return k == "y"
+
+
+def rebuild(rocm):
+    """Hand over to the installer to delete the venv and install fresh. This process runs on the venv's own python,
+    which Windows won't let it delete, so there the installer starts in its own window and this one exits."""
+    base = getattr(sys, "_base_executable", None) or PY
+    print()
+    if os.name == "nt":
+        flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+        if rocm:
+            # the ROCm installer sets the venv up itself; give this window a moment to let go of the venv first
+            subprocess.Popen(["cmd", "/c", "timeout /t 4 /nobreak >nul & rmdir /s /q venv & install_fizgig_rocm.bat"],
+                             cwd=HERE, creationflags=flags)
+        else:
+            subprocess.Popen([base, "install_fizgig.py", "--rebuild"], cwd=HERE, creationflags=flags)
+        print("The rebuild continues in a new window. You can close this one.")
+        sys.exit(0)
+    if rocm:
+        fail("On Linux, rebuild an AMD ROCm install by deleting the venv folder and running ./install_fizgig_rocm.sh.")
+    sys.exit(run([base, "install_fizgig.py", "--rebuild"]))
+
+
+def choose(rocm):
+    """Before the update: say what this update does to PyTorch, and whether the venv looks broken; Space (or waiting)
+    updates as normal, R rebuilds the venv from scratch. Without a keyboard (pods, scripts, Fizgig's own Update
+    button) it goes straight to the normal update."""
+    h = venv_health(rocm)
+    want = pinned_torch()
+    print()
+    if h.get("err"):
+        print(f"  Your Python environment looks broken: {h['err']}.")
+        if h.get("driver"):
+            print("  If this started after an update, the NVIDIA driver may be too old: this Fizgig's PyTorch needs a")
+            print("  driver for CUDA 13 (580 or newer). A rebuild won't fix a driver.")
+        else:
+            print("  Rebuilding it (R) is the likely fix.")
+    elif want and h.get("torch") and h["torch"] != want and not rocm:
+        print(f"  This update upgrades PyTorch ({h['torch']} -> {want}, about 3 GB). It should go smoothly.")
+        print("  If Fizgig won't start or train afterwards, run this updater again and press R.")
+    if not interactive():
+        print("  Updating as normal (no keyboard to ask).")
+        return
+    print()
+    print("  [Space] Update as normal")
+    print("  [R]     Rebuild: delete the Python environment and install it fresh")
+    print("          (if Fizgig stopped starting or training; models, datasets, LoRAs and settings are kept)")
+    k = countdown("Updating as normal in {s} s ...", COUNTDOWN_S)
+    if k == "r" and confirm_rebuild():
+        rebuild(rocm)
+
+
+def check_after(rocm):
+    """After the update: the same health check. A failure is said plainly, with the rebuild offered on the spot."""
+    h = venv_health(rocm)
+    if not h.get("err"):
+        return
+    print()
+    print(f"WARNING: after the update, {h['err']}.")
+    if h.get("driver"):
+        print("The NVIDIA driver may be too old: this Fizgig's PyTorch needs a driver for CUDA 13 (580 or newer).")
+        return
+    print("Rebuilding the Python environment from scratch usually fixes this.")
+    if interactive():
+        k = countdown("[R] Rebuild now   [Space] Leave it   (leaving it in {s} s)", 30)
+        if k == "r" and confirm_rebuild():
+            rebuild(rocm)
+    else:
+        print(f"To rebuild: run {ROCM_UPDATER if rocm else UPDATER} again and press R.")
+
+
 def main():
     try:
         sys.stdout.reconfigure(line_buffering=True)     # keep our lines in order with the child processes' output in a log
     except (AttributeError, ValueError):
         pass
     rocm = "--rocm" in sys.argv[1:]
+    if rocm and LINUX:            # the ROCm path below is Windows's (its bitsandbytes wheel, rocm_env.bat)
+        fail("On Linux, update an AMD ROCm install by running ./install_fizgig_rocm.sh again.")
     print("Updating Fizgig (AMD ROCm)..." if rocm else "Updating Fizgig...")
     clear_old_stage2()
     # Older installers overwrote the tracked launchers; restore them so they never block the pull.
-    for launcher in (("run_fizgig_rocm.bat", "run_fizgig.bat") if rocm else ("run_fizgig.bat",)):
+    for launcher in (("Launch Fizgig AMD.bat", "run_fizgig.bat") if rocm else ("run_fizgig.bat",)):
         quiet(["git", "checkout", "--", launcher])
     run(["git", "pull"])
+    choose(rocm)                  # after the pull: requirements.txt now says which PyTorch this version wants
     print()
     print("Installing/updating dependencies...")
     if not os.path.exists(os.path.join(HERE, "requirements.txt")):
@@ -209,12 +401,33 @@ def main():
         print()
     else:
         rocm_deps() if rocm else cuda_deps()
+        if LINUX:                                # Qt for the app window (install_fizgig.py's install_linux_window)
+            if run([PY, "-m", "uv", "pip", "install", "--python", PY, "pywebview[qt]>=5,<7"]) != 0:
+                print("NOTE: Qt for the app window didn't install; Fizgig opens in your browser instead.")
+            linux_tk_note()
     # Community LoRAs + H3 training adapters. Idempotent, and a failure (offline) never aborts the update.
     run([PY, os.path.join("src", "fizgig", "scripts", "fetch_turbo_lora.py")])
     if not rocm:
         msvc_check()
+    check_after(rocm)
     print()
-    print("Update complete! Launch with run_fizgig_rocm.bat" if rocm else "Update complete! Run Fizgig with run_fizgig.bat")
+    print("Update complete! Start Fizgig with ./launch_fizgig.sh (its own window) or ./launch_fizgig_browser.sh"
+          if LINUX else "Update complete! Start Fizgig with Launch Fizgig AMD.bat" if rocm else
+          "Update complete! Start Fizgig with Launch Fizgig.bat (its own window) or Launch Fizgig in browser.bat")
+
+
+def linux_tk_note():
+    """Gizmo is a Tkinter window; a distro's Python has no Tk until its package is installed (install_fizgig.py's
+    check_linux_tk). Pip can't install it, so say which package. Never fails the update."""
+    if os.environ.get("RUNPOD_POD_ID"):
+        return
+    if subprocess.run([PY, "-c", "import tkinter; tkinter.Tcl()"], capture_output=True).returncode == 0:
+        return
+    v = f"{sys.version_info.major}.{sys.version_info.minor}"
+    print("NOTE: Gizmo (the clip / voice / music prep app) needs Tk, which this Python doesn't have. Install it with")
+    print(f"  Ubuntu / Debian: sudo apt install python3-tk   (or python{v}-tk)")
+    print("  Fedora: sudo dnf install python3-tkinter    Arch: sudo pacman -S tk")
+    print("Everything else in Fizgig works without it.")
 
 
 if __name__ == "__main__":

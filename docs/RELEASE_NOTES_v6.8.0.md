@@ -1,4 +1,4 @@
-# Fizgig v6.8.0
+# Fizgig v6.8.0 (beta)
 
 Krea 2 moves onto Fizgig's driver system and gains slider LoRAs, including a new Ultra mode for much higher strengths. Qwen Image 2.1 gains full fine-tuning, joining Krea 2 and MiniMax H3. Repair Studio gets bigger sliders with nudge buttons, unlimited strengths, and donor saves that look exactly as previewed.
 
@@ -21,13 +21,13 @@ The slider LoRAs from 6.7.0 now train on Krea 2: a LoRA whose strength is a dial
 
 ### Ultra mode
 
-A new tick box at the bottom of the Krea 2 slider section. Ultra mode trains the slider on the composition blocks (0 to 7) and the text-fusion blocks only, leaving the fine-detail blocks alone. The result holds up at much higher strengths: one test slider ran cleanly at 20 in ComfyUI. How far yours goes depends on what you train and for how long. The file is also much smaller.
+A new tick box at the bottom of the Krea 2 slider section. Ultra mode trains the slider on the composition blocks (0 to 7) and the text-fusion blocks only, leaving the fine-detail blocks alone. The result holds up at much higher strengths: one test slider ran cleanly at 20 in ComfyUI. How far yours goes depends on what you train and for how long. The file is also much smaller. Ultra mode works best for sliders trained from prompts; it can work well with photo pairs too, especially when the change is compositional (pose, framing, layout) rather than fine detail.
 
 ## Fine-tuning for Qwen Image 2.1
 
 Qwen Image 2.1 can now fine-tune the whole base model, so Fizgig fine-tunes three families: Krea 2, Qwen Image 2.1 and MiniMax H3. On Krea 2 and Qwen, pick **Fine-tune the whole model** under **Kind of training**. MiniMax H3 keeps its own fine-tune checkbox for now. When H3 moves onto the driver system shortly, its fine-tuning gets the same card as Krea 2 and Qwen. Training counts in rotations, and each checkpoint is a complete model file you load in place of the base. An optional folder of class photos (regularisation) trains alongside at a lower learning rate to keep the model's general knowledge intact.
 
-A fine-tune takes longer than a LoRA, but far less than people expect. It trains one part of the model at a time, so it fits a single consumer GPU, and a full rotation through every part takes several epochs: four on a 24 or 32 GB card. With the defaults (10 rotations, 1 epoch per part) that's 40 epochs, at about 0.85 seconds a step on Krea 2 at 0.25 MP against about 0.6 for a LoRA. In total that's about as long as the 64-epoch Standard Krea 2 LoRA preset, and about twice the 30-epoch Ultra Fast one. A 16 GB card can fine-tune too, but it splits the model into more parts and streams from system RAM (about 5 seconds a step), so expect a much longer run there.
+A fine-tune takes longer than a LoRA, but far less than people expect. It trains one part of the model at a time, so it fits a single consumer GPU, and a full rotation through every part takes several epochs: four on a 24 or 32 GB card. With the defaults (10 rotations, 1 epoch per part) that's 40 epochs, at about 0.85 seconds a step on Krea 2 at 0.25 MP against about 0.6 for a LoRA. In total, expect a default fine-tune to take 3 to 4 times as long as the Ultra Fast Krea 2 LoRA preset: its lower learning rate needs more steps to get there. A 16 GB card can fine-tune too, but it splits the model into more parts and streams from system RAM (about 5 seconds a step), so expect a much longer run there.
 
 When it's done, use the result as a new checkpoint in place of the base, or press **Checkpoint to LoRA** on the fine-tune card to turn the difference between your fine-tune and the base into a LoRA. Concepts come out far better separated than in a LoRA trained directly. See [FINETUNE.md](https://github.com/shootthesound/Fizgig/blob/v6.8.0/docs/FINETUNE.md).
 

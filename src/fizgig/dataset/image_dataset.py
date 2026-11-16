@@ -24,11 +24,14 @@ from safetensors.torch import save_file, load_file
 from PIL import Image
 import cv2
 
+from fizgig.dataset.masks import (SEG_AREAS, element_map, face_box, folder_names, is_mask_file, load_element,
+                                  load_face, load_mask, mask_for_stem, mask_problem)
 from fizgig.utils.safetensors import mem_eff_save_file, MemoryEfficientSafeOpen
 from fizgig.training.metadata import (ARCHITECTURE_KLEIN_9B, ARCHITECTURE_KLEIN_9B_FULL,
                                       ARCHITECTURE_MINIMAX)
 
 import logging
+from fizgig.utils.upright import open_upright
 
 logger = logging.getLogger(__name__)
 
@@ -179,7 +182,7 @@ def glob_images(directory: str, base: str = "*", caption_extension: Optional[str
             img_paths.extend(glob.glob(os.path.join(glob.escape(directory), base + ext)))
         else:
             img_paths.extend(glob.glob(glob.escape(os.path.join(directory, base + ext))))
-    img_paths = list(set(img_paths))
+    img_paths = [p for p in set(img_paths) if not is_mask_file(p)]      # photo-masklabel.png is photo.png's mask
 
     if caption_extension is not None:
         caption_paths = glob.glob(os.path.join(glob.escape(directory), "*" + caption_extension))
@@ -204,6 +207,15 @@ def divisible_by(num: int, divisor: int) -> int:
     return num - num % divisor
 
 
+def _own_shape(image, bucket_reso: Tuple[int, int], step: int) -> Tuple[int, int]:
+    """(width, height) at *bucket_reso*'s pixel count in *image*'s own aspect, snapped to *step*."""
+    w, h = image.size if isinstance(image, Image.Image) else (image.shape[1], image.shape[0])
+    area, ar = bucket_reso[0] * bucket_reso[1], w / h
+    nw = max(step, int(round((area * ar) ** 0.5 / step)) * step)
+    nh = max(step, int(round((area / ar) ** 0.5 / step)) * step)
+    return nw, nh
+
+
 def resize_image_to_bucket(image: Union[Image.Image, np.ndarray], bucket_reso: Tuple[int, int]) -> np.ndarray:
     """Resize *image* to *bucket_reso* ``(width, height)``, cropping the centre."""
     is_pil = isinstance(image, Image.Image)
@@ -226,7 +238,17 @@ def resize_image_to_bucket(image: Union[Image.Image, np.ndarray], bucket_reso: T
         arr = np.array(img)
     else:
         arr = np.array(image) if is_pil else image
-        arr = cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        if arr.ndim == 3 and arr.shape[-1] == 4:
+            # premultiplied while averaging, so a transparent area's hidden colour doesn't bleed into the edges (the
+            # PIL path above does the same)
+            a = arr[..., 3:].astype(np.float32) / 255.0
+            pm = cv2.resize(np.concatenate([arr[..., :3] * a, a * 255.0], -1), (new_w, new_h),
+                            interpolation=cv2.INTER_AREA)
+            al = pm[..., 3:] / 255.0
+            rgb = np.where(al > 0, pm[..., :3] / np.maximum(al, 1e-6), 0.0)
+            arr = np.concatenate([rgb, pm[..., 3:]], -1).round().clip(0, 255).astype(np.uint8)
+        else:
+            arr = cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
     crop_left = (new_w - bucket_width) // 2
     crop_top = (new_h - bucket_height) // 2
@@ -281,6 +303,27 @@ class ItemInfo:
 # Cache I/O — Fizgig-native format
 # ---------------------------------------------------------------------------
 
+def source_stamp(path) -> str:
+    """"size:mtime" of the picture a latent cache was made from, kept in the cache's metadata ("source"): any change
+    re-encodes it, older or newer - a copied-in photo keeps its own date, so "newer than the cache" misses a folder
+    refilled with someone else's photos under the same names. "" when the file can't be read. A picture with a rotation
+    flag adds ":upright", so one cached sideways (before the flag was applied) re-encodes."""
+    try:
+        st = os.stat(path)
+        stamp = f"{st.st_size}:{int(st.st_mtime)}"
+    except (OSError, TypeError):
+        return ""
+    if os.path.splitext(str(path))[1].lower() in (".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".png"):
+        try:
+            from fizgig.utils.upright import orientation
+            with Image.open(path) as im:
+                if orientation(im) != 1:
+                    stamp += ":upright"
+        except Exception:
+            pass
+    return stamp
+
+
 def save_latent_cache(
     item_info: ItemInfo,
     latent: torch.Tensor,
@@ -304,6 +347,7 @@ def save_latent_cache(
         "height": str(item_info.original_size[1]),
         "dtype": dtype_to_str(latent.dtype),
         "format_version": "2.0.0",
+        "source": source_stamp(item_info.item_key),
     }
 
     # NaN guard
@@ -456,11 +500,33 @@ class BucketBatchManager:
         self.num_timestep_buckets = num_timestep_buckets
         self.timestep_pool: Optional[list[list[float]]] = None
 
+        self.quota: Optional[dict] = None   # limit(): items a bucket gives each epoch (None = all of them)
         self.bucket_batch_indices: list[Tuple[Tuple[int, int], int]] = []
         for reso in self.bucket_resos:
-            num_batches = math.ceil(len(self.buckets[reso]) / self.batch_size)
+            num_batches = math.ceil(len(self.buckets[reso]) / self.bucket_batch(reso))
             for i in range(num_batches):
                 self.bucket_batch_indices.append((reso, i))
+
+    def limit(self, per_epoch: int) -> int:
+        """At most per_epoch items an epoch (a LoRA's regularisation set, --reg_per_epoch). Each bucket gives a fixed
+        share of them by its size, so an epoch's steps are the same every epoch (the run's totals hold), and the
+        buckets' shuffle at each epoch's start makes them a different handful each time. Returns the items there are."""
+        total = sum(len(b) for b in self.buckets.values())
+        if per_epoch <= 0 or per_epoch >= total:
+            return total
+        raw = {r: per_epoch * len(self.buckets[r]) / total for r in self.bucket_resos}
+        quota = {r: int(v) for r, v in raw.items()}
+        for r in sorted(self.bucket_resos, key=lambda r: raw[r] - quota[r], reverse=True)[:per_epoch - sum(quota.values())]:
+            quota[r] += 1                      # largest remainders first: the shares add up to per_epoch
+        self.quota = quota
+        self.bucket_batch_indices = [(r, i) for r in self.bucket_resos
+                                     for i in range(math.ceil(quota[r] / self.bucket_batch(r)))]
+        return total
+
+    def bucket_batch(self, reso):
+        """Items a step from this bucket: Batch size for pictures, 1 for a clip's or a voice's bucket (a step packs
+        thousands of a clip's tokens already, and its sound rows are its own)."""
+        return 1 if reso and reso[0] in ("clip", "audio") else self.batch_size
 
     def show_bucket_info(self):
         for reso in self.bucket_resos:
@@ -494,8 +560,9 @@ class BucketBatchManager:
     def __getitem__(self, idx: int) -> dict[str, Any]:
         bucket_reso, batch_idx = self.bucket_batch_indices[idx]
         bucket = self.buckets[bucket_reso]
-        start = batch_idx * self.batch_size
-        end = min(start + self.batch_size, len(bucket))
+        start = batch_idx * self.bucket_batch(bucket_reso)
+        end = min(start + self.bucket_batch(bucket_reso), len(bucket) if self.quota is None
+                  else self.quota.get(bucket_reso, len(bucket)))
 
         batch_tensor_data: dict[str, list[torch.Tensor]] = {}
 
@@ -571,10 +638,42 @@ class BucketBatchManager:
                     batch_tensor_data[content_key] = []
                 batch_tensor_data[content_key].append(tensor)
 
+        # Masked training: each item's mask on its latent's grid (an item without one counts everywhere)
+        if any(getattr(it, "mask_path", None) for it in bucket[start:end]):
+            masks = []
+            for it, lat in zip(bucket[start:end], batch_tensor_data.get("latents", [])):
+                m = None
+                if getattr(it, "mask_path", None):
+                    lh, lw = lat.shape[-2:]
+                    bw, bh = it.bucket_size
+                    if abs(bw / lw - bh / lh) < 1e-6:           # the latent is the bucket's grid, the right way round
+                        m = load_mask(it.mask_path, it.original_size, it.bucket_size, (lh, lw))
+                masks.append(torch.from_numpy(m)[None] if m is not None else torch.ones(1, *lat.shape[-2:]))
+            batch_tensor_data["loss_mask"] = masks
+        # Boost the face: each item's face oval on its latent's grid (zeros without a face)
+        if any(getattr(it, "face_box", None) or getattr(it, "element_map", None) is not None
+               for it in bucket[start:end]):
+            faces = []
+            for it, lat in zip(bucket[start:end], batch_tensor_data.get("latents", [])):
+                lh, lw = lat.shape[-2:]
+                bw, bh = it.bucket_size
+                f = None
+                if abs(bw / lw - bh / lh) < 1e-6:
+                    if getattr(it, "face_box", None):
+                        f = load_face(it.face_box, it.original_size, it.bucket_size, (lh, lw),
+                                      getattr(it, "face_area", "face"))
+                    elif getattr(it, "element_map", None) is not None:
+                        f = load_element(it.element_map, it.original_size, it.bucket_size, (lh, lw))
+                faces.append(torch.from_numpy(f)[None] if f is not None else torch.zeros(1, lh, lw))
+            batch_tensor_data["face_weight"] = faces
+
         # Stack tensors per key
         stacked: dict[str, Any] = {}
         for key, tensors in batch_tensor_data.items():
-            stacked[key] = torch.stack(tensors)
+            if len(tensors) > 1 and any(t.shape != tensors[0].shape for t in tensors):
+                stacked[key] = tensors      # Batch Size above 1: captions of different lengths, grouped by the trainer
+            else:
+                stacked[key] = torch.stack(tensors)
 
         if self.timestep_pool is not None:
             stacked["timesteps"] = self.timestep_pool[idx][:end - start]
@@ -584,6 +683,10 @@ class BucketBatchManager:
         # Per-image identity for the (passive) per-image loss logger. Harmless list of strings that
         # trainers ignore unless logging is enabled.
         stacked["item_keys"] = [item_info.item_key for item_info in bucket[start:end]]
+        # the key is the file's name, so two folders' IMG_0001s share one; the text cache path is the item's own
+        # (each folder caches in its own folder) - DOP's per-item caption and targets key on it
+        stacked["item_te_paths"] = [str(getattr(item_info, "text_encoder_output_cache_path", "") or "")
+                                    for item_info in bucket[start:end]]
 
         return stacked
 
@@ -607,11 +710,20 @@ class ImageDirectoryDatasource:
         caption_extension: Optional[str] = None,
         control_directory: Optional[str] = None,
         extra_extensions: tuple = (),
+        family=None,
+        caption_replace=None,
+        extra_reference_directory: Optional[str] = None,
     ):
+        import re
+        self.caption_replace = [(re.compile(r"(?<!\w)" + re.escape(str(a)) + r"(?!\w)", re.I), str(b))
+                                for a, b in (caption_replace or []) if str(a)]
         self.image_directory = image_directory
         self.caption_extension = caption_extension
         self.control_directory = control_directory
+        self.extra_reference_directory = extra_reference_directory
         self.extra_extensions = tuple(extra_extensions)
+        # the FamilyDescription whose clips these are (its clip_spec checks and decodes them); None = stills only
+        self.family = family
         self.caption_only = False
         self.has_control = False
         self._current_idx = 0
@@ -666,7 +778,12 @@ class ImageDirectoryDatasource:
             self.control_paths: dict[str, list[str]] = {}
 
             sorted_by_len = sorted(self.image_paths, key=lambda p: len(os.path.basename(p)), reverse=True)
-            all_ctrl = set(glob_images(self.control_directory))
+            # a dataset that globs clips (H3) pairs a clip with a clip: a clip-pair slider's other pole
+            _vid = tuple(e for e in self.extra_extensions if e in VIDEO_EXTENSIONS)
+            all_ctrl = set(glob_images(self.control_directory, extra_extensions=_vid))
+            # a multi-picture edit: its extra pictures (photo_1, photo_2 ...) match by name from their own folder
+            if self.extra_reference_directory:
+                all_ctrl |= set(glob_images(self.extra_reference_directory))
 
             for img_path in sorted_by_len:
                 base_no_ext = os.path.splitext(os.path.basename(img_path))[0].casefold()   # IMG_1 pairs with img_1
@@ -714,19 +831,35 @@ class ImageDirectoryDatasource:
             return image_path, [Image.new("RGB", AUDIO_SENTINEL_RESO)], caption, None
         if os.path.splitext(image_path)[1].lower() in {e.lower() for e in VIDEO_EXTENSIONS}:
             # A clip arrives as its frames, which the resize step downstream already handles as a
-            # list. Imported lazily and only inside this branch: the dataset layer stays free of
-            # model imports at load time, and only MiniMax datasets ever glob a video in the
-            # first place.
-            from fizgig.minimax.clip import read_frames, validate
-            frames = read_frames(image_path)
-            validate(image_path, frames=len(frames))
+            # list. Checked against the family's ClipSpec; only a family whose media include clips
+            # ever globs one.
+            from fizgig.families import clips
+            spec = self.family.clip_spec
+            frames = clips.read_frames(image_path)
+            clips.validate(image_path, spec, self.family.display_name, frames=len(frames))
             imgs = [Image.fromarray(f) for f in frames]
             _, caption = self.get_caption(idx)
-            return image_path, imgs, caption, None
+            controls = None
+            if self.has_control:
+                # a clip-pair slider: the other pole is a clip (any length - an edit may drop frames), its frames the
+                # controls
+                cps = self.control_paths[image_path]
+                if len(cps) != 1 or os.path.splitext(cps[0])[1].lower() not in {e.lower() for e in VIDEO_EXTENSIONS}:
+                    raise ValueError(f"{os.path.basename(image_path)}: a clip pairs with exactly one clip of the same "
+                                     f"name in the second folder (found: {[os.path.basename(p) for p in cps]})")
+                # the VAE encodes the family's frame grid only: an edit that dropped frames is held on its last
+                # frame up to the next length it can encode
+                pf, n_before = clips.hold_to_grid(clips.read_frames(cps[0]), spec)
+                if len(pf) != n_before:
+                    logger.info(f"[slider] {os.path.basename(cps[0])}: {n_before} frames -> {len(pf)} (last frame held;"
+                                f" {self.family.display_name} encodes "
+                                f"{', '.join(str(g) for g in clips.grid_frames(spec)[:4])} ... frames)")
+                controls = [Image.fromarray(f) for f in pf]
+            return image_path, imgs, caption, controls
 
-        img = Image.open(image_path)
-        if img.mode not in ("RGB", "RGBA"):
-            img = img.convert("RGB")
+        img = open_upright(image_path)
+        if img.mode not in ("RGB", "RGBA"):     # a palette / grey PNG with transparency keeps it, as RGBA
+            img = img.convert("RGBA" if img.mode in ("LA", "PA") or "transparency" in img.info else "RGB")
 
         _, caption = self.get_caption(idx)
 
@@ -734,9 +867,9 @@ class ImageDirectoryDatasource:
         if self.has_control:
             controls = []
             for cp in self.control_paths[image_path]:
-                c = Image.open(cp)
+                c = open_upright(cp)
                 if c.mode not in ("RGB", "RGBA"):
-                    c = c.convert("RGB")
+                    c = c.convert("RGBA" if c.mode in ("LA", "PA") or "transparency" in c.info else "RGB")
                 controls.append(c)
 
         return image_path, [img], caption, controls
@@ -748,7 +881,10 @@ class ImageDirectoryDatasource:
             return image_path, ""
         with open(caption_path, "rb") as f:
             raw = f.read()
-        return image_path, decode_caption(raw, caption_path).strip()
+        caption = decode_caption(raw, caption_path).strip()
+        for pat, to in self.caption_replace:
+            caption = pat.sub(lambda _m, t=to: t, caption)
+        return image_path, caption
 
     def __iter__(self):
         self._current_idx = 0
@@ -784,6 +920,15 @@ class ImageDataset(torch.utils.data.Dataset):
     # still's own encoding). Set on the CLASS by the trainer before the dataset group is
     # generated (the blueprint path builds and prepares the datasets in one go).
     clip_still_as_photo: bool = False
+    # Masked training (fizgig/dataset/masks.py): each item with a photo-masklabel.png beside its picture gets the mask
+    # on its latent's grid as `loss_mask` in the batch. Set on the CLASS by the trainer before the dataset group is
+    # generated, like clip_still_as_photo.
+    loss_masks: bool = False
+    # Boost the face (an experiment): anything but 1 gives each still's largest face (masks.face_box) as `face_weight` in the
+    # batch, a soft oval on its latent's grid; the trainer multiplies it into the loss weights. Set on the CLASS.
+    face_boost: float = 1.0
+    face_area: str = "face"           # "head": the oval takes in the hair (masks.load_face); masks.SEG_AREAS: the
+                                      # Make masks person finder's area instead (masks.element_map)
 
     def __init__(
         self,
@@ -795,14 +940,24 @@ class ImageDataset(torch.utils.data.Dataset):
         bucket_no_upscale: bool,
         image_directory: Optional[str] = None,
         control_directory: Optional[str] = None,
+        extra_reference_directory: Optional[str] = None,
         cache_directory: Optional[str] = None,
         debug_dataset: bool = False,
         architecture: str = ARCHITECTURE_KLEIN_9B,
         is_reg: bool = False,
         clip_megapixels: Optional[float] = None,
+        caption_replace: Optional[list] = None,
+        photos_only: bool = False,
+        mask_directory: Optional[str] = None,
+        item_prefix: str = "",
         **kwargs,
     ):
         super().__init__()
+        # Each picture's training key is item_prefix + its name: a training folder's own pictures have none, a
+        # sub-folder's is its path ("outfits/red/"), another subject's or the regularisation set's a tag ("s2:",
+        # "reg:") - so same-named pictures in two folders stay apart, and the loss watch finds each one's folder
+        self.item_prefix = item_prefix or ""
+        self.mask_directory = mask_directory      # masked training: the masks' folder when not image_directory
         # Clip Target Megapixels (MiniMax H3): a clip is cached and trained at this size or
         # smaller, so photos can train at 1 MP beside clips at a size that caches and trains fast.
         self.clip_megapixels = float(clip_megapixels) if clip_megapixels else None
@@ -814,6 +969,7 @@ class ImageDataset(torch.utils.data.Dataset):
         self.bucket_no_upscale = bucket_no_upscale if enable_bucket else False
         self.image_directory = image_directory
         self.control_directory = control_directory
+        self.extra_reference_directory = extra_reference_directory
         self.cache_directory = cache_directory
         self.debug_dataset = debug_dataset
         self.architecture = architecture
@@ -831,15 +987,26 @@ class ImageDataset(torch.utils.data.Dataset):
         if image_directory is None:
             raise ValueError("image_directory must be specified")
 
-        # Only MiniMax H3 can train on clips and voice recordings, so only its datasets glob for
+        # Clips and voice recordings are globbed only for a family whose description's media include
         # them. Kept on the dataset as well as handed to the datasource, because
         # prepare_for_training re-derives what counts as a training item when it cross-checks
         # the cache — and if the two answers disagree, every clip's cache is discarded as an
         # orphan and the run trains on nothing.
-        _extra = VIDEO_EXTENSIONS + AUDIO_EXTENSIONS if architecture == ARCHITECTURE_MINIMAX else ()
+        self.family = _described_family(architecture)
+        _media = tuple(getattr(self.family, "media", ()) or ())
+        _extra = () if photos_only else ((VIDEO_EXTENSIONS if "clip" in _media else ()) +
+                                         (AUDIO_EXTENSIONS if "voice" in _media else ()))
         self.extra_extensions = _extra
+        if photos_only and os.path.isdir(image_directory):
+            _left = [f for f in os.listdir(image_directory)
+                     if os.path.splitext(f)[1].lower() in {e.lower() for e in VIDEO_EXTENSIONS + AUDIO_EXTENSIONS}]
+            if _left:
+                logger.info(f"[isolation] {len(_left)} clip/voice file(s) in {image_directory} left out: "
+                            f"Fizgig LoRA Isolation trains people from their photos")
         self.datasource = ImageDirectoryDatasource(image_directory, caption_extension,
-                                                   control_directory, extra_extensions=_extra)
+                                                   control_directory, extra_extensions=_extra,
+                                                   family=self.family, caption_replace=caption_replace,
+                                                   extra_reference_directory=extra_reference_directory)
 
         if self.cache_directory is None:
             self.cache_directory = self.image_directory
@@ -908,8 +1075,9 @@ class ImageDataset(torch.utils.data.Dataset):
         if not self._clip_free_gb:
             return bucket_reso                       # CPU, or no way to ask — leave it alone
 
-        from fizgig.minimax.vae import MiniMaxH3VideoVAEEncoder
-        planned = MiniMaxH3VideoVAEEncoder.plan_clip_bucket(self._clip_free_gb, *bucket_reso)
+        if getattr(self, "_clip_driver", None) is None:
+            self._clip_driver = self.family.load_driver()
+        planned = self._clip_driver.clip_bucket_cap(self._clip_free_gb, *bucket_reso)
         if tuple(planned) != tuple(bucket_reso) and image_key not in self._clip_capped:
             self._clip_capped.add(image_key)
             logger.warning(
@@ -1015,7 +1183,12 @@ class ImageDataset(torch.utils.data.Dataset):
 
                 resized_controls = None
                 if controls is not None:
-                    resized_controls = [resize_image_to_bucket(c, bucket_reso) for c in controls]
+                    # the first before-image is the original at the target's crop; extra references (photo_1,
+                    # photo_2 ... of a multi-reference edit) keep their own shape at the target's pixel count, as
+                    # BFL's reference sizes them
+                    resized_controls = [resize_image_to_bucket(c, bucket_reso if i == 0 else
+                                                               _own_shape(c, bucket_reso, bucket_selector.reso_steps))
+                                        for i, c in enumerate(controls)]
                 return image_size, image_key, resized, caption, resized_controls
 
             future = executor.submit(fetch_and_resize)
@@ -1175,7 +1348,7 @@ class ImageDataset(torch.utils.data.Dataset):
             _exts = {e.lower() for e in IMAGE_EXTENSIONS}
             _exts |= {e.lower() for e in getattr(self, "extra_extensions", ())}
             valid_keys = {os.path.splitext(f)[0] for f in os.listdir(self.image_directory)
-                          if os.path.splitext(f)[1].lower() in _exts}
+                          if os.path.splitext(f)[1].lower() in _exts and not is_mask_file(f)}
         # The stems that are audio files. Cache filenames strip the extension, so the folder
         # listing is the only place an item's audio-ness can still be seen at this point.
         audio_keys = set()
@@ -1189,6 +1362,8 @@ class ImageDataset(torch.utils.data.Dataset):
         still_frame0_fallback = 0
 
         bucketed: dict[Tuple, list[ItemInfo]] = {}   # (w, h), or ("audio", w, h) for voice items
+        _mask_names, masked_items, misfit_masks = None, 0, []
+        _pic_names, face_items = None, 0
         for cache_file in latent_cache_files:
             tokens = os.path.basename(cache_file).split("_")
             # Filename: {basename}_{W:04d}x{H:04d}_{arch}.safetensors
@@ -1229,15 +1404,43 @@ class ImageDataset(torch.utils.data.Dataset):
                     # A VRAM-capped clip (or one cached at an older, lower Target Megapixels)
                     # — train it at its cached size rather than dropping it: dropping made a
                     # clips-only dataset crash with "No training items" right after a clean
-                    # cache run. Batch size 1 only: mixed sizes cannot stack into one batch
-                    # (H3 always runs batch 1, so this guard is belt-and-braces).
-                    if self.batch_size != 1:
-                        skipped_wrong_reso += 1
-                        continue
+                    # cache run. A clip trains on a step of its own at any Batch size (below).
                     accepted_smaller_clips += 1
                 bucket_key = bucket_reso
-            item_info = ItemInfo(item_key, "", image_size, bucket_reso, latent_cache_path=cache_file)
+                if self.batch_size > 1 and self.latent_cache_frames(cache_file) > 1:
+                    bucket_key = ("clip",) + bucket_reso      # Batch size batches pictures; a clip trains on its own
+            item_info = ItemInfo(self.item_prefix + item_key, "", image_size, bucket_reso,
+                                 latent_cache_path=cache_file)
             item_info.text_encoder_output_cache_path = te_cache
+            _mdir = self.mask_directory or self.image_directory
+            # a regularisation set's pictures train whole and plain: no mask, no Boost the face (an anchor for the kind
+            # of thing they show, not a subject)
+            if self.loss_masks and _mdir and bucket_key == bucket_reso and not self.is_reg \
+                    and self.latent_cache_frames(cache_file) <= 1:          # stills only: never a clip or a voice
+                if _mask_names is None:
+                    _mask_names = folder_names(_mdir)
+                item_info.mask_path = mask_for_stem(_mdir, item_key, _mask_names)
+                if item_info.mask_path:
+                    _pic = next((os.path.join(_mdir, _mask_names[n]) for n in
+                                 (item_key.lower() + e.lower() for e in IMAGE_EXTENSIONS) if n in _mask_names), None)
+                    _why = mask_problem(item_info.mask_path, image_size, _pic)
+                    if _why:
+                        misfit_masks.append(f"{os.path.basename(item_info.mask_path)} ({_why})")
+                        item_info.mask_path = None              # its picture trains unmasked, and the log says so
+                masked_items += bool(item_info.mask_path)
+            if self.face_boost != 1.0 and self.image_directory and bucket_key == bucket_reso and not self.is_reg \
+                    and self.latent_cache_frames(cache_file) <= 1:          # Boost the face: stills only
+                if _pic_names is None:
+                    _pic_names = folder_names(self.image_directory)
+                _pic = next((os.path.join(self.image_directory, _pic_names[n]) for n in
+                             (item_key.lower() + e.lower() for e in IMAGE_EXTENSIONS) if n in _pic_names), None)
+                item_info.face_area = self.face_area
+                if self.face_area in SEG_AREAS:
+                    item_info.element_map = element_map(_pic, self.face_area) if _pic else None
+                    face_items += item_info.element_map is not None
+                else:
+                    item_info.face_box = face_box(_pic) if _pic else None
+                    face_items += item_info.face_box is not None
 
             bucket = bucketed.get(bucket_key, [])
             for _ in range(self.num_repeats):
@@ -1247,12 +1450,13 @@ class ImageDataset(torch.utils.data.Dataset):
             # bucket) never qualify; a still (3-D latent) is left alone.
             if (self.clip_still_as_photo and bucket_key != ("audio",) + AUDIO_SENTINEL_RESO
                     and self.latent_cache_frames(cache_file) > 1):
-                ff = ItemInfo(item_key + "#still", "", image_size, bucket_reso,
+                ff = ItemInfo(self.item_prefix + item_key + "#still", "", image_size, bucket_reso,
                               latent_cache_path=cache_file)
                 ff.text_encoder_output_cache_path = te_cache
                 ff.still_only = True
+                stills = bucket if bucket_key == bucket_reso else bucketed.setdefault(bucket_reso, [])
                 for _ in range(self.num_repeats):
-                    bucket.append(ff)
+                    stills.append(ff)
                 still_items += self.num_repeats
                 if not self.latent_cache_has_still(cache_file):
                     still_frame0_fallback += 1
@@ -1285,6 +1489,19 @@ class ImageDataset(torch.utils.data.Dataset):
                     f"[dataset] {still_frame0_fallback} clip(s) were cached without a picked "
                     f"still — their frame 0 is used instead. Re-run caching with the tick on "
                     f"(or flush the cache) to pick sharp frames for them.")
+        if self.face_boost != 1.0:
+            what = {"face": "a face", "head": "a face (with its hair)"}.get(self.face_area, self.face_area.replace("_", " "))
+            logger.info(f"[face boost] {face_items} picture(s) in {self.image_directory} have {what} found: it counts "
+                        f"x{self.face_boost:g} in the loss; the rest train as normal")
+        if self.loss_masks:
+            logger.info(f"[masks] {masked_items} picture(s) in {self.mask_directory or self.image_directory} train "
+                        f"with their mask"
+                        + ("; the rest train as normal" if masked_items else
+                           " - none has a mask (name it after its picture: photo.png -> photo-masklabel.png)"))
+            if misfit_masks:
+                shown = ", ".join(misfit_masks[:8]) + (f", … {len(misfit_masks) - 8} more" if len(misfit_masks) > 8 else "")
+                logger.warning(f"[masks] {len(misfit_masks)} mask(s) can't be used - those pictures train WITHOUT a "
+                               f"mask: {shown}")
         self.batch_manager = BucketBatchManager(bucketed, self.batch_size, num_timestep_buckets=num_timestep_buckets)
         self.batch_manager.show_bucket_info()
         self.num_train_items = sum(len(b) for b in bucketed.values())

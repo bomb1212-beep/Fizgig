@@ -19,7 +19,7 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-PRECISIONS = ("bf16", "int8", "nf4")
+PRECISIONS = ("bf16", "int8", "nf4", "hqq")       # hqq: a family whose driver loads it (H3)
 
 
 def _targets(dit, driver):
@@ -38,37 +38,112 @@ def quantize(dit, driver, precision, compute_device, store_device=None):
         raise ValueError(f"precision must be one of {PRECISIONS}, got {precision!r}")
     compute_device = torch.device(compute_device)
     targets = _targets(dit, driver)
+    for _, m in targets:
+        _quantize_one(m, driver, precision, compute_device, store_device)
     if precision == "int8":
-        from fizgig.modules.int8_train import int8_train_forward
-        from fizgig.modules.nf4 import _dequantize_source_weight
-        fp32 = getattr(driver, "int8_fp32_scales", True)
-        for _, m in targets:
-            w = _dequantize_source_weight(m).to(compute_device)
-            w = w.float() if fp32 else w.contiguous()         # a driver may keep its original trainer's bf16 scales
-            scale = w.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / 127.0
-            m.weight.requires_grad_(False)
-            q = (w / scale).round_().clamp_(-127, 127).to(torch.int8).contiguous()
-            m.weight.data = q if store_device is None else q.to(store_device)
-            m.register_buffer("_int8_wscale", scale.reshape(1, -1).to(torch.float32), persistent=False)
-            m._is_int8 = True
-            m._int8_grad_mode = "bf16"
-            m.forward = int8_train_forward.__get__(m, type(m))
-            del w
         dit._int8_quantized = True
     else:
-        from bitsandbytes.functional import quantize_nf4
-        from fizgig.modules.nf4 import _dequantize_source_weight, nf4_linear_forward_patch
-        for _, m in targets:
-            packed, state = quantize_nf4(_dequantize_source_weight(m).to(compute_device).contiguous())
-            m._nf4_packed, m._nf4_state, m._is_nf4 = packed, state, True
-            m.weight.data = torch.empty(0, device=compute_device, dtype=torch.bfloat16)
-            m.weight.requires_grad_(False)
-            m.forward = nf4_linear_forward_patch.__get__(m, type(m))
         dit._nf4_quantized = True
     gc.collect()
     torch.cuda.empty_cache()
-    logger.info(f"[precision] {precision}: {len(targets)} block Linears quantised; everything else stays bf16")
+    logger.info(f"[precision] {precision}{_int8_kind(driver, precision)}: {len(targets)} block Linears quantised; everything else stays bf16")
     return len(targets)
+
+
+@torch.no_grad()
+def _int8_kind(driver, precision):
+    """The log's word on which INT8: weight-only (activations stay bf16) or the default, activations rounded too."""
+    if precision != "int8":
+        return ""
+    return " (weight-only, activations bf16)" if getattr(driver, "int8_weight_only", False) else " (weights and activations)"
+
+
+def _quantize_one(m, driver, precision, compute_device, store_device=None):
+    """One block-map Linear to `precision` ("int8" or "nf4"), in place - the step quantize() takes for each."""
+    from fizgig.modules.nf4 import _dequantize_source_weight
+    if precision == "int8":
+        from fizgig.modules.int8_train import int8_train_forward
+        w = _dequantize_source_weight(m).to(compute_device)
+        # a driver may keep its original trainer's bf16 scales
+        w = w.float() if getattr(driver, "int8_fp32_scales", True) else w.contiguous()
+        scale = w.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / 127.0
+        m.weight.requires_grad_(False)
+        q = (w / scale).round_().clamp_(-127, 127).to(torch.int8).contiguous()
+        m.weight.data = q if store_device is None else q.to(store_device)
+        m.register_buffer("_int8_wscale", scale.reshape(1, -1).to(torch.float32), persistent=False)
+        m._is_int8 = True
+        if getattr(driver, "int8_weight_only", False):    # the activations stay bf16 (description: why)
+            from fizgig.modules.int8_train import int8_weight_only_forward
+            m.forward = int8_weight_only_forward.__get__(m, type(m))
+        else:
+            m.forward = int8_train_forward.__get__(m, type(m))
+        del w
+    else:
+        from bitsandbytes.functional import quantize_nf4
+        from fizgig.modules.nf4 import nf4_linear_forward_patch
+        packed, state = quantize_nf4(_dequantize_source_weight(m).to(compute_device).contiguous())
+        m._nf4_packed, m._nf4_state, m._is_nf4 = packed, state, True
+        m.weight.data = torch.empty(0, device=compute_device, dtype=torch.bfloat16)
+        m.weight.requires_grad_(False)
+        m.forward = nf4_linear_forward_patch.__get__(m, type(m))
+
+
+STREAM_HEADROOM_GB = 6.0     # what the rest of the run takes in RAM beside the model file while it loads
+
+
+def _ram_short(driver, path):
+    """The bf16 model file would not fit in the RAM that's free (on a pod, its own limit, via container_ram): the
+    one case the base is streamed. With RAM to spare the whole-file load runs as it always has."""
+    try:
+        import psutil
+        return driver.dit_gb(path) + STREAM_HEADROOM_GB > psutil.virtual_memory().available / 1e9
+    except Exception:
+        return False
+
+
+@torch.no_grad()
+def _stream_load(driver, path, device, precision, swap):
+    """The base built a tensor at a time, each block-map Linear quantised as soon as its weight is read, so the
+    bf16 model is never whole in RAM. Same result as load_dit on the CPU + quantize(); None when the driver can't
+    stream this file (it then loads the usual way)."""
+    got = driver.stream_dit(path)
+    if got is None:
+        return None
+    dit, f, dtype = got                    # the model on meta, the open file, the dtype load_dit gives its weights
+    with f:
+        _stream_fill(dit, driver, f, dtype, path, device, precision, swap)
+    dit.eval().requires_grad_(False)
+    gc.collect()
+    torch.cuda.empty_cache()
+    logger.info(f"[precision] {precision}{_int8_kind(driver, precision)}: {len(_targets(dit, driver))} block Linears quantised; everything else stays bf16")
+    return dit
+
+
+def _stream_fill(dit, driver, f, dtype, path, device, precision, swap):
+    keys = f.keys()
+    read = lambda k: f.get_tensor(k, device=torch.device("cpu"), dtype=dtype)    # noqa: E731 - as load_dit reads
+    expected = set(dit.state_dict().keys())
+    if set(keys) != expected:
+        raise RuntimeError(f"{os.path.basename(path)}: {len(set(keys) - expected)} unexpected and "
+                           f"{len(expected - set(keys))} missing weights for this model")
+    targets = dict(_targets(dit, driver))
+    owned = {}
+    for k in keys:
+        mod = k.rpartition(".")[0]
+        if mod in targets:
+            owned.setdefault(mod, []).append(k)
+    rest = [k for k in keys if k.rpartition(".")[0] not in targets]
+    logger.info(f"[precision] RAM is short for the whole {driver.dit_gb(path):.0f} GB model: "
+                f"loading it a Linear at a time and quantising each to {precision} as it arrives")
+    dit.load_state_dict({k: read(k) for k in rest}, strict=False, assign=True)
+    compute_device, store_device = torch.device(device), ("cpu" if swap else None)
+    for name, m in targets.items():
+        m.load_state_dict({k.rpartition(".")[2]: read(k) for k in owned.get(name, ())}, strict=True, assign=True)
+        _quantize_one(m, driver, precision, compute_device, store_device)
+    if precision == "int8":
+        dit._int8_quantized = True
+    else:
+        dit._nf4_quantized = True
 
 
 def move(dit, device):
@@ -83,6 +158,9 @@ def load_base(driver, path, device, precision="bf16", blocks_to_swap=0, supports
     """The family's DiT at `precision`, optionally block-swapped. NF4 cannot swap (its weights are not .weight), so
     swap is dropped for it; a family whose driver has no block swap ignores the request. Returns (dit, swapped)."""
     swap = int(blocks_to_swap or 0)
+    own = driver.load_planned(path, device, precision, swap)
+    if own is not None:                               # the driver loads its own tiers (H3: ConvRot int8 / NF4 / HQQ rings)
+        return own
     if swap and precision == "nf4":
         logger.info("[block swap] off: NF4 weights cannot stream (the 4-bit base is small enough not to need it)")
         swap = 0
@@ -94,8 +172,15 @@ def load_base(driver, path, device, precision="bf16", blocks_to_swap=0, supports
         elif swap > cap:
             logger.info(f"[block swap] {swap} requested, {cap} is the maximum")
             swap = cap
-    dit = driver.load_dit(path, "cpu" if (swap or precision != "bf16") else device)
-    quantize(dit, driver, precision, device, store_device="cpu" if swap else None)
+    if getattr(driver, "loads_quantized", False):     # the file is already the base precision
+        dit = driver.load_dit(path, device)
+        return dit, 0
+    dit = None
+    if precision != "bf16" and hasattr(driver, "stream_dit") and _ram_short(driver, path):
+        dit = _stream_load(driver, path, device, precision, swap)
+    if dit is None:
+        dit = driver.load_dit(path, "cpu" if (swap or precision != "bf16") else device)
+        quantize(dit, driver, precision, device, store_device="cpu" if swap else None)
     if swap:
         driver.enable_block_swap(dit, swap, device, supports_backward)
         logger.info(f"[block swap] {swap} blocks stream between CPU and GPU")
@@ -120,24 +205,120 @@ def _peak(entry, megapixels):
     return y0 + (y1 - y0) * (megapixels - x0) / (x1 - x0)
 
 
-def plan(desc, driver, precision="auto", blocks_to_swap=-1, free_gb=None, margin_gb=1.5, megapixels=1.0):
+TIGHT_MARGIN_GB = 0.5      # nf4 with no swap beats a swapped int8 base down to this much headroom
+
+# Optimizer state per trainable parameter, in bytes (fp32 adapter weights): 8-bit moments are a byte each, fp32 ones
+# four; AdEMAMix keeps three moments, Lion and Muon one; Prodigy four fp32 buffers. Unlisted: fp32 Adam's 8.
+_STATE_BYTES = {"adamw8bit": 2, "pagedadamw8bit": 2, "ademamix8bit": 3, "pagedademamix8bit": 3, "lion8bit": 1,
+                "adamw": 8, "adafactor": 1, "muon": 4, "prodigy": 16, "automagic3": 4, "automagic4": 4}
+# What the description's train_memory figures already carry: a rank-16 LoRA on adamw8bit with EMA on (the form's
+# default), so a run that size or smaller adds nothing
+_FIGURE_RANK, _FIGURE_STATE, _FIGURE_EMA = 16, 2, True
+
+
+def _adapter_bytes(state_bytes, ema):
+    """Bytes per trainable parameter for the whole run: fp32 weight + fp32 gradient + optimizer state + fp32 EMA."""
+    return 4 + 4 + state_bytes + (4 if ema else 0)
+
+
+def _target_shapes(driver, dit_path):
+    """(out, in) of every Linear the driver's LoRA wraps, read from the model file's header (no weights loaded), or []
+    when the file can't be read or its names don't line up with the block map's."""
+    import json
+    import struct
+    try:
+        names = [m for g in driver.block_map(None) for b in g.blocks for m in b.modules]
+        with open(dit_path, "rb") as f:
+            hdr = json.loads(f.read(struct.unpack("<Q", f.read(8))[0]))
+    except Exception:
+        return []
+    keys = [k for k in hdr if k.endswith(".weight") and len(hdr[k].get("shape") or []) == 2]
+    prefix = next((k[:-len(n) - 7] for n in names[:1] for k in keys if k.endswith("." + n + ".weight") or
+                   k == n + ".weight"), None)
+    if prefix is None:
+        return []
+    return [tuple(int(d) for d in hdr[prefix + n + ".weight"]["shape"]) for n in names
+            if prefix + n + ".weight" in hdr and len(hdr[prefix + n + ".weight"].get("shape") or []) == 2]
+
+
+def adapter_ema(run: dict) -> bool:
+    """Whether the run keeps an EMA copy of the adapter (ema_decay above 0)."""
+    try:
+        return float(run.get("ema_decay") or 0) > 0
+    except (TypeError, ValueError):
+        return bool(run.get("ema_decay"))
+
+
+def adapter_extra_gb(driver, run: dict) -> float:
+    """GB this run's trainable adapter holds beyond what the description's train_memory figures already include
+    (a rank-16 LoRA on adamw8bit with EMA): weights, gradients, optimizer state and the EMA copy, all fp32. Not a
+    rounding error: LoKR factor 8 on Krea 2 is 200M parameters, ~3 GB with AdEMAMix and EMA against a rank-16 LoRA's
+    ~0.5 GB, and planning without it put a 16 GB card's nf4 run past its memory (#337). run: dit_path, network_type,
+    network_dim, lokr_factor, optimizer_type, ema_decay (as train.py hands driver.plan_run). 0 when the file can't
+    be read."""
+    shapes = _target_shapes(driver, run.get("dit_path") or "")
+    if not shapes:
+        return 0.0
+    from fizgig.networks.lora import factorization
+    lokr = str(run.get("network_type") or "").lower() == "lokr"
+    f = int(run.get("lokr_factor") or 8)
+
+    def params(out_f, in_f):
+        if lokr:
+            a, c = factorization(out_f, f)
+            b, d = factorization(in_f, f)
+            return a * b + c * d
+        return int(run.get("network_dim") or 16) * (in_f + out_f)
+
+    n = sum(params(o, i) for o, i in shapes)
+    base = sum(_FIGURE_RANK * (i + o) for o, i in shapes)
+    ema = adapter_ema(run)
+    state = _STATE_BYTES.get(str(run.get("optimizer_type") or "adamw8bit").lower(), 8)
+    return max(0.0, (n * _adapter_bytes(state, ema) - base * _adapter_bytes(_FIGURE_STATE, _FIGURE_EMA)) / 1e9)
+
+
+def small_card_figures(desc) -> bool:
+    """Whether the Auto plan reads desc.train_memory_small: the family has small-card figures and this card gets the
+    trainer's small-card preview treatment (under 20 GB)."""
+    if not getattr(desc, "train_memory_small", None):
+        return False
+    from fizgig.families.train import _small_card_previews
+    return _small_card_previews()
+
+
+def plan(desc, driver, precision="auto", blocks_to_swap=-1, free_gb=None, margin_gb=1.5, megapixels=1.0, pictures=1,
+         adapter_gb=0.0, dit_path=None):
     """Resolve 'auto' precision and/or block swap (-1) from free VRAM and the description's measured training
     memory (desc.train_memory: {precision: (peak GB at no swap, GB saved per swapped block)}).
 
     Auto precision takes the most precise base that fits without swap (bf16, then int8, then nf4), since swap costs
-    far more speed than quantisation. Only if nothing fits does it swap (int8, the smaller swappable base). An
-    explicit precision with auto swap gets the fewest blocks that fit. Returns (precision, blocks_to_swap, reason)."""
+    far more speed than quantisation. If none fits with the full margin, nf4 still goes first when it fits with a
+    small one: swapping int8 instead cost 4.4x the step time and 4x the CPU on a 16 GB card (#216; measured July
+    2026). Only if nothing fits does it swap (int8, the smaller swappable base; failing that, a 4-bit base that
+    streams - desc.streams_blocks). An explicit precision with auto swap
+    gets the fewest blocks that fit. pictures: a batched step's (Batch size), each past the first adding
+    desc.batch_gb's figure at megapixels. adapter_gb: what the run's trainable adapter holds beyond the figures'
+    (adapter_extra_gb). dit_path: Auto leaves out a precision that file can't load at (driver.precision_problem:
+    MiniMax H3's int8 of its full unpruned file, #357). Returns (precision, blocks_to_swap, reason)."""
     if free_gb is None:
         free_gb = free_vram_gb()
-    mem = {p: (_peak(v, megapixels), v[1]) for p, v in (desc.train_memory or {}).items()}
+    extra = batch_extra(desc, megapixels, pictures) + max(0.0, float(adapter_gb or 0))
+    small = small_card_figures(desc)
+    table = desc.train_memory_small if small else desc.train_memory
+    mem = {p: (_peak(v, megapixels) + extra, v[1]) for p, v in (table or {}).items()}
     offered = [p for p in PRECISIONS if p in desc.precisions]
-    if precision == "auto" and getattr(desc, "auto_precisions", ()):
-        offered = [p for p in desc.auto_precisions if p in desc.precisions]
+    order = (getattr(desc, "auto_precisions_small", ()) if small else ()) or getattr(desc, "auto_precisions", ())
+    if precision == "auto" and order:
+        offered = [p for p in order if p in desc.precisions]
+    if precision == "auto" and dit_path:
+        offered = [p for p in offered if not driver.precision_problem(p, dit_path)] or offered
     cap = driver.max_blocks_to_swap()
     budget = free_gb - margin_gb
 
+    streams = getattr(desc, "streams_blocks", None) or (lambda p: p != "nf4")
+
     def swap_for(p):
-        if p not in mem or p == "nf4":
+        if p not in mem or not streams(p):
             return 0
         need, per_block = mem[p]
         if need <= budget or per_block <= 0 or cap <= 0:
@@ -150,6 +331,9 @@ def plan(desc, driver, precision="auto", blocks_to_swap=-1, free_gb=None, margin
         for p in offered:
             if p in mem and mem[p][0] <= budget:
                 return p, 0 if blocks_to_swap < 0 else blocks_to_swap, f"{p} fits {free_gb:.1f} GB free"
+        if "nf4" in offered and "nf4" in mem and mem["nf4"][0] <= free_gb - TIGHT_MARGIN_GB:
+            return "nf4", 0 if blocks_to_swap < 0 else blocks_to_swap, (f"nf4 fits {free_gb:.1f} GB free, closely "
+                                                                        "(block swap would be far slower)")
         swappable = [p for p in ("int8", "bf16") if p in offered and p in mem]
         if swappable and cap > 0:
             p = swappable[0]
@@ -157,13 +341,142 @@ def plan(desc, driver, precision="auto", blocks_to_swap=-1, free_gb=None, margin
             if mem[p][0] - n * mem[p][1] <= budget:
                 return p, n if blocks_to_swap < 0 else blocks_to_swap, f"{p} + {n} swapped blocks fit {free_gb:.1f} GB"
         p = "nf4" if "nf4" in offered else offered[-1]
-        return p, 0, f"nothing fits {free_gb:.1f} GB comfortably: {p}, the smallest base"
+        # a 4-bit base that streams (MiniMax H3 Image's NF4 ring) takes the blocks it needs: with none, a 12 GB card
+        # planned 12.8 GB, spilled into system memory on Windows and trained at 40 s/step; 16 swapped ran 4.1 (#354)
+        n = swap_for(p)
+        if n and mem[p][0] - n * mem[p][1] <= budget:
+            return p, n if blocks_to_swap < 0 else blocks_to_swap, f"{p} + {n} swapped blocks fit {free_gb:.1f} GB"
+        return (p, n if blocks_to_swap < 0 else (blocks_to_swap if n else 0),
+                f"nothing fits {free_gb:.1f} GB comfortably: {p}, the smallest base"
+                + (f", {n} blocks swapped (the most)" if n else ""))
     if precision not in offered:
         raise ValueError(f"{desc.display_name} offers {offered}, not {precision!r}")
     if blocks_to_swap < 0:
         n = swap_for(precision)
         return precision, n, (f"{n} swapped blocks to fit {free_gb:.1f} GB" if n else f"fits {free_gb:.1f} GB")
     return precision, blocks_to_swap, "as set"
+
+
+def batch_extra(desc, megapixels=1.0, pictures=1):
+    """GB a batched step needs past one picture's: desc.batch_gb (fixed, per megapixel) for each picture after the
+    first."""
+    fixed, per_mp = getattr(desc, "batch_gb", None) or (0.0, 0.0)
+    return max(0, int(pictures) - 1) * (float(fixed) + float(per_mp) * float(megapixels))
+
+
+def fits(desc, precision, blocks_to_swap, free_gb, megapixels=1.0, pictures=1, margin_gb=1.5):
+    """Whether `precision` with `blocks_to_swap` swapped fits free_gb by the description's figures (as plan() weighs
+    them); True when there is no figure for it."""
+    if precision not in (desc.train_memory or {}):
+        return True
+    v = desc.train_memory[precision]
+    extra = batch_extra(desc, megapixels, pictures)
+    return _peak(v, megapixels) + extra - max(0, blocks_to_swap) * v[1] <= free_gb - margin_gb
+
+
+def share_shortfall(desc, driver, precision, blocks_to_swap, megapixels, free_gb=None, margin_gb=0.5):
+    """Why `precision` with `blocks_to_swap` swapped won't fit this card ("needs ~X GB, Y GB free"), or "" when it
+    does or the description has no figure for it - read from the same train_memory figures Auto plans with."""
+    if precision not in (desc.train_memory or {}):
+        return ""
+    need, per_block = _peak(desc.train_memory[precision], megapixels), desc.train_memory[precision][1]
+    if free_gb is None:
+        free_gb = free_vram_gb()
+    left = need - max(0, blocks_to_swap) * per_block
+    if left <= free_gb - margin_gb:
+        return ""
+    return (f"needs ~{left:.1f} GB with {max(0, blocks_to_swap)} blocks swapped at {megapixels:.2f} MP, "
+            f"{free_gb:.1f} GB free")
+
+
+NOGC_MIN_CARD_GB = 38.0   # big cards only (40 GB and up; a 40 GB A100 reports ~39.4 GiB) - 32 GB and smaller always checkpoint
+NOGC_MARGIN_GB = 4.0     # over the measured no-checkpointing peak: rank, adapters, EMA, a Context LoRA, a busy desktop
+NOGC_MAX_RANK = 32       # rank 32 measured +0.6-1.8 GB over the figures (inside the margin); higher ranks unmeasured
+
+
+def card_gb():
+    """The card's size in GiB - the simulated card's when FIZGIG_SIM_VRAM_GB is set."""
+    sim = os.environ.get("FIZGIG_SIM_VRAM_GB", "").strip()
+    if sim:
+        return float(sim)
+    if not torch.cuda.is_available():
+        return 0.0
+    return torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / 1024 ** 3
+
+
+def auto_batch(desc, megapixels):
+    """Batch size Auto's batch for this size (desc.batch_auto), before the memory check: 1 when the family has none,
+    or the run is past its measured sizes."""
+    return desc.auto_batch(megapixels)
+
+
+def nogc_batch_gb(desc, megapixels, pictures):
+    """GB the pictures past the first add with checkpointing off (desc.batch_gb_nogc), or None when unmeasured at
+    this size."""
+    if pictures <= 1:
+        return 0.0
+    pts = getattr(desc, "batch_gb_nogc", None) or ()
+    if not pts or megapixels > max(p[0] for p in pts) + 0.01:
+        return None
+    return _peak((pts, 0.0), max(megapixels, min(p[0] for p in pts))) * (pictures - 1)
+
+
+def plan_checkpointing(desc, precision, blocks_to_swap, megapixels, free_gb=None, compiled=True, kind="", rank=8,
+                       pictures=1):
+    """Gradient checkpointing on or off: (on, reason). Off only on a big card (NOGC_MIN_CARD_GB+), for a compiled run with no block swap whose measured
+    no-checkpointing peak (desc.train_memory_nogc, at the largest bucket) fits free VRAM with NOGC_MARGIN_GB to spare.
+    The figures are compiled runs - uncompiled blocks without checkpointing take more - and a swapped block's weights
+    would stay pinned through backward without the recompute."""
+    key = f"{precision}:{kind}" if kind else precision
+    pts = (getattr(desc, "train_memory_nogc", None) or {}).get(key)
+    if not pts:
+        return True, f"no measured figure for {key} without it"
+    if blocks_to_swap > 0:
+        return True, "blocks are swapped"
+    if not compiled and desc.compiles and not getattr(desc, "nogc_uncompiled", False):
+        return True, "the blocks aren't compiled this run"     # (a family that never compiles was measured uncompiled)
+    if card_gb() < NOGC_MIN_CARD_GB:
+        return True, f"a {card_gb():.0f} GB card (only {NOGC_MIN_CARD_GB:.0f} GB+ cards go without it)"
+    if rank > NOGC_MAX_RANK:
+        return True, f"on: rank {rank} is past the measured ranks (up to {NOGC_MAX_RANK})"
+    if free_gb is None:
+        free_gb = free_vram_gb()
+    if megapixels > max(p[0] for p in pts) + 0.01:
+        return True, f"on: {megapixels:.2f} MP is past the measured sizes"
+    need = _peak((pts, 0.0), max(megapixels, min(p[0] for p in pts)))    # below the first point: that point's peak
+    more = nogc_batch_gb(desc, megapixels, pictures)
+    if more is None:
+        return True, f"on: no measured figure for {pictures} pictures a step without it at {megapixels:.2f} MP"
+    need += more
+    at = f"{megapixels:.2f} MP" + (f" x {pictures} pictures" if pictures > 1 else "")
+    if need + NOGC_MARGIN_GB <= free_gb:
+        return False, f"off: needs ~{need:.1f} GB at {at}, {free_gb:.1f} GB free"
+    return True, f"on: off would need ~{need + NOGC_MARGIN_GB:.1f} GB at {at}, {free_gb:.1f} GB free"
+
+
+def plan_partial_checkpointing(desc, precision, blocks_to_swap, megapixels, free_gb=None, compiled=True, kind="",
+                               rank=8):
+    """How many of the last blocks train without gradient checkpointing when full off doesn't fit a big card: (n, why).
+    Read from desc.train_memory_partial {key: (blocks, ((megapixels, GB with every block checkpointed, GB per block
+    without it), ...))} - reserved peaks, compiled with the checkpoint outside the graph, previews on - at the first
+    measured size at or above the run's (never between or past them), with NOGC_MARGIN_GB to spare. 0 = all on."""
+    key = f"{precision}:{kind}" if kind else precision
+    fig = (getattr(desc, "train_memory_partial", None) or {}).get(key)
+    if (not fig or blocks_to_swap > 0 or (not compiled and desc.compiles) or card_gb() < NOGC_MIN_CARD_GB
+            or rank > NOGC_MAX_RANK):
+        return 0, ""
+    blocks, pts = fig
+    at = [p for p in pts if p[0] + 0.01 >= megapixels]
+    if not at:
+        return 0, ""
+    mp, on_gb, per_block = min(at)
+    if free_gb is None:
+        free_gb = free_vram_gb()
+    n = max(0, min(blocks - 1, int((free_gb - NOGC_MARGIN_GB - on_gb) // per_block)))
+    if not n:
+        return 0, ""
+    return n, (f"partly off: the last {n} of {blocks} blocks without it (~{on_gb + n * per_block:.1f} GB at "
+               f"{megapixels:.2f} MP, {free_gb:.1f} GB free)")
 
 
 _SIM_OTHERS_GB = 0.8     # a simulated card also loses this to the desktop / other apps, as real cards do
@@ -175,7 +488,7 @@ def apply_vram_cap():
     sim = os.environ.get("FIZGIG_SIM_VRAM_GB", "").strip()
     if not sim or not torch.cuda.is_available():
         return
-    total = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+    total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / 1024 ** 3
     torch.cuda.set_per_process_memory_fraction(min(1.0, (float(sim) - _SIM_OTHERS_GB) / total))
     logger.info(f"[sim] behaving like a {float(sim):g} GB card ({float(sim) - _SIM_OTHERS_GB:.1f} GB for Fizgig)")
 

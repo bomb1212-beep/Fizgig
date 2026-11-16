@@ -2,11 +2,11 @@
 """Probe the installed PyTorch ROCm version and write rocm_env.bat / rocm_env.sh.
 
 bitsandbytes needs BNB_ROCM_VERSION to match the ROCm SDK bundled with the PyTorch wheel
-(e.g. 714 for ROCm 7.14, 715 for 7.15). run_fizgig_rocm.bat and run_fizgig_rocm.sh source these.
+(e.g. 714 for ROCm 7.14, 715 for 7.15). Launch Fizgig AMD*.bat and launch_fizgig_amd.sh
+source these (plus FIZGIG_AMD_* identity for the web UI).
 
-With --experimental (Windows floating install): omit BNB_ROCM_VERSION so bitsandbytes
-auto-selects its highest matching lib (falls back with a warning if exact ROCm minor is
-missing). Distinct from Linux ROCM_CHANNEL=nightly.
+With --experimental: omit BNB_ROCM_VERSION so bitsandbytes auto-selects its highest matching
+lib. Distinct from Linux ROCM_CHANNEL=nightly.
 """
 
 from __future__ import annotations
@@ -19,10 +19,10 @@ import sys
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
-OUT_BAT = SCRIPT_DIR / "rocm_env.bat"
-OUT_SH = SCRIPT_DIR / "rocm_env.sh"
-DEFAULT_BNB_LINUX = "714"  # libbitsandbytes_rocm714.so - matches stable repo.amd.com torch
-DEFAULT_BNB_WIN = "715"  # Windows 0xDELUXA wheel / pinned multi-arch torch (+rocm7.15)
+OUT_BAT = SCRIPT_DIR / "user_data" / "rocm_env.bat"
+OUT_SH = SCRIPT_DIR / "user_data" / "rocm_env.sh"
+DEFAULT_BNB_LINUX = "714"  # fallback when probed ROCm has no matching libbitsandbytes_rocm*.so
+DEFAULT_BNB_WIN = "715"  # Windows 0xDELUXA wheel fallback when probed ROCm has no matching DLL
 
 
 def _bnb_lib_ext() -> str:
@@ -52,12 +52,53 @@ def _bitsandbytes_rocm_libs_available() -> list[Path]:
     return sorted(lib_dir.glob(f"libbitsandbytes_rocm*{_bnb_lib_ext()}"))
 
 
+# The 4-bit (NF4) matrix-vector kernels a 4-bit model uses when it generates a token at a time (JoyCaption NF4's
+# captions): some bitsandbytes ROCm builds ship without them - #316: its rocm715 DLL had none, its rocm716 one did
+GEMM_4BIT = (b"cgemm_4bit_bf16", b"cgemm_4bit_fp16", b"cgemm_4bit_fp32")
+
+
+def _has_4bit_gemm(lib: Path) -> bool:
+    """Does this bitsandbytes library export the 4-bit kernels? (Their names in its export table, read as bytes, so
+    it works on a DLL that can't load yet, and on a Linux .so.)"""
+    try:
+        data = lib.read_bytes()
+    except OSError:
+        return True                  # can't tell: keep it
+    return all(name + b"\0" in data for name in GEMM_4BIT)
+
+
+def _rocm_lib_version(lib: Path) -> int | None:
+    m = re.search(r"rocm(\d+)", lib.name)
+    return int(m.group(1)) if m else None
+
+
+def _with_4bit_gemm(bnb: str, lib: Path | None) -> tuple[str, Path | None]:
+    """The library for BNB_ROCM_VERSION: the matching one when it has the 4-bit kernels, else the nearest version
+    that does - newer first (#316: 715 lacked them, 716 worked with PyTorch's ROCm 7.15). None has them: unchanged."""
+    if lib is None or _has_4bit_gemm(lib):
+        return bnb, lib
+    want = int(bnb) if bnb.isdigit() else 0
+    others = [(v, p) for p in _bitsandbytes_rocm_libs_available()
+              if (v := _rocm_lib_version(p)) is not None and v != want and _has_4bit_gemm(p)]
+    if not others:
+        print(f"WARN: {lib.name} has no 4-bit kernels (cgemm_4bit_*) and no other build has them: 4-bit (NF4) "
+              f"text generation such as JoyCaption NF4 may fail", file=sys.stderr)
+        return bnb, lib
+    v, p = min(others, key=lambda vp: (vp[0] < want, abs(vp[0] - want)))   # nearest newer, else nearest older
+    print(f"WARN: {lib.name} has no 4-bit kernels (cgemm_4bit_*); using {p.name} (BNB_ROCM_VERSION={v}) instead",
+          file=sys.stderr)
+    return str(v), p
+
+
 def _windows_rocm_path_prefix(core: Path) -> str | None:
     """Directories where hipInfo.exe lives (bitsandbytes cuda_specs runs ``hipinfo``)."""
     parts: list[str] = []
     bin_dir = core / "bin"
     if bin_dir.is_dir():
         parts.append(str(bin_dir.resolve()))
+    libs_bin = core.parent / "_rocm_sdk_libraries" / "bin"     # the libraries newer bitsandbytes DLLs load (#316)
+    if libs_bin.is_dir():
+        parts.append(str(libs_bin.resolve()))
     devel_bin = core.parent / "_rocm_sdk_devel" / "bin"
     if devel_bin.is_dir():
         parts.append(str(devel_bin.resolve()))
@@ -85,7 +126,7 @@ def _ensure_windows_rocm_on_path() -> None:
     """Put hipinfo / ROCm bin dirs on PATH before bitsandbytes or torch probes them.
 
     Without this, bitsandbytes prints WinError 2 ("could not detect ROCm GPU
-    architecture") on a fresh update because hipinfo.exe is not findable yet —
+    architecture") on a fresh update because hipinfo.exe is not findable yet  - 
     rocm_env.bat is what normally prepends those dirs at launch time.
     """
     if sys.platform != "win32":
@@ -102,9 +143,19 @@ def _ensure_windows_rocm_on_path() -> None:
     os.environ.setdefault("HIP_PATH", str(core.resolve()))
 
 
+def _choose_training_gpu():
+    """Same rule as Launch Fizgig AMD.bat / pick_gpu.py (#186)."""
+    install_dir = str(SCRIPT_DIR / "src" / "install")
+    if install_dir not in sys.path:
+        sys.path.insert(0, install_dir)
+    from pick_gpu import choose_training_gpu
+
+    return choose_training_gpu()
+
+
 def detect_gfx_target() -> str | None:
-    """Return gfx code (e.g. gfx1201) or None. Prefer detect_gpu*.py, then torch."""
-    script = SCRIPT_DIR / ("detect_gpu_linux.py" if sys.platform.startswith("linux") else "detect_gpu.py")
+    """Return gfx code (e.g. gfx1201) or None. Prefer detect_gpu*.py, then torch on the pick_gpu card."""
+    script = SCRIPT_DIR / "src" / "install" / ("detect_gpu_linux.py" if sys.platform.startswith("linux") else "detect_gpu.py")
     if script.is_file():
         try:
             out = subprocess.run(
@@ -122,15 +173,41 @@ def detect_gfx_target() -> str | None:
     try:
         import torch
 
-        if torch.cuda.is_available():
-            props = torch.cuda.get_device_properties(0)
-            for attr in ("gcnArchName", "name"):
-                gfx = _normalize_gfx(getattr(props, attr, None))
-                if gfx:
-                    return gfx
+        if not torch.cuda.is_available():
+            return None
+        # Same device as pick_gpu / detect_amd_gpu_identity - not built-in device 0 (#186, #192).
+        idx = 0
+        try:
+            hit = _choose_training_gpu()
+            if hit is not None:
+                idx = hit[0]
+        except Exception:
+            pass
+        props = torch.cuda.get_device_properties(idx)
+        for attr in ("gcnArchName", "name"):
+            gfx = _normalize_gfx(getattr(props, attr, None))
+            if gfx:
+                return gfx
     except Exception:
         pass
     return None
+
+
+def detect_amd_gpu_identity() -> tuple[str | None, int | None]:
+    """(name, total_vram_bytes) for the same card pick_gpu.py selects (#186, #188, #192).
+
+    Skips built-in graphics (is_integrated / generic "AMD Radeon(TM) Graphics"), then takes
+    the most VRAM of those. Baked into rocm_env for the web UI so readout matches training.
+    """
+    try:
+        hit = _choose_training_gpu()
+        if hit is None:
+            return None, None
+        _idx, name, total = hit
+        name = (name or "").strip() or None
+        return name, total if total > 0 else None
+    except Exception:
+        return None, None
 
 
 def bnb_rocm_version_from_torch() -> str:
@@ -178,7 +255,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     omit_bnb = bool(args.experimental)
 
-    # hipinfo lives under the pip ROCm SDK — put it on PATH before bitsandbytes probes.
+    # hipinfo lives under the pip ROCm SDK - put it on PATH before bitsandbytes probes.
     _ensure_windows_rocm_on_path()
 
     is_linux = sys.platform.startswith("linux")
@@ -217,10 +294,15 @@ def main(argv: list[str] | None = None) -> int:
                 )
             bnb = default_bnb
             bnb_lib = _bitsandbytes_rocm_lib(bnb)
-        elif is_linux and probed == DEFAULT_BNB_LINUX:
-            src = f"{src} (Linux ROCm 7.14 / bnb {bnb})"
         else:
-            src = f"{src} (bnb {bnb} / {bnb_lib.name})"
+            picked, bnb_lib = _with_4bit_gemm(bnb, bnb_lib)
+            if picked != bnb:
+                src = f"{src} (bnb {picked} / {bnb_lib.name}: rocm{bnb} has no 4-bit kernels, #316)"
+                bnb = picked
+            elif is_linux and probed == DEFAULT_BNB_LINUX:
+                src = f"{src} (Linux ROCm 7.14 / bnb {bnb})"
+            else:
+                src = f"{src} (bnb {bnb} / {bnb_lib.name})"
     except Exception as exc:
         print(f"WARN: {exc}; using default BNB_ROCM_VERSION={default_bnb}")
         bnb = default_bnb
@@ -230,6 +312,7 @@ def main(argv: list[str] | None = None) -> int:
         src = f"{src}; BNB_ROCM_VERSION omitted (--experimental / bitsandbytes auto)"
 
     gfx = detect_gfx_target()
+    gpu_name, vram_total = detect_amd_gpu_identity()
 
     rocm_core_win = SCRIPT_DIR / "venv" / "Lib" / "site-packages" / "_rocm_sdk_core"
     try:
@@ -260,12 +343,23 @@ def main(argv: list[str] | None = None) -> int:
         if path_prefix:
             bat_lines.append(f'set "PATH={path_prefix};%PATH%"')
         if gfx:
-            bat_lines.append(f'REM GPU gfx target: {gfx}')
+            bat_lines.append(f'set "FIZGIG_AMD_GFX={gfx}"')
+        # Web UI VRAM panel (#188): capacity/name without importing torch in the server process.
+        if vram_total is not None:
+            bat_lines.append(f'set "FIZGIG_AMD_VRAM_TOTAL={vram_total}"')
+        if gpu_name:
+            # Escape quotes for cmd set "VAR=..."
+            safe = gpu_name.replace('"', "")
+            bat_lines.append(f'set "FIZGIG_AMD_GPU_NAME={safe}"')
         bat_lines.append("")
+        OUT_BAT.parent.mkdir(exist_ok=True)
         OUT_BAT.write_text("\r\n".join(bat_lines), encoding="utf-8")
         bnb_msg = "BNB_ROCM_VERSION unset" if omit_bnb else f"BNB_ROCM_VERSION={bnb}"
         extra = f"  gfx={gfx}" if gfx else ""
+        if vram_total is not None:
+            extra += f"  vram={vram_total / 2**30:.0f}GB"
         print(f"Wrote {OUT_BAT.name}: {bnb_msg}  ({src}){extra}")
+
 
     if rocm_core_linux is not None:
         sh_lines = [
@@ -285,11 +379,19 @@ def main(argv: list[str] | None = None) -> int:
             ]
         )
         if gfx:
-            sh_lines.append(f"# GPU gfx target: {gfx}")
+            sh_lines.append(f'export FIZGIG_AMD_GFX="{gfx}"')
+        if vram_total is not None:
+            sh_lines.append(f'export FIZGIG_AMD_VRAM_TOTAL="{vram_total}"')
+        if gpu_name:
+            safe = gpu_name.replace('"', '\\"')
+            sh_lines.append(f'export FIZGIG_AMD_GPU_NAME="{safe}"')
         sh_lines.append("")
+        OUT_SH.parent.mkdir(exist_ok=True)
         OUT_SH.write_text("\n".join(sh_lines), encoding="utf-8")
         bnb_msg = "BNB_ROCM_VERSION unset" if omit_bnb else f"BNB_ROCM_VERSION={bnb}"
         extra = f"  gfx={gfx}" if gfx else ""
+        if vram_total is not None:
+            extra += f"  vram={vram_total / 2**30:.0f}GB"
         print(f"Wrote {OUT_SH.name}: {bnb_msg}  ({src}){extra}")
 
     if not rocm_core_win.is_dir() and rocm_core_linux is None:

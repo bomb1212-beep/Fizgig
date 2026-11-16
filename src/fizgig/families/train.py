@@ -12,15 +12,20 @@ Why training adapters exist: on Qwen Image 2.1 a plain LoRA collapsed at lr 5e-4
 Adaptive LR a no-adapter run fell to 37 likeness at step 2000 while Fizgig's adapter held 74-77 (26 Sep 2026).
 """
 import argparse
+import dataclasses
 import datetime
 import gc
+import glob
 import json
 import logging
 import math
 import os
 import random
+import re
+import shutil
 import sys
 import time
+import uuid
 from multiprocessing import Value
 
 import torch
@@ -36,15 +41,21 @@ from fizgig.families import quant  # noqa: E402
 from fizgig.families.lora import FamilyLoRA  # noqa: E402
 from fizgig.families.registry import get as get_family  # noqa: E402
 from fizgig.training.adaptive_lr import AdaptiveLR  # noqa: E402
+from fizgig.training.resume_lr import resume_lr  # noqa: E402
 from fizgig.training.metadata import (build_metadata, latest_sample_image, refresh_checkpoint_thumbnail,  # noqa: E402
                                       resolve_title, sample_for_epoch, thumbnail_data_uri)
 from fizgig.training.train_utils import LossRecorder, prune_state_dirs, validate_output_name  # noqa: E402
+from fizgig.training.step_log import StepLog, take_request  # noqa: E402
+from fizgig.utils.image import flatten
+from fizgig.utils.upright import open_upright
 
 logger = logging.getLogger(__name__)
 
 ADAPTER = "training_adapter"
 CONTEXT = "context"
 SPEED = "speed_lora"
+LOOK = "preview_look"         # a LoRA for previews only (MOSS-Image's SFT look LoRA), on CPU between previews
+TRAINABLE_PREVIEW = "epoch_lora"         # the epoch's LoRA, frozen on a preview checkpoint
 
 
 class _Collator:
@@ -90,7 +101,8 @@ def _save_state(output_dir, output_name, net, optimizer, *, epoch, global_step, 
         rng["cuda"] = torch.cuda.get_rng_state_all()
     torch.save(rng, os.path.join(state_dir, "rng.pt"))
     with open(os.path.join(state_dir, "training_state.json"), "w", encoding="utf-8") as f:   # commit marker, last
-        json.dump({"epoch": epoch, "global_step": global_step, "architecture": arch_id, **(extra or {})}, f)
+        json.dump({"epoch": epoch, "global_step": global_step, "architecture": arch_id,
+                   "optimizer": optimizer.__class__.__name__, **(extra or {})}, f)
     logger.info(f"[state] saved -> {state_dir}")
     return state_dir
 
@@ -117,11 +129,51 @@ def _optimizer_family_groups(desc, net, lr):
     return [{"params": buckets[f], "lr": float(lr), "family": f, "modules": counts[f]} for f in order if f in buckets]
 
 
-def _load_state(state_dir, net, optimizer, device, arch):
+def _legacy_perm(driver, net):
+    """{old parameter index: family LoRA parameter index} for an older trainer's state (driver.legacy_state_order), or
+    None when the orders already agree. Only modules that train here count, in the old order, down then up."""
+    order = driver.legacy_state_order(net.dit)
+    if order is None:
+        return None
+    from fizgig.families.lora import TRAINABLE
+    here, i = {}, 0
+    for full, w in net.wrapped.items():
+        if TRAINABLE in w.adapters:
+            for part, _p in enumerate(w.adapters[TRAINABLE].parameters()):
+                here[(full, part)] = i
+                i += 1
+    old = [(m, part) for m in order if (m, 0) in here for part in range(2) if (m, part) in here]
+    if len(old) != len(here):
+        raise RuntimeError(f"[resume] the old state's layout ({len(old)} tensors) does not match this LoRA "
+                           f"({len(here)}) - different rank, blocks or network type?")
+    return {k: here[key] for k, key in enumerate(old)}
+
+
+def _load_state(state_dir, net, optimizer, device, arch, untagged_own=False, driver=None):
     """(epoch, global step, training_state.json) of a saved state, its LoRA weights and RNG restored. The optimizer
     (and, by the caller, the EMA) is restored only from a state this family wrote: another trainer's (the original
     Krea 2's) orders its parameters differently, so its moments would land on the wrong tensors - that state goes on
-    from its weights with a fresh optimizer."""
+    from its weights with a fresh optimizer.
+    A pause saved by an accelerate trainer (the old Klein trainer: model.safetensors holding the LoRA, the epoch in the
+    folder name, adaptive_lr_state.json beside it) goes on the same way; its global step is None (the caller counts
+    it from the epoch)."""
+    legacy = os.path.join(state_dir, "model.safetensors")
+    if not os.path.isfile(os.path.join(state_dir, "training_state.json")) and os.path.isfile(legacy):
+        m = re.search(r"-(\d{6})-state$", os.path.basename(os.path.normpath(state_dir)))
+        if not m:
+            raise RuntimeError(f"[resume] {state_dir}: no epoch in the folder name ('<lora name>-000012-state')")
+        if net.load_trainable(legacy) == 0:
+            raise RuntimeError(f"[resume] {state_dir} matched none of this LoRA's modules - different rank or "
+                               f"target modules?")
+        meta = {"epoch": int(m.group(1)), "own_state": False}
+        side = os.path.join(state_dir, "adaptive_lr_state.json")
+        if os.path.isfile(side):
+            with open(side, encoding="utf-8") as f:
+                meta["adaptive_lr_state"] = json.load(f)
+        logger.info("[resume] this pause was saved by the old trainer: continuing from its LoRA weights and epoch"
+                    + (" (and its adaptive LR state)" if "adaptive_lr_state" in meta else "")
+                    + ", with a fresh optimizer")
+        return meta["epoch"], None, meta
     for need in ("lora.safetensors", "optimizer.pt", "training_state.json"):
         if not os.path.isfile(os.path.join(state_dir, need)):
             raise RuntimeError(f"[resume] {state_dir} is not a saved training state (missing {need}). Pick the "
@@ -131,9 +183,30 @@ def _load_state(state_dir, net, optimizer, device, arch):
                            f"target modules?")
     with open(os.path.join(state_dir, "training_state.json"), encoding="utf-8") as f:
         meta = json.load(f)
-    meta["own_state"] = meta.get("architecture") == arch
+    meta["own_state"] = meta.get("architecture") == arch or (untagged_own and "architecture" not in meta)
     if meta["own_state"]:
-        optimizer.load_state_dict(torch.load(os.path.join(state_dir, "optimizer.pt"), map_location=device))
+        sd = torch.load(os.path.join(state_dir, "optimizer.pt"), map_location=device)
+        perm = _legacy_perm(driver, net) if (driver is not None and "architecture" not in meta) else None
+        if perm is not None:            # an older trainer's order: each moment back onto its own tensor
+            sd["state"] = {perm[int(k)]: v for k, v in sd["state"].items()}
+            meta["legacy_perm"] = perm
+            logger.info("[resume] an older trainer's state: optimizer moments remapped into this LoRA's order")
+        # another Optimizer Type than the run trained with (#246): its saved moments don't fit this one, so the LoRA's
+        # weights carry on with a fresh optimizer (a state from before the type was saved: as its groups tell)
+        was, now = meta.get("optimizer"), optimizer.__class__.__name__
+        if was and was != now:
+            why = f"it trained with {was}, and this resume uses {now}"
+        elif len(sd.get("param_groups") or []) != len(optimizer.param_groups):
+            why = "it trained with another Optimizer Type than this resume uses"
+        else:
+            why = ""
+        if why:
+            meta["fresh_optimizer"] = True
+            logger.info(f"[resume] {why}: continuing from the state's LoRA weights and epoch, with a fresh "
+                        f"optimizer (it settles within a few steps). To carry the optimizer on too, resume with "
+                        f"{was or 'the run' + chr(39) + 's own'} Optimizer Type.")
+        else:
+            optimizer.load_state_dict(sd)
     else:
         logger.info("[resume] this state was saved by another trainer: continuing from its LoRA weights, with a "
                     "fresh optimizer and weight average (they settle within a few steps)")
@@ -174,35 +247,188 @@ def _small_card_previews():
         if not torch.cuda.is_available():
             return False
         sim = os.environ.get("FIZGIG_SIM_VRAM_GB", "").strip()
-        total = float(sim) if sim else torch.cuda.get_device_properties(0).total_memory / 1e9
+        total = float(sim) if sim else torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / 1e9
         return total < 20.0
     except Exception:
         return False
 
 
+def _record_prompts(sample_dir, output_name, epoch, prompts):
+    """The prompts an epoch's previews used (<sample_dir>/.prompts_<name>.json, by epoch), so the gallery shows each
+    preview's own prompt after a mid-run change, not the run's first ones."""
+    path = os.path.join(sample_dir, f".prompts_{output_name}.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {}
+    data[str(epoch)] = [str(p) for p in prompts]
+    try:
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(path + ".tmp", path)
+    except OSError as e:
+        logger.warning(f"[sample] could not record the preview prompts ({e})")
+
+
 def _read_sample_override(output_dir):
-    """The GUI's live sample override (<output_dir>/.sample_override.json, written by the status-bar panel):
-    {prompt, seed, width, height} while a prompt is set, else None. The reference image field is Klein's and ignored."""
+    """The live sample override (<output_dir>/.sample_override.json, written by the desktop's status-bar panel or the
+    web UI's Samples tab): {prompts, prompt (the first), seed, width, height, steps, cfg, turbo, every, until, after}
+    while a prompt is set, else None (every / until / after: the preview cadence, see preview_due). A "prompts" list (the web's, every line of its box) or a single "prompt"; the reference image field
+    is ignored. steps / cfg / turbo (the Turbo LoRA's strength) are None when the override doesn't set them."""
     path = os.path.join(output_dir, ".sample_override.json")
     try:
         with open(path, encoding="utf-8") as f:
             d = json.load(f)
-        prompt = str(d.get("prompt", "")).strip()
-        if prompt:
-            return {"prompt": prompt, "seed": int(d.get("seed", 1234)), "width": int(d.get("width", 1024)),
-                    "height": int(d.get("height", 1024))}
+        prompts = d.get("prompts") if isinstance(d.get("prompts"), list) else [d.get("prompt", "")]
+        prompts = [str(p).strip() for p in prompts if str(p or "").strip() and not str(p).strip().startswith("#")]
+        if prompts:
+            def num(k, kind):            # one bad value drops only itself, never the prompts
+                try:
+                    return kind(float(d[k])) if d.get(k) not in (None, "") else None
+                except (TypeError, ValueError):
+                    return None
+            steps, cfg, turbo = num("steps", int), num("cfg", float), num("turbo", float)
+            look = d.get("look") if isinstance(d.get("look"), str) else None   # the look LoRA's path, "" = off
+            # the preview-model tick (Qwen's Turbo, Klein's Distilled): its file's path when ticked, "" = the training
+            # model, None = not sent (the run keeps what it started with)
+            ck = d.get("checkpoint") if isinstance(d.get("checkpoint"), str) else None
+            return {"prompts": prompts, "prompt": prompts[0], "seed": int(d.get("seed", 1234)), "checkpoint": ck,
+                    "width": int(d.get("width", 1024)), "height": int(d.get("height", 1024)),
+                    "steps": steps if steps and steps > 0 else None, "cfg": cfg if cfg and cfg > 0 else None,
+                    "turbo": turbo if turbo is not None and turbo >= 0 else None,
+                    "look": look, "look_strength": num("look_strength", float),
+                    **{k: (lambda v: v if v is not None and v >= 0 else None)(num(k, int))
+                       for k in ("every", "until", "after")}}
     except (OSError, ValueError, TypeError):
         pass
     return None
 
 
-def _encode_override(driver, te_path, prompt, dit, device, parkable=True, references=None):
-    """Encode one override prompt mid-run. The text encoder loads beside the training DiT when it fits; otherwise the
+HELPER_PREVIEWS = ".helper_previews.json"   # written by the web UI while a helper renders this run's previews
+HELPER_PREVIEWS_OFF = ".helper_previews_off.json"   # the trainer's: what keeps this run's previews on this GPU
+HELPER_ROUNDS = ".helper_rounds"             # <output_dir>/.helper_rounds/<epoch>/: a round handed to the helper
+
+
+HELPER_SHARE = ".helper_share.json"   # written by the web UI while a helper trains a share of each epoch's images
+SHARE_DIR = ".helper_share"           # <output_dir>/.helper_share/: setup.json, <epoch>/start, job, theirs, lead
+
+
+def _helper_share(output_dir, output_name=""):
+    """The helper that trains a share of each epoch ({name, frac}), while the web UI says it's there for this run
+    (a note left by the run before, in the same folder, names that run)."""
+    try:
+        with open(os.path.join(output_dir, HELPER_SHARE), encoding="utf-8") as f:
+            d = json.load(f)
+        ok = (d.get("on") and time.time() - float(d.get("at", 0)) < 60 and 0 < float(d.get("frac", 0)) < 1
+              and (not output_name or d.get("run") == output_name))
+        return d if ok else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+HELPER_SHARE_WAIT = ".helper_share_wait.json"   # the web UI's: this launch's helper is getting ready
+
+
+def _share_wait_note(output_dir, output_name, launch):
+    """The web UI's hold on this launch's first epoch while its helper gets ready ({name, text}), while it keeps it
+    fresh, else None."""
+    try:
+        with open(os.path.join(output_dir, HELPER_SHARE_WAIT), encoding="utf-8") as f:
+            d = json.load(f)
+        ok = (d.get("run") == output_name and d.get("launch") == launch and time.time() - float(d.get("at", 0)) < 20)
+        return d if ok else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _share_split(seed, epoch, keys, frac):
+    """The helper's images this epoch: ordered by a hash of the seed, the epoch and each file's name (the same on
+    both sides, so nothing is listed or sent), and drawn separately from the face crops (any file with "face" in
+    its name) and the rest - each GPU gets its share of each, and with two or more face crops neither gets them
+    all. Over the run every image trains on both GPUs."""
+    import hashlib
+    name = lambda k: os.path.basename(str(k))
+    out = set()
+    for part in ([k for k in keys if "face" in name(k).lower()], [k for k in keys if "face" not in name(k).lower()]):
+        order = sorted(part, key=lambda k: hashlib.md5(f"{seed}:{epoch}:{name(k)}".encode()).hexdigest())
+        n = round(len(order) * float(frac))
+        if len(order) >= 2:
+            n = min(max(n, 1), len(order) - 1)
+        out.update(order[:n])
+    return out
+
+
+def _write_json(path, data):
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    for n in range(20):          # Windows refuses the replace while the web UI has the file open for a moment
+        try:
+            os.replace(path + ".tmp", path)
+            return
+        except PermissionError:
+            if n == 19:
+                raise
+            time.sleep(0.05)
+
+
+class _Compare(Exception):
+    """The round handed to the helper also renders here (Check picture)."""
+
+
+def _helper_previews(output_dir):
+    """The helper that renders this run's previews ({name, ...}), while the web UI says it's there (its note is
+    refreshed every few seconds; an old one means the helper or the web UI went away and this GPU renders)."""
+    try:
+        with open(os.path.join(output_dir, HELPER_PREVIEWS), encoding="utf-8") as f:
+            d = json.load(f)
+        return d if d.get("on") and time.time() - float(d.get("at", 0)) < 60 else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def preview_due(done, every, until=0, after=0):
+    """Whether epoch `done` previews (or saves): every `every` epochs, or with `until` and `after` both set (How often
+    to preview / save, switched on: "then from epoch `until`"), every `every` before epoch `until`, then from it on
+    whole multiples of `after`."""
+    if until > 0 and after > 0 and done >= until:
+        return done % after == 0
+    return every > 0 and done % every == 0
+
+
+SLIDER_LIVE = ".slider_prompts.json"            # written by the web UI while a prompt slider trains
+SLIDER_LIVE_APPLIED = ".slider_prompts_applied.json"   # what the trainer took, and at which epoch (the UI reads it)
+
+
+def _read_slider_live(output_dir):
+    """A prompt slider's new prompts, set while it trains: {base, pos, neg, guidance, anchors} or None - the form's own
+    three (what the picture is, what each end adds), all needed, as at launch; anchors may be empty."""
+    try:
+        with open(os.path.join(output_dir, SLIDER_LIVE), encoding="utf-8") as f:
+            d = json.load(f)
+        out = {"base": str(d.get("base") or "").strip(), "pos": str(d.get("pos") or "").strip(),
+               "neg": str(d.get("neg") or "").strip(), "guidance": float(d.get("guidance")),
+               "anchors": _anchor_lines(d.get("anchors"))}
+        return out if out["base"] and out["pos"] and out["neg"] and out["guidance"] > 0 else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _anchor_lines(raw):
+    """A prompt slider's anchor prompts from a list or one prompt per line, blanks dropped."""
+    if isinstance(raw, str):
+        raw = raw.splitlines()
+    return [str(x).strip() for x in (raw or []) if str(x).strip()]
+
+
+def _encode_override(driver, te_path, prompts, dit, device, parkable=True, references=None):
+    """Encode the override's prompts mid-run. The text encoder loads beside the training DiT when it fits; otherwise the
     DiT waits on CPU for the encode (a block-swapped DiT is small enough to stay, and the driver picks a smaller
     encoder when VRAM is short)."""
     from fizgig.families import quant
     te_gb = os.path.getsize(te_path) / 1024 ** 3 if te_path and os.path.exists(te_path) else 0.0
-    park = parkable and quant.free_vram_gb() < te_gb + 2.0
+    tok = driver.park_for(dit, device, te_gb + 2.0, "the override prompt's text encoder")
+    park = tok is None and parkable and quant.free_vram_gb() < te_gb + 2.0
     if park:
         quant.move(dit, "cpu")
         torch.cuda.empty_cache()
@@ -213,13 +439,15 @@ def _encode_override(driver, te_path, prompt, dit, device, parkable=True, refere
             te = driver.load_text_encoder(te_path, device)
         try:
             if references:
-                return driver.encode_text_with_references(te, [prompt], [references])
-            return driver.encode_text(te, [prompt])
+                return driver.encode_text_with_references(te, list(prompts), [references] * len(prompts))
+            return driver.encode_text(te, list(prompts))
         finally:
             driver.unload_text_encoder(te)
             del te
             torch.cuda.empty_cache()
     finally:
+        if tok is not None:
+            driver.unpark(dit, device, tok)
         if park:
             quant.move(dit, device)
 
@@ -240,14 +468,26 @@ def _reference_size(w, h, area):
     return max(64, round((area * r) ** 0.5 / 64) * 64), max(64, round((area / r) ** 0.5 / 64) * 64)
 
 
-def _load_references(paths, width, height):
-    """uint8 (H, W, 3) arrays of the preview's reference images at the first one's aspect and the preview's area,
-    and that (width, height)."""
+def _as_trained(im, rgba=False):
+    """A picture as training takes it: RGBA when it has transparency and the family's VAE takes alpha (description
+    rgba), else RGB with a see-through picture laid on white."""
+    from fizgig.utils.image import flatten
+    if rgba and (im.mode in ("RGBA", "LA", "PA") or "transparency" in im.info):
+        return im.convert("RGBA")
+    return flatten(im)
+
+
+def _load_references(paths, width, height, rgba=False):
+    """uint8 (H, W, 3) arrays of the preview's reference images and the preview's (width, height): the first (the
+    photo the edit is made to) sets the preview's shape at its area; extra pictures (a multi-picture edit's photo_1,
+    photo_2 ...) keep their own shape at that area, as they are sized in training."""
     import numpy as np
     from PIL import Image, ImageOps
-    imgs = [Image.open(p).convert("RGB") for p in paths]
+    from fizgig.utils.upright import open_upright
+    imgs = [_as_trained(open_upright(p), rgba) for p in paths]       # as training takes them
     size = _reference_size(*imgs[0].size, width * height)
-    return [np.array(ImageOps.fit(im, size, Image.LANCZOS)) for im in imgs], size
+    return [np.array(ImageOps.fit(im, size if i == 0 else _reference_size(*im.size, width * height), Image.LANCZOS))
+            for i, im in enumerate(imgs)], size
 
 
 class _SliderBank(torch.utils.data.Dataset):
@@ -276,18 +516,23 @@ SLIDER_PREVIEW_MULTIPLIERS = (-1.0, 0.0, 1.0)
 def _slider_strip(frames, multipliers):
     from PIL import Image, ImageDraw, ImageFont
     w, h = frames[0].size
-    gap, band = 8, 30
-    strip = Image.new("RGB", (w * len(frames) + gap * (len(frames) - 1), h + band), (16, 16, 16))
-    draw = ImageDraw.Draw(strip)
+    gap = 8
     try:
         font = ImageFont.load_default(size=max(14, w // 40))
     except Exception:
         font = ImageFont.load_default()
-    for k, (im, m) in enumerate(zip(frames, multipliers)):
+    labels = ["strength 0 (slider off)" if m == 0 else f"strength {m:+g}" for m in multipliers]
+    # the band fits the text (the font grows with the picture): its full height, descenders too, padded evenly
+    probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    top, bottom = min(probe.textbbox((0, 0), t, font=font)[1] for t in labels),         max(probe.textbbox((0, 0), t, font=font)[3] for t in labels)
+    pad = max(6, (bottom - top) // 3)
+    band = (bottom - top) + 2 * pad
+    strip = Image.new("RGB", (w * len(frames) + gap * (len(frames) - 1), h + band), (16, 16, 16))
+    draw = ImageDraw.Draw(strip)
+    for k, (im, label) in enumerate(zip(frames, labels)):
         x = k * (w + gap)
-        strip.paste(im, (x, band))
-        draw.text((x + 8, 7), "strength 0 (slider off)" if m == 0 else f"strength {m:+g}", fill=(236, 236, 236),
-                  font=font)
+        strip.paste(flatten(im), (x, band))
+        draw.text((x + 8, pad - top), label, fill=(236, 236, 236), font=font)
     return strip
 
 
@@ -310,59 +555,253 @@ def _pair_slider_caption(user_config):
     return counts.most_common(1)[0][0] if counts else None
 
 
-def _prompt_slider_step(driver, dit, net, latents, enc, gen, *, guidance, min_t, max_t):
+def _prompt_slider_step(driver, dit, net, latents, enc, gen, *, guidance, min_t, max_t, anchor=None,
+                        anchor_weight=1.0):
     """Concept Sliders, textual form, on flow matching. With the adapter at 0 the frozen model predicts the
     neutral, positive and negative prompts at one noised practice latent; the adapter then trains at +1 toward
     v_neutral + guidance * (v_pos - v_neg) and at -1 toward the mirror. Each pole is backpropagated before the
-    flip (checkpointed blocks recompute at the strength of the moment). Returns the detached mean loss."""
+    flip (checkpointed blocks recompute at the strength of the moment).
+
+    An anchor (#252, a prompt the slider must leave alone, e.g. "a photo of a man" for a hair-length dial meant for
+    women): the frozen model's prediction for it at the same latent is a target at +1 and -1 too, weighted by
+    anchor_weight, so the dial learns its change without carrying it onto the anchor. Returns (the detached mean
+    slider loss, t, the anchor's mean loss or None)."""
     state = driver.noise_latents(latents, gen, min_t=min_t, max_t=max_t)
     n_c, p_c, g_c = enc
+    a_total = None
     try:
         net.set_trainable_multiplier(0.0)
         with torch.no_grad():
             v_n = driver.predict(dit, state, n_c).float()
             delta = float(guidance) * (driver.predict(dit, state, p_c).float() - driver.predict(dit, state, g_c).float())
+            v_a = driver.predict(dit, state, anchor).float() if anchor is not None else None
         total = 0.0
         for m in (1.0, -1.0):
             net.set_trainable_multiplier(m)
             loss = F.mse_loss(driver.predict(dit, state, n_c).float(), v_n + m * delta)
             (0.5 * loss).backward()
             total += 0.5 * loss.item()
+            if v_a is not None:          # its own forward and backward, so the peak is one prediction's, as before
+                a_loss = F.mse_loss(driver.predict(dit, state, anchor).float(), v_a)
+                (0.5 * float(anchor_weight) * a_loss).backward()
+                a_total = (a_total or 0.0) + 0.5 * a_loss.item()
     finally:
         net.set_trainable_multiplier(1.0)
-    return total, state["t"]
+    return total, state["t"], a_total
+
+
+def _apply_auto_batch(desc, driver, user_config, precision, blocks_to_swap, run):
+    """Batch size Auto: on a 40 GB+ card, the family's measured sweet spot for the run's size (batch_auto) when
+    nothing in the run reads one picture a step and the base still plans with no block swap at that batch; else 1.
+    Written into the dataset config before the dataset is built (its buckets batch at that size)."""
+    res = user_config.get("general", {}).get("resolution") or [1024, 1024]
+    mp = (res[0] * res[1] if isinstance(res, (list, tuple)) else res * res) / 1e6
+    n, why = quant.auto_batch(desc, mp), ""
+    blockers = [k for k in ("slider", "finetune", "dop", "share", "stage", "mask_prior", "paired", "accumulation")
+                if run.get(k)] + ([] if run.get("lora") else ["not a standard LoRA"])
+    if not desc.batch_training or n <= 1:
+        n, why = 1, f"{desc.display_name} trains fastest a picture at a time at {mp:.2f} MP"
+    elif quant.card_gb() < quant.NOGC_MIN_CARD_GB:
+        n, why = 1, f"a {quant.card_gb():.0f} GB card (Auto batches on {quant.NOGC_MIN_CARD_GB + 2:.0f} GB+ cards)"
+    elif blockers:
+        n, why = 1, f"this run reads one picture a step ({', '.join(blockers)})"
+    elif not desc.own_plan:
+        p, swap, _w = quant.plan(desc, driver, precision, blocks_to_swap, megapixels=mp, pictures=n,
+                                 dit_path=run.get("dit"))
+        if swap > 0:
+            n, why = 1, f"{n} pictures a step would need block swap on this card"
+    if n > 1:
+        why = f"{n} pictures a step - the fastest per picture measured for {desc.display_name} at {mp:.2f} MP"
+        for d in user_config.get("datasets", []):
+            d["batch_size"] = n
+        user_config.setdefault("general", {})["batch_size"] = n
+    logger.info(f"[batch] Auto: {why}")
+    return n
+
+
+def _dop_pairs(triggers, classes):
+    """--dop_trigger "zwxem, qrtpl" + --dop_class "woman, man" -> [(trigger, class), ...]: one class for every
+    trigger when only one is given, nothing (the trigger dropped) when none."""
+    trig = [t.strip() for t in str(triggers or "").split(",") if t.strip()]
+    cls = [c.strip() for c in str(classes or "").split(",")]
+    if len(cls) == 1:
+        cls = cls * len(trig)
+    if len(cls) != len(trig):
+        raise RuntimeError(f"[dop] {len(trig)} trigger(s) ({', '.join(trig)}) but {len(cls)} replacement(s) - give "
+                           "one replacement for each trigger, in the same order, or one for them all")
+    return list(zip(trig, cls))
+
+
+def _dop_caption(caption, pairs):
+    """DOP's caption (multi_person.dop_caption, which the Subjects card's preview shows)."""
+    from fizgig.families.multi_person import dop_caption
+    return dop_caption(caption, pairs)
+
+
+def _dop_captions(group):
+    """item_key -> (the caption its text cache was written from - every family's text cache keeps it as caption1 -,
+    that cache file's path)."""
+    from safetensors import safe_open
+    out = {}
+    for ds in group.datasets:
+        bm = getattr(ds, "batch_manager", None)
+        for bucket in (bm.buckets.values() if bm is not None else ()):
+            for it in bucket:
+                path = getattr(it, "text_encoder_output_cache_path", None)
+                k = str(path or "")            # an item's own (two folders' same-named files share an item_key)
+                if k in out or not path:
+                    continue
+                try:
+                    with safe_open(path, framework="pt") as f:
+                        out[k] = ((f.metadata() or {}).get("caption1"), path)
+                except Exception:
+                    out[k] = (None, path)
+    return out
+
+
+def _dop_path(te_path):
+    """Where an item's trigger-free text encoding is kept: beside its own text cache."""
+    root, ext = os.path.splitext(te_path)
+    return root + "_dop" + (ext or ".safetensors")
+
+
+def _load_dop_cond(path):
+    """A DOP text encoding from its file, batched as the loader batches the cache."""
+    from safetensors.torch import load_file
+    return {k[len("cond__"):]: v[None] for k, v in load_file(path).items() if k.startswith("cond__")}
+
+
+def _dop_step(driver, dit, net, latents, cond, gen, *, weight, min_t, max_t, accum, swapped=False):
+    """Differential Output Preservation (AI-Toolkit's DOP, by Ostris): the same picture, freshly noised, with the
+    trigger swapped for the class word. The target is the model's own prediction there with the adapter at 0, so
+    without the trigger the LoRA learns to change nothing. Backpropagated here; returns the detached loss."""
+    state = driver.noise_latents(latents, gen, min_t=min_t, max_t=max_t)
+    try:
+        net.set_trainable_multiplier(0.0)
+        if swapped:     # a forward with no backward: block swap must stream it as inference, as previews do, or a
+            driver.block_swap_mode(dit, inference=True)     # block is left on the CPU for the next pass
+        with torch.no_grad():
+            target = driver.predict(dit, state, cond).float()
+    finally:
+        net.set_trainable_multiplier(1.0)
+        if swapped:
+            driver.block_swap_mode(dit, inference=False)
+    loss = F.mse_loss(driver.predict(dit, state, cond).float(), target)
+    (loss * weight / accum).backward()
+    return loss.item()
+
+
+class _MaskPrior:
+    """Masked prior preservation (OneTrainer's masked_prior_preservation_weight, AI-Toolkit's inverted_mask_prior):
+    outside a picture's mask the target is the model's own prediction with the LoRA at 0, so the LoRA learns to
+    leave the rest of the picture as the base model draws it instead of only learning it less. The driver calls
+    base() with its forward at the step's noised input, before the training forward (families/driver.py
+    prior_base / with_prior)."""
+
+    def __init__(self, driver, dit, net, weight, swapped):
+        self.driver, self.dit, self.net, self.weight, self.swapped = driver, dit, net, float(weight), bool(swapped)
+
+    def base(self, forward):
+        try:
+            self.net.set_trainable_multiplier(0.0)
+            if self.swapped:     # a forward with no backward: streamed as inference, as DOP's is
+                self.driver.block_swap_mode(self.dit, inference=True)
+            with torch.no_grad():
+                return forward().detach().float()
+        finally:
+            self.net.set_trainable_multiplier(1.0)
+            if self.swapped:
+                self.driver.block_swap_mode(self.dit, inference=False)
+
+
+def _dop_ft_targets(driver, dit, loader, dop_cond, cond_for, device, *, samples, seed, min_t, max_t):
+    """A fine-tune's DOP targets, made before its first step while the model is still the original: for each image,
+    `samples` noised inputs (the family's own timestep rule) and the original model's prediction there for the
+    trigger-free caption. A fine-tune has no adapter to switch off, so these stand in for the base model. Kept on
+    the CPU in bf16: item key -> [(state, prediction), ...]."""
+    gen = torch.Generator().manual_seed(int(seed) + 7919)
+    out = {}
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="[dop] the original model's predictions"):
+            keys = [str(k) for k in batch.get("item_te_paths") or []]
+            dc = cond_for(batch, driver.batch_cond(batch, device))
+            if dc is None or keys[0] in out:
+                continue
+            latents = batch["latents"].to(device)
+            rows = []
+            for _ in range(int(samples)):
+                state = driver.noise_latents(latents, gen, min_t=min_t, max_t=max_t)
+                pred = driver.predict(dit, state, dc)
+                rows.append(({k: (v.detach().cpu() if torch.is_tensor(v) else v) for k, v in state.items()},
+                             pred.detach().to("cpu", torch.bfloat16)))
+            out[keys[0]] = rows
+    return out
+
+
+def _dop_ft_loss(driver, dit, rows, cond, device):
+    """One saved input of this image: the model's prediction now against the original's there."""
+    state, target = rows[random.randrange(len(rows))]
+    state = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in state.items()}
+    return F.mse_loss(driver.predict(dit, state, cond).float(), target.to(device).float())
 
 
 def _render_previews(driver, dit, net, vae, encoded, out_dir, epoch, *, output_name, steps, cfg, neg, width,
-                     height, seed, ema=None, speed=None, lowmem=False, swapped=False, refs=None, slider=False):
+                     height, seed, ema=None, speed=None, lowmem=False, swapped=False, refs=None, slider=False,
+                     strengths=(), look=False):
     """Previews on the RESIDENT training model: training adapter OFF (the deployment setup), the family's speed
     LoRA ON if one is loaded (it lives on CPU between previews). On small cards the DiT parks on CPU for the
     decode. File names match the other trainers so the GUI gallery reads them:
     <name>_e<epoch>_<idx>_<timestamp>_<seed>.png. `speed` is the speed LoRA's SamplingSettings or None; `refs` the edit previews' reference latents; `slider`
-    renders each prompt at -1 / 0 / +1 on one seed and saves them as one strip."""
+    renders each prompt at -1 / 0 / +1 on one seed and saves them as one strip. `strengths`: each prompt again at
+    these LoRA strengths, same seed, saved beside it as <...>_s<strength x100>.png (_s050 = 0.5)."""
     os.makedirs(out_dir, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
     device = next(iter(dit.parameters())).device
+    if torch.cuda.is_available():
+        # the step's activations are freed but still cached (a batch with checkpointing off leaves ~18 GB reserved on
+        # SDXL x 8): handed back first, the preview peaks at the larger of training and itself, not their sum
+        torch.cuda.empty_cache()
     _preview_vram("preview start", reset_peak=True)
-    net.set_enabled(ADAPTER, False)
-    if speed is not None:
-        net.move_adapter(SPEED, device)
-        net.set_enabled(SPEED, True)
-    if ema is not None:
-        ema.swap_in()
-    was_training = dit.training
-    dit.eval()
-    if swapped:
-        driver.block_swap_mode(dit, inference=True)
     paths = []
-    ref_kw = {"refs": [r.to(device) for r in refs]} if refs else {}
+    was_training = dit.training
+    done = set()           # what this preview has changed, so the finally undoes exactly that, wherever it failed
     try:
+        net.set_enabled(ADAPTER, False)
+        done.add("adapter")
+        if speed is not None:
+            done.add("speed")              # before the move: a move that runs out of memory still gets put back
+            net.move_adapter(SPEED, device)
+            net.set_enabled(SPEED, True)
+        if look:
+            done.add("look")
+            net.move_adapter(LOOK, device)
+            net.set_enabled(LOOK, True)
+        if ema is not None:
+            ema.swap_in()
+            done.add("ema")
+        dit.eval()
+        if swapped:
+            done.add("swap")
+            driver.block_swap_mode(dit, inference=True)
+        ref_kw = {"refs": [r.to(device) for r in refs]} if refs else {}
         lats = []
-        mults = SLIDER_PREVIEW_MULTIPLIERS if slider else (None,)
+        extra = () if slider else tuple(strengths or ())
+        mults = SLIDER_PREVIEW_MULTIPLIERS if slider else (None,) + extra
+        # previews run the blocks uncompiled (Compile Blocks): eval mode, the preview size and the speed LoRA are each a
+        # new graph, and building them took ~5 minutes of Triton/MSVC work on the first preview after every start or
+        # resume - a handful of eager steps costs seconds. Training keeps its compiled graphs
+        _eager = torch.compiler.set_stance("force_eager")
+        _eager.__enter__()
+        done.add("eager")
+        if getattr(driver, "preview_int8_attention", False):   # the checkpoint asks for INT8 attention, so the
+            from fizgig.modules import int8_attention as _i8a   # previews match ComfyUI's render (MiniMax H3 Image)
+            _i8 = _i8a.renders(True)
+            _i8.__enter__()
+            done.add("i8a")
         for i, cond in enumerate(encoded):
             for m in mults:
-                if m is not None:
-                    net.set_trainable_multiplier(m)
+                if m is not None or extra:
+                    net.set_trainable_multiplier(1.0 if m is None else m)
                 if speed is not None:
                     # the speed LoRA's own CFG, unless the Samples tab asks for more (then the negative applies too)
                     _cfg = cfg if cfg and cfg > 1.0 else speed.cfg
@@ -372,32 +811,52 @@ def _render_previews(driver, dit, net, vae, encoded, out_dir, epoch, *, output_n
                 else:
                     lats.append(driver.generate(dit, cond, width, height, steps=steps, seed=seed + i, cfg=cfg,
                                                 neg_cond=neg, **ref_kw))
-        if slider:
-            net.set_trainable_multiplier(1.0)
-        park = lowmem and not swapped      # a swapped DiT is already mostly on CPU; moving it would undo the layout
+        tok = driver.park_for(dit, device, None, "decode")   # None = the shared rule below
+        if tok is not None:
+            done.add("decode_park")
+        park = lowmem and not swapped and tok is None   # a swapped DiT is already mostly on CPU
         if park:                            # #123: never hold the training DiT and the VAE decode together
+            done.add("lowmem_park")
             _preview_vram("before decode")
             quant.move(dit, "cpu")
             torch.cuda.empty_cache()
             _preview_vram("DiT parked for the decode")
-        per = len(SLIDER_PREVIEW_MULTIPLIERS) if slider else 1
+        per = len(mults)
         for i in range(len(lats) // per):
             p = os.path.join(out_dir, f"{output_name}_e{epoch:06d}_{i:02d}_{ts}_{seed + i}.png")
-            frames = [driver.decode(vae, lat, width, height) for lat in lats[i * per:(i + 1) * per]]
-            (_slider_strip(frames, SLIDER_PREVIEW_MULTIPLIERS) if slider else frames[0]).save(p)
-            paths.append(p)
+            if slider:
+                frames = [driver.decode(vae, lat, width, height) for lat in lats[i * per:(i + 1) * per]]
+                strip = driver.slider_preview(frames, SLIDER_PREVIEW_MULTIPLIERS)
+                paths += driver.save_preview(_slider_strip(frames, SLIDER_PREVIEW_MULTIPLIERS) if strip is None
+                                             else strip, p)
+                continue
+            for m, lat in zip(mults, lats[i * per:(i + 1) * per]):      # decoded one at a time: a song is big
+                q = p if m is None else f"{p[:-4]}_s{int(round(m * 100)):03d}.png"
+                paths += driver.save_preview(driver.decode(vae, lat, width, height), q)
     finally:
-        if lowmem and not swapped:
+        if "eager" in done:
+            _eager.__exit__(None, None, None)
+        if "i8a" in done:
+            _i8.__exit__(None, None, None)
+        if slider or strengths:
+            net.set_trainable_multiplier(1.0)  # a preview that failed mid-dial must not leave the LoRA scaled
+        if "decode_park" in done:
+            driver.unpark(dit, device, tok)
+        if "lowmem_park" in done:
             quant.move(dit, device)
             _preview_vram("after decode, DiT restored")
-        if swapped:
+        if "swap" in done:
             driver.block_swap_mode(dit, inference=False)
-        if ema is not None:
+        if "ema" in done:
             ema.swap_out()
-        if speed is not None:
+        if "speed" in done:
             net.set_enabled(SPEED, False)
             net.move_adapter(SPEED, "cpu")
-        net.set_enabled(ADAPTER, True)
+        if "look" in done:
+            net.set_enabled(LOOK, False)
+            net.move_adapter(LOOK, "cpu")
+        if "adapter" in done:
+            net.set_enabled(ADAPTER, True)
         dit.train(was_training)
         torch.cuda.empty_cache()
         _preview_vram("after preview cleanup")
@@ -405,10 +864,99 @@ def _render_previews(driver, dit, net, vae, encoded, out_dir, epoch, *, output_n
     return paths
 
 
+class _CheckpointPreviews:
+    """Training previews on the family's preview checkpoint (train_preview_checkpoint: Klein's Distilled), with the
+    old Klein trainer's memory handoff: the driver parks the training model, loads the checkpoint (its own swap by
+    card, optionally INT8), the epoch's LoRA - the live adapter, EMA weights if EMA is on - and the context LoRA ride
+    on it as frozen adapters, and the training model is put back exactly. Between epochs the checkpoint stays in
+    system RAM when it isn't block-swapped and the cache mode allows (auto: decided once per run, free RAM >= 18 GB,
+    so caching never flip-flops); any failure to reuse it falls back to a fresh load."""
+
+    def __init__(self, driver, path, device, cache_mode="auto", int8=False, context=None, speed=None):
+        self.driver, self.path, self.device = driver, path, torch.device(device)
+        self.cache_mode, self.int8, self.context = str(cache_mode or "auto").lower(), bool(int8), context
+        self.speed = speed                 # (path, strength): the speed LoRA, on a checkpoint that takes it (Kromoss)
+        self.cached = None                 # (model, FamilyLoRA, swapped) on the CPU between epochs
+        self._auto = None
+        self._lora_file = os.path.join(os.environ.get("TEMP") or os.environ.get("TMPDIR") or "/tmp",
+                                       f"fizgig_preview_lora_{os.getpid()}.safetensors")
+
+    def _cache_on(self, swapped):
+        if self.cache_mode == "off" or swapped:
+            return False
+        if self.cache_mode == "on":
+            return True
+        if self._auto is None:
+            try:
+                import psutil
+                self._auto = psutil.virtual_memory().available / 1e9 >= 18.0
+            except Exception:
+                self._auto = False
+        return self._auto
+
+    def render(self, dit, net, ema, render):
+        """Park, put the checkpoint up with this epoch's LoRA, call render(model, adapters), restore."""
+        if ema is not None:
+            ema.swap_in()
+        try:
+            net.save(self._lora_file, dtype=torch.bfloat16)
+        finally:
+            if ema is not None:
+                ema.swap_out()
+        rng = torch.get_rng_state()
+        cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        token = self.driver.park_for_preview(dit, self.device)
+        m = fl = None
+        swapped = 0
+        try:
+            gc.collect()
+            torch.cuda.empty_cache()
+            if self.cached is not None:
+                try:
+                    m, fl, swapped = self.cached
+                    self.cached = None
+                    quant.move(m, self.device)
+                    fl.swap_file(TRAINABLE_PREVIEW, self._lora_file)
+                    logger.info("[sample] preview checkpoint reused from RAM (no disk reload)")
+                except Exception:
+                    logger.warning("[sample] preview checkpoint reuse failed - reloading from disk", exc_info=True)
+                    m = fl = None
+            if m is None:
+                m, swapped = self.driver.load_preview_checkpoint(self.path, self.device, int8=self.int8)
+                fl = FamilyLoRA(m, self.driver, device=self.device)
+                fl.add_file(self._lora_file, TRAINABLE_PREVIEW)
+                if self.context:
+                    fl.add_file(self.context[0], CONTEXT, self.context[1])
+                logger.info(f"[sample] previews on {os.path.basename(self.path)}"
+                            + (f" ({swapped} blocks streamed)" if swapped else ""))
+            return render(m, fl, swapped)
+        finally:
+            keep = m is not None and self._cache_on(swapped)
+            if keep:
+                try:
+                    quant.move(m, "cpu")
+                    self.cached = (m, fl, swapped)
+                except Exception:
+                    logger.warning("[sample] could not keep the preview checkpoint in RAM", exc_info=True)
+                    self.cached = None
+            del m, fl
+            gc.collect()
+            gc.collect()
+            torch.cuda.empty_cache()
+            self.driver.unpark_after_preview(dit, self.device, token)
+            torch.set_rng_state(rng)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state_all(cuda_rng)
+            try:
+                os.remove(self._lora_file)
+            except OSError:
+                pass
+
+
 def _largest_bucket_mp(group):
     """Megapixels of the run's largest actual bucket (what sets activation memory), or None."""
     try:
-        return max(w * h / 1e6 for ds in group.datasets for (w, h) in ds.batch_manager.bucket_resos)
+        return max(k[-2] * k[-1] / 1e6 for ds in group.datasets for k in ds.batch_manager.bucket_resos)
     except Exception:
         return None
 
@@ -418,23 +966,22 @@ class _FineTune:
     whole-rotation length and cadence, a fresh optimizer per window, and the full-checkpoint save."""
 
     def __init__(self, driver, desc, dit, net, dit_path, device, *, max_train_epochs, rotations, save_every_rotations,
-                 rotate_every, start_window, epochs_done, fused, lr, master_dir, mp=None):
+                 rotate_every, start_window, epochs_done, fused, lr, master_dir, mp=None, group=None, max_parts=0,
+                 held_grads=False, batch_gb=0.0, optimizer_type="adafactor"):
         from fizgig.families import ft
+        from fizgig.training.optimizers import FT_OPTIMIZERS, ft_optimizer
         from fizgig.utils.device import plannable_free_vram
         self.ft, self.driver, self.desc, self.dit, self.src, self.lr = ft, driver, desc, dit, dit_path, lr
-        spec = driver.ft_spec(dit)
-        if spec is None:
-            raise RuntimeError(f"{desc.display_name}'s driver declares no fine-tune (ft_spec)")
-        self.rot = ft.Rotator(dit, spec, device)
+        self.be = driver.ft_backend(dit, device, dit_path, group) or ft.SharedBackend(driver, dit, device, dit_path,
+                                                                                         group)
         where = os.environ.get("FIZGIG_FT_MASTER", "auto")
         self.scratch = os.path.join(master_dir, ".fizgig_ft_master")
-        gb, where = self.rot.build_master(dit_path, where, self.scratch)
-        n_always = self.rot.start_always()
-        logger.info(f"[finetune] bf16 master: {len(self.rot.master)} weights, {gb:.1f} GB "
-                    + ("in system RAM" if where == "ram" else f"ON DISK at {self.scratch} (system memory can't "
-                       f"comfortably hold it; untouched weights read from the model file, trained ones spill there)")
-                    + f"; {n_always} always-on Linears ({', '.join(spec.always_on) or 'none'}) train all run; "
-                      f"biases frozen")
+        gb, where = self.be.build_master(where, self.scratch)
+        n_always = self.be.start_always()
+        logger.info(f"[finetune] bf16 master: {len(list(self.be.master.keys()))} weights, {gb:.1f} GB "
+                    + ("in system RAM" if where == "ram" else f"ON DISK (system memory can't comfortably hold it; "
+                       f"untouched weights read from the model file, trained ones spill there)")
+                    + f"; {n_always} always-on Linears ({self.be.always_label}) train all run")
         if where == "ram":
             try:
                 import psutil
@@ -444,12 +991,35 @@ class _FineTune:
                                    f"FIZGIG_FT_MASTER=disk keeps the master on disk instead")
             except Exception:
                 pass
-        n_blocks = len(self.rot.blocks)
+        n_blocks = self.be.cycle_len()
         logger.info(f"[finetune] planning with {torch.cuda.memory_allocated() / 1e9:.2f} GB allocated, "
                     f"{plannable_free_vram():.2f} GB free")
-        windows, stream, why, usable = ft.plan_windows(
-            dit, spec, self.rot, plannable_free_vram(), allow_stream=os.environ.get("FIZGIG_NO_FT_STREAM") != "1",
-            mp=mp)
+        if batch_gb:                   # Batch size: the pictures past the first, planned off the free memory
+            logger.info(f"[finetune] {batch_gb:.1f} GB kept for the batch's pictures past the first")
+        # the optimizer (#312): one a fine-tune can use, else Adafactor; a backend that plans its own windows
+        # (MiniMax H3's calibration) keeps Adafactor, the state its plan is measured with
+        opt = ft_optimizer(optimizer_type)
+        if opt != str(optimizer_type or "").strip().lower():
+            logger.warning(f"[finetune] {optimizer_type} is a LoRA optimizer - a fine-tune can't use it, so this one "
+                           f"trains with Adafactor")
+        if opt != "adafactor" and not getattr(self.be, "plans_optimizer_state", False):
+            logger.warning(f"[finetune] {desc.display_name}'s fine-tune plans its memory for Adafactor - training "
+                           f"with Adafactor, not {opt}")
+            opt = "adafactor"
+        if opt != "adafactor":
+            try:                               # built once here, so a missing package says so before the first step
+                ft.make_optimizer([torch.zeros(8, device=device, requires_grad=True)], lr, opt)
+            except Exception as e:
+                logger.warning(f"[finetune] {opt} could not be built ({type(e).__name__}: {e}) - training with "
+                               f"Adafactor")
+                opt = "adafactor"
+        self.opt = opt
+        if FT_OPTIMIZERS[opt]:
+            logger.info(f"[finetune] {opt}: windows planned with its optimizer state (+{FT_OPTIMIZERS[opt]:g} GB per "
+                        f"GB of trained weights)")
+        windows, stream, why, usable = self.be.plan(
+            plannable_free_vram() - batch_gb, allow_stream=os.environ.get("FIZGIG_NO_FT_STREAM") != "1", mp=mp,
+            max_parts=max_parts, held_grads=held_grads, state_factor=FT_OPTIMIZERS[opt])
         for line in why:
             logger.info(f"[finetune] {line}")
         if windows is None:
@@ -461,15 +1031,11 @@ class _FineTune:
         self.epochs = max(1, int(rotations)) * self.cycle
         self.save_every = max(1, int(save_every_rotations)) * self.cycle
         self.epochs_done = int(epochs_done)
-        self.streamer = None
-        if stream and any(isinstance(w, tuple) for w in windows):
-            from fizgig.krea2.rotation import RotationOffloader
-            self.streamer = RotationOffloader(self.rot.blocks, torch.device(device), range(n_blocks))
-            driver.install_ft_streamer(dit, self.streamer)
-            self.streamer.set_resident(self.rot.resident_blocks(self.sched.active_at(0)))
-            logger.info("[finetune] frozen blocks outside the window stream from CPU")
-        self.fused = ft.FusedSteps(lr) if fused else None
-        self.opt_label = ("per-parameter " if fused else "") + ft.make_optimizer([torch.zeros(1)], lr)[1] + " (fine-tune)"
+        self.streamer = getattr(self.be, "streamer", None) or (True if stream else None)
+        driver.ft_cycle(self.cycle, self.epochs_done, self.epochs)
+        self.fused = ft.FusedSteps(lr, opt) if fused else None
+        self.opt_label = ("per-parameter " if fused else "") + (
+            opt if opt != "adafactor" else ft.make_optimizer([torch.zeros(1)], lr)[1]) + " (fine-tune)"
         logger.info(f"[finetune] FULL FINE-TUNE - {self.sched.describe()}")
         logger.info(f"[finetune] {rotations} rotation(s) of {self.cycle} epoch(s) = {self.epochs} epochs; checkpoint"
                     f" + preview every {save_every_rotations} rotation(s) = every {self.save_every} epochs "
@@ -489,7 +1055,7 @@ class _FineTune:
 
     def needs_window(self, epoch):
         """A new window this epoch - or the same one after a save parked it."""
-        return self.sched.active_at(epoch) != self.rot.active
+        return list(self.sched.active_at(epoch)) != list(self.be.active)
 
     def enter(self, epoch):
         """The epoch's window trainable, with a fresh optimizer (the old one's state belonged to the outgoing
@@ -500,25 +1066,24 @@ class _FineTune:
             self.fused.detach()
         gc.collect()
         torch.cuda.empty_cache()
-        if self.streamer is not None:
-            self.streamer.set_resident(self.rot.resident_blocks(want))
-        n = self.rot.rotate_to(want)
+        n = self.be.rotate(want)
         torch.cuda.reset_peak_memory_stats()
-        params = self.rot.trainable_params()
+        params = self.be.trainable_params()
         logger.info(f"[finetune] epoch {epoch + 1 + self.epochs_done}: window {self.sched.window_at(epoch) + 1}/"
-                    f"{self.sched.n_windows} {want} - {n} Linears trainable, "
+                    f"{self.sched.n_windows} {want} - "
+                    f"{n} Linears trainable, "
                     f"{sum(p.numel() for p in params) / 1e9:.2f}B parameters")
         if self.fused is not None:
             self.fused.attach(params)
             return params, None
-        return params, self.ft.make_optimizer(params, self.lr)[0]
+        return params, self.ft.make_optimizer(params, self.lr, self.opt)[0]
 
     def park(self):
         """Everything back to NF4 with the master complete - before a save, a preview, or the end."""
         if self.fused is not None:
             self.fused.detach()
         gc.collect()
-        self.rot.rotate_to([])
+        self.be.park()
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -530,59 +1095,129 @@ class _FineTune:
                 self.desc.modelspec_arch if hasattr(self.desc, "modelspec_arch") else self.desc.key}
         logger.info(f"[finetune] saving the full checkpoint at epoch {n_ep} -> {os.path.basename(path)} "
                     f"(~{os.path.getsize(self.src) / 1e9:.0f} GB; training waits for it)")
-        replaced, total = self.ft.save_checkpoint(self.rot.state_dict(), self.src, path, meta)
-        logger.info(f"[save] {path} ({replaced}/{total} tensors trained)")
+        replaced, total = self.be.save(path, meta)
+        logger.info(f"[save] {path} ({replaced}{'/' + str(total) if total else ''} tensors trained)")
+
+
+def _test_vram_cap(device):
+    """(GB, from step) for FIZGIG_TEST_VRAM_CAP_GB / FIZGIG_TEST_VRAM_CAP_AT_STEP (the out-of-memory recovery's
+    tests), else None. A cap from step 0 applies at once."""
+    raw = os.environ.get("FIZGIG_TEST_VRAM_CAP_GB", "").strip()
+    if not raw or torch.device(device).type != "cuda" or not torch.cuda.is_available():
+        return None
+    try:
+        gb, at = float(raw), int(os.environ.get("FIZGIG_TEST_VRAM_CAP_AT_STEP", "0") or 0)
+    except ValueError:
+        return None
+    if at <= 0:
+        _apply_test_vram_cap(gb, 0)
+        return None
+    return gb, at
+
+
+def _apply_test_vram_cap(gb, at):
+    total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+    torch.cuda.empty_cache()                 # the cached blocks go, so the cap bites on the next allocations
+    torch.cuda.set_per_process_memory_fraction(max(0.01, min(1.0, gb * 1024 ** 3 / total)))
+    logger.warning(f"[test] VRAM capped at {gb:g} GB from step {at} (FIZGIG_TEST_VRAM_CAP_GB) - a test setting")
+
+
+def _reg_limit(group, per_epoch, say=False):
+    """A LoRA's regularisation set (dataset blocks marked is_reg): at most per_epoch of its pictures an epoch, a
+    different handful each epoch (BucketBatchManager.limit). 0 = every one, as a fine-tune's set trains. The group's
+    length follows, so the steps an epoch (and the run card's totals) count only what trains."""
+    if not per_epoch:
+        return
+    for ds in getattr(group, "datasets", None) or []:
+        if getattr(ds, "is_reg", False) and getattr(ds, "batch_manager", None) is not None:
+            have = ds.batch_manager.limit(int(per_epoch))
+            if say:
+                logger.info(f"[reg] {have} regularisation picture(s); each epoch uses "
+                            f"{min(int(per_epoch), have)} of them, a different handful each epoch")
+    group.cumulative_sizes = group.cumsum(group.datasets)
 
 
 def train_family(family, dit_path, dataset_config, output_dir, output_name, *, network_dim=32, network_alpha=32,
-                 learning_rate=1e-4, max_train_epochs=16, save_every_n_epochs=1, save_state=False,
+                 preview_small_card_cap=0,
+                 learning_rate=1e-4, max_train_epochs=16, save_every_n_epochs=1, save_until_epoch=0,
+                 save_every_n_epochs_after=0, save_state=False,
                  save_state_on_train_end=False, keep_last_n_states=2, seed=42, precision="bf16",
                  training_adapter=None, training_adapter_strength=1.0,
                  context_lora_path=None, context_lora_strength=1.0, min_timestep=0.0, max_timestep=1.0,
-                 speed_lora=None, speed_lora_strength=None,
-                 vae_path=None, te_path=None, sample_prompts=None, sample_every_n_epochs=0, sample_width=None,
+                 speed_lora=None, speed_lora_strength=None, preview_lora=None, preview_lora_strength=1.0,
+                 vae_path=None, te_path=None, sample_prompts=None, sample_every_n_epochs=0, sample_until_epoch=0,
+                 sample_every_n_epochs_after=0, sample_width=None,
                  sample_height=None, sample_steps=None, sample_cfg_scale=None, sample_negative=None,
                  sample_at_first=False, sample_seed=42, sample_reference=None, sample_image=None,
-                 slider_pairs=False, slider_diff_weight=1.0, slider_prompts=None, slider_guidance=3.0,
+                 sample_strengths=(), slider_pairs=False, slider_diff_weight=1.0, slider_prompts=None, slider_guidance=3.0,
+                 slider_anchors=(), slider_anchor_weight=1.0,
                  train_blocks=None,
                  slider_bank=16, slider_bank_res=768,
                  metadata_title=None, metadata_author=None, metadata_description=None, metadata_license=None,
                  metadata_tags=None, metadata_trigger_phrase=None, metadata_thumbnail=None,
                  resume_state_dir=None, adaptive_lr=False, adaptive_lr_min=1e-4, adaptive_lr_max=2e-4,
-                 max_grad_norm=1.0, ema_decay=0.0, optimizer_type="adamw", optimizer_args="",
+                 max_grad_norm=1.0, ema_decay=0.0, optimizer_type=None, optimizer_args="",
                  lr_scheduler="constant", lr_warmup_steps=0, lr_scheduler_num_cycles=1, lr_scheduler_power=1.0,
-                 gradient_accumulation_steps=1, compile_blocks="auto", gradient_checkpointing=True, blocks_to_swap=0, network_type="lora", lokr_factor=8,
+                 gradient_accumulation_steps=1, compile_blocks="auto", gradient_checkpointing="auto", blocks_to_swap=0, network_type="lora", lokr_factor=8,
                  log_per_image_loss=False, per_image_lr=False, auto_recaption=False, warmup_look_outliers=False,
-                 trigger_word=None, trigger_position="start", recaption_instruction=None,
-                 recaption_instruction_detailed=None, captioner=None,
-                 finetune=False, ft_rotations=10, ft_save_every_rotations=1, ft_rotate_every=1, ft_start_window=0,
-                 ft_epochs_done=0, ft_fused_backward=False, reg_lr_multiplier=0.2):
+                 training_maps=False, training_maps_images=3,
+                 trigger_word=None, trigger_position="start", recaption_triggers=None, recaption_instruction=None,
+                 recaption_instruction_detailed=None, recaption_task=None, recaption_task_detailed=None,
+                 captioner=None, finetune=False, ft_rotations=10, ft_save_every_rotations=1, ft_rotate_every=1, ft_max_parts=0,
+                 ft_start_window=0,
+                 ft_epochs_done=0, ft_fused_backward=False, reg_lr_multiplier=0.2, reg_per_epoch=0,
+                 preview_checkpoint=None,
+                 preview_checkpoint_cache="auto", preview_int8=False, family_options=None,
+                 dop=False, dop_trigger=None, dop_class="", dop_weight=1.0, dop_every=1, dop_ft_samples=8,
+                 lr_boost=None, share_worker=None, masked_training=False, mask_floor=0.1, mask_prior=0.0, face_weight=1.0, face_area="face", face_cycle="1:0", face_until="0:0",
+                 caption_dropout=0.0, stage_dataset_config=None, stage_until=0.3, stage_blend=0.1,
+                 batch_size_auto=False):
     desc = get_family(family)
     if desc is None or not desc.training_ready:
         raise RuntimeError(f"unknown or untrainable family {family!r}")
     validate_output_name(output_name)          # before any model loads, not at the first save an epoch in (#70)
+    # none given: a LoRA trains with AdamW, a fine-tune with Adafactor (#312)
+    ft_optimizer_type, optimizer_type = optimizer_type or "adafactor", optimizer_type or "adamw"
     if context_lora_path and finetune:
         raise RuntimeError("A Context LoRA trains a LoRA on top of another one; a fine-tune trains the base model "
                            "itself, so the two don't combine. Drop --context_lora_path.")
     driver = desc.load_driver()
+    driver.set_options(dict(family_options or {}))      # before the data: an option may shape the dataset
+    if train_blocks:
+        train_blocks = driver.expand_train_blocks(train_blocks)
     arch = desc.arch_id
     speed_desc = desc.preview_speed() if speed_lora else None
     if speed_lora and speed_desc is None:
         logger.warning(f"[sample] {desc.display_name} declares no preview speed LoRA - ignoring --speed_lora")
         speed_lora = None
-    if speed_desc is not None and speed_lora_strength is not None and speed_lora_strength <= 0:
-        logger.info(f"[sample] {speed_desc.name} at strength 0 - previews render without it")
-        speed_lora = speed_desc = None
+    # no strength given = the family's preview strength (launch.py leaves the flag out at that default: MOSS-Image 0.6,
+    # Krea 2 0.7), not the speed LoRA's own (1.0) - which previews used to get
+    if speed_desc is not None and speed_lora_strength is None:
+        speed_lora_strength = (desc.preview_speed_defaults() or (0, 0))[1] or speed_desc.strength
+    # strength 0: previews render without it, and it loads at the first preview a live change asks it for
+    speed_idle = speed_desc is not None and speed_lora_strength is not None and speed_lora_strength <= 0
+    if speed_idle:
+        logger.info(f"[sample] {speed_desc.name} at strength 0 - previews render without it until a strength is "
+                    "asked for")
     # --speed_lora on its own means the turbo's own recipe (strength, steps); the GUI passes its Samples-tab values
-    sample_steps = sample_steps or (speed_desc.settings.steps if speed_desc else desc.preview_steps)
+    asked_steps, asked_cfg = sample_steps, sample_cfg_scale   # a preview checkpoint takes these when given
+    sample_steps = sample_steps or (speed_desc.settings.steps if speed_desc and not speed_idle else desc.preview_steps)
     sample_cfg_scale = desc.preview_cfg if sample_cfg_scale is None else sample_cfg_scale
     sample_width = sample_width or desc.preview_width
     sample_height = sample_height or desc.preview_height
     lowmem = _small_card_previews()
-    if lowmem and max(sample_width, sample_height) > 768:
-        sample_width, sample_height = _cap_canvas(sample_width, sample_height)
+    # Krea 2 always (#123); another model only when its Faster, smaller previews tick asks (#309)
+    canvas_cap = int(getattr(desc, "preview_small_card_cap", 0) or preview_small_card_cap or 0) if lowmem else 0
+    small_from = None                 # the size asked for when the previews render smaller (the gallery says so)
+    if canvas_cap and max(sample_width, sample_height) > canvas_cap:
+        if not getattr(desc, "preview_small_card_cap", 0):    # the tick's choice (MOSS-Image), not Krea 2's own cap
+            small_from = (sample_width, sample_height)
+        sample_width, sample_height = _cap_canvas(sample_width, sample_height, canvas_cap)
         logger.info(f"[preview] card under 20 GB: preview canvas capped to {sample_width}x{sample_height} and the "
                     f"DiT parks on CPU for the decode (#123). FIZGIG_PREVIEW_LOWMEM=0 turns this off.")
+    elif lowmem:
+        logger.info("[preview] card under 20 GB: the DiT parks on CPU for the decode. FIZGIG_PREVIEW_LOWMEM=0 turns "
+                    "this off.")
     device = torch.device("cuda")
     quant.apply_vram_cap()          # FIZGIG_SIM_VRAM_GB: behave like a smaller card
     torch.manual_seed(seed)
@@ -601,10 +1236,6 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             logger.info("[slider] network type %s -> LoRA: a slider is a plain LoRA whose strength is the dial",
                         network_type)
             network_type = "lora"
-        if str(optimizer_type).lower().startswith("automagic"):
-            logger.info("[slider] optimizer %s -> adamw8bit: the +1/-1 flip every step reads as noise to an "
-                        "optimizer that sets its own rate", optimizer_type)
-            optimizer_type = "adamw8bit"
         if adaptive_lr or ema_decay or log_per_image_loss or per_image_lr or auto_recaption or warmup_look_outliers:
             logger.info("[slider] adaptive LR, weight averaging and the per-image loss watch are off: they assume "
                         "one target per image, and a slider step has two")
@@ -616,10 +1247,18 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
         else:
             logger.info("[slider] PROMPT-PAIR SLIDER: base '%s' | +1 -> '%s' | -1 -> '%s' (guidance %g)",
                         *slider_prompts, float(slider_guidance))
+            slider_anchors = _anchor_lines(slider_anchors)
+            if slider_anchors:
+                logger.info("[slider] %d anchor prompt(s), one a step in turn, weight %g - the dial leaves them "
+                            "as the model has them: %s", len(slider_anchors), float(slider_anchor_weight),
+                            " | ".join(slider_anchors))
             if not (te_path and vae_path):
                 raise RuntimeError("[slider] prompt pairs need the text encoder and VAE paths")
             if str(slider_prompts[0]).strip():     # the dial is shown on the picture it was trained on
-                sample_prompts = [str(slider_prompts[0]).strip()]
+                # and on the first anchor, whose strip should barely move
+                sample_prompts = [str(slider_prompts[0]).strip()] + slider_anchors[:1]
+    else:
+        slider_anchors = []
 
     # ---- full fine-tune (families/ft.py): the base model itself trains, a component window at a time -------------
     if finetune:
@@ -630,11 +1269,9 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
         if resume_state_dir:
             raise RuntimeError("[finetune] a fine-tune continues from its saved checkpoint (the Model / --dit), not a "
                                "state folder")
-        from fizgig.families import ft as _ft
-        _why = _ft.source_unfit_reason(dit_path)
+        _why = driver.ft_source_unfit(dit_path)
         if _why:
-            raise RuntimeError(f"[finetune] {os.path.basename(dit_path)} {_why} - a fine-tune trains from, and "
-                               f"saves over, a bf16 model file")
+            raise RuntimeError(f"[finetune] {os.path.basename(dit_path)} {_why}")
         if precision != "nf4" or blocks_to_swap:
             logger.info(f"[finetune] frozen base: NF4 (asked {precision}, swap {blocks_to_swap}) - the fine-tune "
                         f"trunk is always 4-bit, and blocks outside the window stream only if the plan needs it")
@@ -657,6 +1294,19 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
 
     # ---- data ------------------------------------------------------------------------------------
     shared_epoch = Value("i", 0)
+    # the face's own loss weight (the face detector's oval): anything but 1 (0 = the face not at all); stills only
+    face_phase = {"on": True, "epoch": 0, "ended": False}   # Boost the face's cycle: this epoch boosted? (per epoch)
+    try:                                   # --face_until E:S - the boost ends after epoch E or step S, whichever is
+        _face_end = tuple(max(0, int(x)) for x in (str(face_until or "0:0").split(":") + ["0"])[:2])   # sooner; 0 = none
+    except ValueError:
+        raise RuntimeError(f"--face_until {face_until!r}: give it as EPOCH:STEP, e.g. 12:600 (0 = no limit)") from None
+    try:                                   # --face_cycle N:M - N boosted epochs, then M normal ones
+        _face_cyc = tuple(max(0, int(x)) for x in str(face_cycle or "1:0").split(":")[:2])
+        _face_cyc = (max(1, _face_cyc[0]), _face_cyc[1] if len(_face_cyc) > 1 else 0)
+    except ValueError:
+        raise RuntimeError(f"--face_cycle {face_cycle!r}: give it as N:M, e.g. 2:1") from None
+    face_on = (face_weight is not None and float(face_weight) >= 0.0 and float(face_weight) != 1.0
+               and not slider_prompts and desc.masked_training)
     if slider_prompts:
         user_config = {"general": {"resolution": [slider_bank_res, slider_bank_res]}}
         group = _SliderBank([None] * max(1, int(slider_bank)))    # filled once the DiT is loaded
@@ -664,52 +1314,285 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
         if not dataset_config:
             raise RuntimeError("--dataset_config is required (only a prompt-pair slider trains without a dataset)")
         user_config = load_user_config(dataset_config)
+        if batch_size_auto:
+            _apply_auto_batch(desc, driver, user_config, precision, blocks_to_swap, dict(
+                dit=dit_path, slider=slider, finetune=finetune, dop=bool(dop), share=share_worker is not None,
+                stage=bool(stage_dataset_config), mask_prior=bool(masked_training and mask_prior),
+                lora=str(network_type).lower() == "lora", accumulation=int(gradient_accumulation_steps or 1) > 1,
+                paired=any(d.get("control_directory") for d in user_config.get("datasets", []))))
         blueprint = BlueprintGenerator(ConfigSanitizer()).generate(user_config, argparse.Namespace(),
                                                                    architecture=arch)
+        if masked_training:
+            if not desc.masked_training:
+                raise RuntimeError(f"{desc.display_name} has no masked training - drop --masked_training")
+            from fizgig.dataset.image_dataset import ImageDataset
+            ImageDataset.loss_masks = True      # each still with a photo-masklabel.png gets its mask (dataset/masks.py)
+        if face_on:
+            from fizgig.dataset.image_dataset import ImageDataset
+            ImageDataset.face_boost = float(face_weight)     # each still's largest face as an oval (Boost the face)
+            from fizgig.dataset.masks import FACE_AREAS
+            ImageDataset.face_area = face_area if face_area in FACE_AREAS else "face"
         group = generate_dataset_group_by_blueprint(blueprint.dataset_group, training=True,
                                                     num_timestep_buckets=None, shared_epoch=shared_epoch)
     if group.num_train_items == 0:
         raise RuntimeError("No training items - run the cache stages (families/cache.py) first.")
+    masked_images = 0
+    if masked_training and slider_prompts:
+        logger.info("[masks] a prompt-pair slider trains on pictures it makes itself: masked training is off")
+        masked_training = False
+    elif masked_training:
+        masked_images = len({str(getattr(it, "mask_path", "")) for ds in group.datasets
+                             for b in ds.batch_manager.buckets.values() for it in b if getattr(it, "mask_path", None)})
+        logger.info(f"[masks] masked training: {masked_images} picture(s) with a mask, outside the mask counts "
+                    f"x{float(mask_floor):g}")
+    mask_prior = float(mask_prior or 0.0) if masked_training else 0.0
+    if mask_prior and (slider or finetune):
+        logger.info("[masks] keeping the model's own picture outside the mask needs a LoRA to switch off (not a "
+                    "slider or a fine-tune): it's off for this run")
+        mask_prior = 0.0
+    elif mask_prior:
+        logger.info(f"[masks] outside the mask, the LoRA is kept to the model's own picture at x{mask_prior:g} "
+                    "(one extra forward a step, without the LoRA)")
+
+    def _batch_loss(batch, latents):
+        """Batch Size above 1: the step's pictures in one forward per caption shape. Each picture's caption dropout
+        is drawn on its own; the loss is the pictures' mean, as their own steps would average."""
+        n = latents.shape[0]
+        if any(k.startswith("latents_control_") for k in batch):
+            raise RuntimeError("Batch size above 1 trains plain pictures: an edit's before-images need batch 1")
+        conds = []
+        for i in range(n):
+            one = {k: (v[i][None] if isinstance(v, list) and len(v) == n and torch.is_tensor(v[0]) else
+                       v[i:i + 1] if torch.is_tensor(v) and v.dim() and v.shape[0] == n else
+                       [v[i]] if isinstance(v, list) and len(v) == n else v) for k, v in batch.items()}
+            c = driver.batch_cond(one, device)
+            if uncond is not None and random.Random((global_step * 7919 + 17) * 31 + i).random() < caption_dropout:
+                c = {**c, **{k: v.to(device) for k, v in uncond.items()}}
+            conds.append(c)
+        groups, whole = [], driver.stack_conds(conds)
+        if whole is not None:
+            groups = [(list(range(n)), whole)]
+        else:
+            shapes = {}
+            for i, c in enumerate(conds):
+                shapes.setdefault(tuple((k, tuple(v.shape)) for k, v in c.items() if torch.is_tensor(v)), []).append(i)
+            groups = [(ix, driver.stack_conds([conds[i] for i in ix])) for ix in shapes.values()]
+        lm = _loss_mask(batch)
+        total, ts = 0.0, []
+        per, raw, tpic = [None] * n, [None] * n, [None] * n      # each picture's own, in the batch's order
+        for ix, cond in groups:
+            sel = torch.tensor(ix, device=latents.device)
+            l, info = driver.training_loss_batch(dit, latents.index_select(0, sel), cond, gen, min_t=min_timestep,
+                                                 max_t=max_timestep,
+                                                 loss_mask=None if lm is None else lm.index_select(0, sel.to(lm.device)))
+            total = total + l * (len(ix) / n)
+            ts.append(float(info.get("t", 0.5)))
+            if info.get("per") is not None:
+                for j, i in enumerate(ix):
+                    per[i] = info["per"][j]
+                    raw[i] = (info.get("per_raw") or [None] * len(ix))[j]
+                    tpic[i] = (info.get("ts") or [info.get("t", 0.5)] * len(ix))[j]
+        out = {"t": sum(ts) / len(ts)}
+        if all(p is not None for p in per):
+            out.update(per=torch.stack(per), ts=tpic,
+                       **({"per_raw": raw} if all(r is not None for r in raw) else {}))
+        return total, out
+
+    def _loss_mask(batch):
+        """The step's per-cell loss weights (masked training), or None: a picture without a mask trains as normal."""
+        m = batch.get("loss_mask") if masked_training else None
+        if face_on and any(_face_end) and _face_cyc[1] > 0 and not face_phase["ended"]:
+            # with --face_until, the cycle runs in steps: the window (epoch E or step S, the sooner) splits into E
+            # equal blocks (12 if no epoch is given) - an epoch each when they fit, so a big dataset whose S steps
+            # are only a few epochs still gets its normal stretches between the boosted ones
+            win = min(x for x in (_face_end[0] * steps_per_epoch, _face_end[1]) if x)
+            unit = max(1, min(steps_per_epoch, win // (_face_end[0] or 12)))
+            on = (global_step // unit) % (_face_cyc[0] + _face_cyc[1]) < _face_cyc[0]
+            if on != face_phase.get("was"):
+                face_phase["was"] = on
+                face_phase.setdefault("said", []).append(   # said at the next epoch's start: mid-step it would land
+                    f"[face boost] step {global_step} (epoch {face_phase['epoch'] + 1}): "     # on a progress-bar
+                    + ("boosted" if on else "normal (no boost)")                                 # line, which the
+                    + f" for {unit * (_face_cyc[0] if on else _face_cyc[1])} steps")            # app's log thins out
+            face_phase["on"] = on
+        f = batch.get("face_weight") if face_on and face_phase["on"] else None
+        if f is not None and not face_phase["ended"] and ((_face_end[0] and face_phase["epoch"] >= _face_end[0])
+                                                         or (_face_end[1] and global_step >= _face_end[1])):
+            face_phase["ended"] = True       # its limit: from here on the run trains as if it were off
+            face_phase.setdefault("said", []).append(f"[face boost] ends at step {global_step} (epoch "
+                                                     f"{face_phase['epoch'] + 1}): the rest of the run trains without it")
+        if face_phase["ended"]:
+            f = None
+        if m is None and f is None:
+            return None
+        from fizgig.dataset.masks import mask_weight
+        w = mask_weight(m.to(device).float(), mask_floor) if m is not None else None
+        if f is not None:                    # the face: x face_weight over its oval (0 = not at all), on top of the mask
+            f = 1.0 + (float(face_weight) - 1.0) * f.to(device).float()
+            w = f if w is None else w * f
+        return w
     if slider_pairs:
         shared = _pair_slider_caption(user_config)
         if shared:                           # the dial is shown on what both ends of a pair have in common
             sample_prompts = [shared]
             logger.info("[slider] previews use the pairs' caption: '%s'", shared)
-    for ds in group.datasets:
-        if getattr(ds, "batch_size", 1) != 1:
-            raise RuntimeError(f"{desc.display_name} trains at batch size 1 here (conditioning lengths differ per "
-                               f"image). Set Batch Size to 1.")
+    if slider:
+        driver.slider_setup(group)           # e.g. H3: still previews unless the pairs are clips
+    bsz = max((int(getattr(ds, "batch_size", 1) or 1) for ds in group.datasets), default=1)   # a prompt slider has none
+    if bsz != 1 and not desc.batch_training:
+        raise RuntimeError("Fizgig trains one image at a time: set batch_size = 1 in the dataset config. For a "
+                           "larger effective batch use --gradient_accumulation_steps (the same averaged "
+                           "gradient, at the memory of batch 1).")
+    if bsz != 1:
+        # Batch Size above 1 (Other Options): what reads one picture a step stays at batch 1
+        blockers = [name for on, name in (
+            (slider, "a slider"), (bool(dop), "DOP"),
+            (bool(mask_prior), "keeping the model's own picture outside the mask"),
+            (bool(stage_dataset_config), "Start at a smaller size"), (share_worker is not None, "a helper's share"))
+            if on]
+        if blockers:
+            raise RuntimeError(f"Batch size {bsz} can't run with {', '.join(blockers)}: set Batch size to 1, or turn "
+                               "those off.")
+        logger.info(f"[batch] {bsz} pictures a step, each from the same size bucket; a batch whose captions differ "
+                    "in shape runs each shape's pictures as their own group")
+    _reg_limit(group, reg_per_epoch, say=True)     # a LoRA's regularisation set: its share an epoch (--reg_per_epoch)
     loader = DataLoader(group, batch_size=1, shuffle=True, num_workers=0,
                         collate_fn=(lambda b: b[0]) if slider_prompts else _Collator(shared_epoch, group))
+    # Start at a smaller size: the first stage_until of the epochs draw from this dataset (its own cache folder),
+    # blending into the full size over stage_blend of the run
+    low_loader = None
+    if stage_dataset_config and not slider and not finetune and share_worker is None:
+        _lbp = BlueprintGenerator(ConfigSanitizer()).generate(load_user_config(stage_dataset_config),
+                                                              argparse.Namespace(), architecture=arch)
+        low_group = generate_dataset_group_by_blueprint(_lbp.dataset_group, training=True, num_timestep_buckets=None,
+                                                        shared_epoch=shared_epoch)
+        if low_group.num_train_items == 0:
+            logger.warning("[stages] the smaller size has no cache - this run trains at the full size throughout")
+        else:
+            _reg_limit(low_group, reg_per_epoch)
+            low_loader = DataLoader(low_group, batch_size=1, shuffle=True, num_workers=0,
+                                    collate_fn=_Collator(shared_epoch, low_group))
+            logger.info(f"[stages] the first {float(stage_until) * 100:.0f}% of the epochs at the smaller size "
+                        f"({low_group.num_train_items} items), blending into the full size over "
+                        f"{float(stage_blend) * 100:.0f}% of the run")
+    low_iter = [None]
+
+    def _low_share(epoch):
+        """This epoch's share of steps at the smaller size: 1 before the blend, 0 after, a straight line between."""
+        if low_loader is None:
+            return 0.0
+        x = (epoch + 0.5) / max(1, max_train_epochs)
+        a, b = float(stage_until) - float(stage_blend) / 2, float(stage_until) + float(stage_blend) / 2
+        return 1.0 if x <= a else 0.0 if x >= b else (b - x) / (b - a)
+
+    def _low_batch():
+        try:
+            return next(low_iter[0])
+        except (StopIteration, TypeError):
+            low_iter[0] = iter(low_loader)
+            return next(low_iter[0])
     steps_per_epoch = len(loader)
     logger.info(f"{desc.display_name} training: {group.num_train_items} items, {max_train_epochs} epochs, "
                 f"{steps_per_epoch} steps/epoch")
-    # A fine-tune's regularisation set: a dataset block marked is_reg, trained at a fixed reduced LR so it tethers
-    # the model's prior rather than teaching a subject (a full fine-tune has no rank bound on its drift). A LoRA's
-    # update is rank-bounded, so there the block is trained as ordinary images, with a warning.
+    _launch = uuid.uuid4().hex[:12]      # this launch: a re-run of the same name is a new training share
+    # what keeps this run on one GPU (the share's half would train without it), for the Helpers tab to say so
+    _share_off = ("a fine-tune" if finetune else
+                  "a regularisation dataset" if any(getattr(ds, "is_reg", False) for ds in group.datasets) else
+                  "Start at a smaller size" if low_loader is not None else
+                  "Your subject and other people" if dop else
+                  "Track how each image trains and the per-image options" if (
+                      log_per_image_loss or per_image_lr or auto_recaption or warmup_look_outliers) else "")
+    if share_worker is None and not slider_prompts:
+        try:                     # for a helper's training share (web/helpers.py): this run's command and its cache
+            os.makedirs(os.path.join(output_dir, SHARE_DIR), exist_ok=True)
+            for _old in glob.glob(os.path.join(output_dir, SHARE_DIR, "[0-9]" * 6)):
+                shutil.rmtree(_old, ignore_errors=True)     # an earlier run's rounds: never this run's to combine
+            with open(dataset_config, encoding="utf-8") as f:
+                _ds_text = f.read()
+            _write_json(os.path.join(output_dir, SHARE_DIR, "setup.json"), {
+                "launch": _launch, "off": _share_off,
+                "family": desc.key, "args": sys.argv[1:], "dataset_config": _ds_text, "output_name": output_name,
+                "cache_dirs": sorted({ds.cache_directory for ds in getattr(group, "datasets", [])
+                                      if getattr(ds, "cache_directory", None)}), "max_train_epochs": max_train_epochs})
+        except Exception as e:
+            logger.info(f"[share] no training share for this run ({e})")
+    # A regularisation set: a dataset block marked is_reg, each of its pictures' loss scaled by reg_lr_multiplier.
+    # A fine-tune's tethers the model's prior (a full fine-tune has no rank bound on its drift); a LoRA's (the Subjects
+    # card's Regularisation dataset, #332) holds the model's idea of the kind of thing the subject is in place, in
+    # place of DOP / Fizgig LoRA Isolation. Its pictures are never watched, excluded, recaptioned or mapped
+    # (loss_watch._folders and train_maps skip the block)
     reg_keys = set()
     reg_ds = [ds for ds in getattr(group, "datasets", []) if getattr(ds, "is_reg", False)]
-    if reg_ds and finetune:
+    if reg_ds:
         for ds in reg_ds:
             for bucket in ds.batch_manager.buckets.values():
                 reg_keys.update(str(it.item_key) for it in bucket)
+        subject = group.num_train_items - len(reg_keys)
         logger.info(f"[reg] {len(reg_keys)} regularisation image(s) at x{reg_lr_multiplier:g} LR "
-                    f"({group.num_train_items - len(reg_keys)} subject items)")
-        if len(reg_keys) >= group.num_train_items - len(reg_keys):
+                    f"({subject} subject items)")
+        if finetune and len(reg_keys) >= subject:
             logger.warning("[reg] regularisation images are at least half the training set - the multiplier only "
                            "reads as an LR cut while they are the minority (Adafactor normalises by a second moment "
                            "the majority dominates)")
-    elif reg_ds:
-        logger.warning("[reg] the dataset config has a regularisation block, but this is a LoRA run - those images "
-                       "train as ordinary images at full LR; remove the is_reg block if that is not what you want")
+        elif not finetune and (int(reg_per_epoch or 0) or len(reg_keys)) > subject:
+            logger.warning("[reg] each epoch trains on more regularisation pictures than subject pictures: most of "
+                           "what the LoRA sees is the regularisation set, so it learns your subject more slowly")
 
     # ---- Auto precision / swap: planned on an empty card (the description's figures include the preview VAE)
+    auto_precision = precision == "auto"
     if precision == "auto" or blocks_to_swap < 0:
         req = (precision, blocks_to_swap)
         res = user_config.get("general", {}).get("resolution") or [1024, 1024]
         mp = (res[0] * res[1] if isinstance(res, (list, tuple)) else res * res) / 1e6
-        precision, blocks_to_swap, why = quant.plan(desc, driver, precision, blocks_to_swap, megapixels=mp)
-        why += f" at {mp:.2f} MP"
+        run_plan = dict(
+            dit_path=dit_path, network_type=network_type, network_dim=network_dim, lokr_factor=lokr_factor,
+            optimizer_type=optimizer_type, training_adapter=training_adapter, context_lora_path=context_lora_path,
+            ema_decay=0.98 if str(ema_decay).lower().startswith("short") else ema_decay)
+        own = driver.plan_run(precision, blocks_to_swap, group=group, run=run_plan)
+        if own is not None:
+            precision, blocks_to_swap, why = own
+        else:
+            # the figures are a rank-16 LoRA's: a bigger adapter (LoKR, fp32 Adam, EMA) is counted on top (#337)
+            adapter_gb = quant.adapter_extra_gb(driver, run_plan) if not finetune else 0.0
+            plain = quant.plan(desc, driver, precision, blocks_to_swap, megapixels=mp, pictures=bsz,
+                               dit_path=dit_path)
+            counted = quant.plan(desc, driver, precision, blocks_to_swap, megapixels=mp, pictures=bsz,
+                                 adapter_gb=adapter_gb, dit_path=dit_path) if adapter_gb >= 0.1 else plain
+            precision, blocks_to_swap, why = counted
+            kept = counted[:2] != plain[:2] and plain[:2] == ("nf4", 0)
+            if kept:
+                # the 4-bit base is the smallest and can't swap; the swapped int8 the adapter pushes the plan to ran 6x
+                # slower than nf4 in #337's measurement, and the figures leave room on Linux - keep nf4, say what to
+                # change so it fits for certain (a Windows card past its memory spills into system RAM and crawls)
+                precision, blocks_to_swap, why = plain
+                logger.warning(
+                    f"[precision] tight fit: this run's {'LoKR' if str(network_type).lower() == 'lokr' else 'LoRA'}, "
+                    f"its optimizer{' and EMA' if quant.adapter_ema(run_plan) else ''} take ~{adapter_gb:.1f} GB "
+                    "more than a rank-16 LoRA, so the 4-bit base may not fit this card. If steps slow down as the "
+                    "run goes (Windows spilling into system memory), or it runs out of memory: turn Weight averaging "
+                    "(EMA) off, lower Target Megapixels, or use a standard LoRA")
+            from fizgig.utils.gpu_backend import is_rocm
+            if not kept and precision == "nf4" and "closely" in why and os.name == "nt" and is_rocm():
+                # Windows AMD has no expandable segments: a close fit runs short once pictures of many shapes train at
+                # full size (1.8 GB in unusable pieces, #341, measured on ROCm); a Windows card then spills into system
+                # memory and crawls. EMA off fitted the same run (15.5 GB peak of 15.8)
+                logger.warning(
+                    "[precision] tight fit: on an AMD card on Windows this run may run short once its full-size "
+                    "pictures start. If steps slow down as the run goes, or it runs out of memory: turn Weight "
+                    "averaging (EMA) off, lower Target Megapixels, or use a standard LoRA")
+            why += f" at {mp:.2f} MP" + (f" x {bsz} pictures a step" if bsz > 1 else "")
+            if adapter_gb >= 0.1 and not kept:
+                why += (f", counting {adapter_gb:.1f} GB more for the "
+                        f"{'LoKR' if str(network_type).lower() == 'lokr' else 'LoRA'}, its optimizer"
+                        + (" and EMA" if quant.adapter_ema(run_plan) else "") + " than a rank-16 LoRA")
+            if share_worker is not None:
+                # a helper's share trains at the lead's precision (the same base numbers): say so plainly, before the
+                # model loads, when this card can't hold it even with the most blocks swapped (the lead trains on)
+                short = quant.share_shortfall(desc, driver, precision, blocks_to_swap, mp)
+                if short:
+                    raise SystemExit(f"[share] This GPU can't train the lead's {desc.precision_labels.get(precision, precision)} "
+                                     f"base: {short}. The lead trains every image itself. To share with this GPU, "
+                                     "train on the lead with a smaller base (Auto, int8 or 4-bit).")
         logger.info(f"[precision] Auto plan: {precision}, block swap {blocks_to_swap} ({why}); asked {req}")
 
     # ---- torch.compile (Krea 2's rule), decided here on the empty card as the original does - the free VRAM its
@@ -719,68 +1602,197 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
     do_compile = False
     cb = str(compile_blocks or "off").lower()
     if desc.compiles and cb != "off":
-        from fizgig.utils.capabilities import compile_boundary, should_compile
-        q4, q8 = precision == "nf4", ("int8" if precision == "int8" else "")
         try:
-            mp_max = max(w * h / 1e6 for ds in group.datasets for (w, h) in ds.batch_manager.bucket_resos)
+            mp_max = max(k[-2] * k[-1] / 1e6 for ds in group.datasets for k in ds.batch_manager.bucket_resos)
         except Exception:
             mp_max = 0.25
+        do_compile, why = driver.compile_plan(cb, group.num_train_items * max_train_epochs, precision,
+                                              max(0, blocks_to_swap) if precision != "nf4" else 0,
+                                              mp=mp_max * bsz if bsz > 1 else mp_max)
         if cb == "auto":
-            do_compile, why = should_compile(group.num_train_items * max_train_epochs, q4, q8,
-                                             max(0, blocks_to_swap) if precision != "nf4" else 0, mp=mp_max)
             logger.info("[compile] auto: %s - %s", "ENABLED (checkpoint outside)" if do_compile == "outside"
                         else ("ENABLED" if do_compile else "off"), why)
-        elif cb == "outside":
-            do_compile = "outside"
+        elif why:
+            logger.info("[compile] %s", why)
+    if auto_precision and not do_compile:
+        alt = driver.auto_uncompiled_precision(dit_path, precision)
+        if alt and alt != precision:
+            logger.info(f"[precision] Auto: {desc.precision_labels.get(alt, alt)} instead of {precision} - this run "
+                        "is not compiled, and uncompiled that is the faster base for this file")
+            precision = alt
+
+    # ---- gradient checkpointing: "auto" goes without it when the measured figure fits the empty card (LoRA only -
+    # LoKR without checkpointing measured 3-16 GB over a LoRA at 1 MP, Qwen edit pairs ~26 GB; fine-tunes, sliders, edit pairs and
+    # the mid-run captioner carry memory the figures don't cover)
+    gc_off_blocks = 0
+    if gradient_checkpointing == "auto":
+        paired = any(d.get("control_directory") for d in user_config.get("datasets", []))
+        if (quant.card_gb() < quant.NOGC_MIN_CARD_GB or finetune or slider or paired or auto_recaption
+                or str(network_type).lower() != "lora"
+                or gradient_accumulation_steps > 1):
+            gradient_checkpointing = True
         else:
-            do_compile = compile_boundary(q4, q8, mp=mp_max)
-            if do_compile == "outside":
-                logger.info("[compile] on: inside-the-graph won't fit at this token load - compiling with the "
-                            "checkpoint OUTSIDE the region instead.")
+            kind, mp_ck = driver.nogc_load(group)
+            # a batch: one picture's figure + the measured cost of each picture past it (batch_gb_nogc)
+            gradient_checkpointing, why = quant.plan_checkpointing(
+                desc, precision, max(0, blocks_to_swap) if precision != "nf4" else 0, mp_ck, compiled=bool(do_compile),
+                kind=kind, rank=int(network_dim), pictures=bsz)
+            logger.info(f"[checkpointing] gradient checkpointing {why}")
+            if gradient_checkpointing and bsz == 1:     # the partial figures are one picture's
+                gc_off_blocks, why = quant.plan_partial_checkpointing(
+                    desc, precision, max(0, blocks_to_swap) if precision != "nf4" else 0, mp_ck,
+                    compiled=bool(do_compile), kind=kind, rank=int(network_dim))
+                if gc_off_blocks:
+                    logger.info(f"[checkpointing] gradient checkpointing {why}")
+                    if do_compile:          # the partial figures are compiled with the checkpoint outside the graph
+                        do_compile = "outside"
+    gradient_checkpointing = bool(gradient_checkpointing)
 
     # ---- previews: encode prompts once, keep the VAE ---------------------------------------------
     encoded = neg = vae = ref_imgs = ref_latents = None
-    slider_enc = None
+    slider_enc = slider_neg = None
+    anchor_enc = []
     if slider_prompts:
         te = driver.load_text_encoder(te_path, device)
-        slider_enc = [{k: v[None] for k, v in c.items()}
-                      for c in driver.encode_text(te, [str(x) for x in slider_prompts])]
+        _all = [{k: v[None] for k, v in c.items()}
+                for c in driver.encode_text(te, [str(x) for x in slider_prompts] + list(slider_anchors))]
+        slider_enc, anchor_enc = _all[:3], _all[3:]
+        if sample_cfg_scale > 1.0 and desc.preview_negative is not None:
+            # the practice pictures render as previews do: the Samples tab's negative (else the family's default)
+            text = sample_negative if sample_negative is not None else desc.preview_negative
+            slider_neg = {k: v[None] for k, v in driver.encode_text(te, [text])[0].items()}
         driver.unload_text_encoder(te)
         del te
         torch.cuda.empty_cache()
+    # ---- DOP: each image's caption with the trigger swapped for the class word, encoded once ------------------
+    dop_cond = {}
+    if dop:
+        trig = str(dop_trigger or trigger_word or metadata_trigger_phrase or "").strip()
+        pairs = _dop_pairs(trig, dop_class) if trig else []
+        why = ("a slider trains a dial, not a subject" if slider else
+               "it needs the trigger word (--dop_trigger)" if not trig else
+               "it needs the text encoder (--text_encoder)" if not te_path else "")
+        if why:
+            logger.warning(f"[dop] off: {why}")
+        else:
+            caps = _dop_captions(group)
+            todo = {k: c2 for k, (c, _p) in caps.items() if (c2 := _dop_caption(c, pairs)) is not None}
+            from fizgig.families import cache as _cache
+            new = [k for k in sorted(todo) if not _cache.cond_file_matches(_dop_path(caps[k][1]), todo[k])]
+            shown = ", ".join(f"'{t}' -> '{c}'" if c else f"'{t}' dropped" for t, c in pairs)
+            if not todo:
+                logger.warning(f"[dop] off: no caption contains {'any of ' if len(pairs) > 1 else ''}{shown}")
+            else:
+                keys = sorted(todo)
+                if new:          # written beside each item's own text cache, so a re-run reads them back
+                    te = driver.load_text_encoder(te_path, device)
+                    try:
+                        for i in tqdm(range(0, len(new), 4), desc="[dop] trigger-free captions"):
+                            chunk = new[i:i + 4]
+                            for k, c in zip(chunk, driver.encode_text(te, [todo[k] for k in chunk])):
+                                _cache.save_cond_file(desc, _dop_path(caps[k][1]), todo[k], c, k)
+                    finally:
+                        driver.unload_text_encoder(te)
+                        del te
+                        torch.cuda.empty_cache()
+                dop_cond.update({k: _dop_path(caps[k][1]) for k in keys})
+                logger.info(f"[dop] trigger-free captions: {len(new)} encoded, {len(keys) - len(new)} already in "
+                            "the cache")
+                logger.info(f"[dop] Differential Output Preservation on {len(dop_cond)} of {len(caps)} images "
+                            f"(x{dop_weight:g}, every {max(1, int(dop_every))} step(s)); {shown}: without the trigger the "
+                            f"LoRA is held to the base model. e.g. '{todo[keys[0]][:120]}'")
+                if len(pairs) > 1:
+                    for t, _c in pairs:
+                        n = sum(1 for k in todo if re.search(r"(?<!\w)" + re.escape(t) + r"(?!\w)", caps[k][0], re.I))
+                        logger.info(f"[dop]   '{t}': {n} image(s)")
+                if len(dop_cond) < len(caps):
+                    logger.info(f"[dop] {len(caps) - len(dop_cond)} image(s) have no trigger in the caption - "
+                                "they train as usual, with no preservation step")
+    # ---- caption dropout: the empty caption, encoded once, trains in place of the picture's on that share of steps
+    uncond = None
+    caption_dropout = float(caption_dropout or 0.0)
+    if caption_dropout > 0:
+        why = ("a slider trains a dial, not a caption" if slider else
+               "it needs the text encoder (--text_encoder)" if not te_path else
+               f"{desc.display_name} has its own" if not desc.caption_dropout else "")
+        cache_dirs = [getattr(ds, "cache_directory", "") for ds in group.datasets if getattr(ds, "cache_directory", "")]
+        if why or not cache_dirs:
+            logger.warning(f"[caption dropout] off: {why or 'no text cache folder'}")
+        else:
+            from fizgig.families import cache as _cache
+            up = os.path.join(cache_dirs[0], f"uncond_{desc.arch_id}_te.safetensors")
+            if not _cache.cond_file_matches(up, ""):
+                te = driver.load_text_encoder(te_path, device)
+                try:
+                    _cache.save_cond_file(desc, up, "", driver.encode_text(te, [""])[0], "uncond")
+                finally:
+                    driver.unload_text_encoder(te)
+                    del te
+                    torch.cuda.empty_cache()
+            uncond = _load_dop_cond(up)
+            logger.info(f"[caption dropout] {caption_dropout:g} of steps train with no caption")
+    dop_every = max(1, int(dop_every or 1))
+    if dop_cond:
+        # each new shape compiles its own graph. The DOP pass's trigger-free captions bring text lengths the run's
+        # own captions don't; with automatic dynamic shapes, the dynamic graph that follows failed to compile on
+        # Krea 2 (inductor: KeyError 'unbacked_bindings', the step after the first DOP pass); off, the same run went
+        # 30 steps clean. A run without DOP is left as it was
+        import torch._dynamo as _dyn
+        _dyn.config.automatic_dynamic_shapes = False
+    dop_sum = [0.0, 0]
     sample_dir = os.path.join(output_dir, "sample")
+
+    def dop_cond_for(batch, cond):
+        """This item's conditioning with its trigger-free text, or None when the item has no DOP pass (no trigger,
+        an edit pair, sound only)."""
+        keys = [str(k) for k in batch.get("item_te_paths") or []]
+        if (not dop_cond or len(keys) != 1 or keys[0] not in dop_cond or any(k.startswith("latents_control_")
+                                                                             for k in batch)
+                or bool(torch.as_tensor(batch.get("audio_only", False)).any())):
+            return None
+        dc = dict(cond)
+        for n, v in _load_dop_cond(dop_cond[keys[0]]).items():
+            if n not in dc:      # the cache keeps the text under other names: DOP can't swap it
+                raise RuntimeError(f"[dop] {desc.display_name}'s encoded text has '{n}', which its cached "
+                                   f"conditioning doesn't ({', '.join(sorted(cond))})")
+            dc[n] = v.to(device) if torch.is_tensor(v) else v
+        return dc
+    dop_ft = None                  # a fine-tune's saved targets (made at the first window)
+    dop_ft_file = os.path.join(output_dir, f"{output_name}_dop_targets.pt")
     if sample_reference and not driver.supports_references:
         logger.warning(f"[sample] {desc.display_name} has no edit previews - ignoring --sample_reference")
         sample_reference = None
     if sample_prompts and sample_every_n_epochs and te_path and vae_path:
         logger.info("[sample] encoding %d preview prompt(s) with %s", len(sample_prompts), desc.text_encoder_label)
         if sample_reference:
-            ref_imgs, (sample_width, sample_height) = _load_references(sample_reference, sample_width, sample_height)
+            ref_imgs, (sample_width, sample_height) = _load_references(sample_reference, sample_width, sample_height,
+                                                                    desc.rgba)
             logger.info(f"[sample] edit previews from {len(ref_imgs)} reference image(s) at "
                         f"{sample_width}x{sample_height}")
             te = driver.load_reference_text_encoder(te_path, device)
             encoded = driver.encode_text_with_references(te, sample_prompts, [ref_imgs] * len(sample_prompts))
-            if sample_cfg_scale > 1.0:
+            if sample_cfg_scale > 1.0 or not desc.samples_cfg_free:
                 neg = driver.encode_text_with_references(te, [sample_negative or ""], [ref_imgs])[0]
         elif sample_image and desc.preview_image:
             from PIL import Image
             logger.info(f"[sample] previews see {os.path.basename(sample_image)} through the text encoder's vision "
                         f"path")
             te = driver.load_text_encoder(te_path, device)
-            encoded = driver.encode_text_with_image(te, sample_prompts, Image.open(sample_image))
-            if sample_cfg_scale > 1.0:
+            encoded = driver.encode_text_with_image(te, sample_prompts, open_upright(sample_image))
+            if sample_cfg_scale > 1.0 or not desc.samples_cfg_free:
                 neg = driver.encode_text(te, [sample_negative or ""])[0]     # negatives stay text-only
         else:
             te = driver.load_text_encoder(te_path, device)
             encoded = driver.encode_text(te, sample_prompts)
-            if sample_cfg_scale > 1.0:
+            if sample_cfg_scale > 1.0 or not desc.samples_cfg_free:
                 neg = driver.encode_text(te, [sample_negative or ""])[0]
         driver.unload_text_encoder(te)
         del te
         torch.cuda.empty_cache()
         vae = driver.load_vae(vae_path, device)
         if ref_imgs:
-            ref_latents = [z[None].cpu() for z in driver.encode_images(vae, ref_imgs)]
+            # one at a time: extra pictures have their own shapes, and a driver may stack its batch (Klein)
+            ref_latents = [driver.encode_images(vae, [im])[0][None].cpu() for im in ref_imgs]
     elif sample_prompts and sample_every_n_epochs:
         logger.warning("[sample] previews need the text encoder and VAE paths - previews are off for this run")
 
@@ -789,33 +1801,75 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
     dit, swapped = quant.load_base(driver, dit_path, device, precision, blocks_to_swap)
     if gradient_checkpointing:
         driver.enable_gradient_checkpointing(dit, True)
+        dit.gc_off_blocks = gc_off_blocks       # the compiled blocks / H3's loop leave the last ones un-checkpointed
     net = FamilyLoRA(dit, driver, device=device)
+    driver.prepare_training(dit, group, net)
     if training_adapter:
         n = net.add_file(training_adapter, ADAPTER, training_adapter_strength)
         if n == 0:
             raise RuntimeError(f"Training adapter {training_adapter} matched no {desc.display_name} modules.")
+        driver.frozen_file_added(dit, training_adapter, training_adapter_strength, "adapter")
         logger.info(f"[adapter] training adapter ON ({n} Linears, strength {training_adapter_strength:g}) - frozen, "
                     f"off in previews, not saved into the LoRA")
-    else:
+    elif desc.training_adapter:                 # the family has one and this run goes without it
         logger.warning("[adapter] no training adapter for this run")
     if context_lora_path:
         n = net.add_file(context_lora_path, CONTEXT, context_lora_strength)
+        if n + driver.frozen_file_added(dit, context_lora_path, context_lora_strength, "context") == 0:
+            raise RuntimeError(f"Context LoRA {os.path.basename(context_lora_path)} matched no {desc.display_name} "
+                               f"layers: is it a {desc.display_name} LoRA?")
         logger.info(f"[context] {os.path.basename(context_lora_path)} frozen + active at {context_lora_strength:g} "
                     f"({n} Linears)")
-    if speed_lora and encoded is not None:
-        n = net.add_file(speed_lora, SPEED, speed_desc.strength if speed_lora_strength is None else speed_lora_strength)
-    if speed_lora and encoded is not None and n == 0:
-        net.remove(SPEED)
-        logger.warning(f"[sample] {os.path.basename(speed_lora)} matched no {desc.display_name} layers "
-                       f"(a turbo LoRA for another model?) - previews render without it, at "
-                       f"{desc.preview_steps} steps")
-        speed_lora = None
-        sample_steps = desc.preview_steps
-    elif speed_lora and encoded is not None:
+    def _add_speed(strength):
+        """The speed LoRA onto the training model, off and on CPU between previews; False when it matched nothing."""
+        n = net.add_file(speed_lora, SPEED, strength)
+        driver.frozen_file_added(dit, speed_lora, strength, "speed")
+        if n == 0:
+            net.remove(SPEED)
+            logger.warning(f"[sample] {os.path.basename(speed_lora)} matched no {desc.display_name} layers "
+                           f"(a turbo LoRA for another model?) - previews render without it")
+            return False
         net.set_enabled(SPEED, False)
         net.move_adapter(SPEED, "cpu")
         logger.info(f"[sample] {speed_desc.name}: {n} Linears, on CPU between previews, on only while they render "
-                    f"({sample_steps} steps, strength {speed_desc.strength if speed_lora_strength is None else speed_lora_strength:g})")
+                    f"(strength {strength:g})")
+        return True
+
+    look_said = [False]
+
+    def _look_ready(path=None, strength=None):
+        """The preview look LoRA on the training model (added the first time its file is there: it may still be
+        downloading), off and on CPU between previews. False = previews without it. path / strength: the live
+        override's, when the Samples tab's tick turned it on after the run started."""
+        path, strength = path or preview_lora, strength or preview_lora_strength
+        if not path or look_said[0] == "bad":
+            return False
+        if net.has(LOOK):
+            return True
+        if not os.path.isfile(path):
+            if not look_said[0]:
+                logger.info(f"[sample] {os.path.basename(path)} isn't downloaded yet - previews render without "
+                            "it until it is")
+                look_said[0] = True
+            return False
+        n = net.add_file(path, LOOK, strength)
+        driver.frozen_file_added(dit, path, strength, "speed")
+        if n == 0:
+            net.remove(LOOK)
+            logger.warning(f"[sample] {os.path.basename(path)} matched no {desc.display_name} layers - "
+                           "previews render without it")
+            look_said[0] = "bad"
+            return False
+        net.set_enabled(LOOK, False)
+        net.move_adapter(LOOK, "cpu")
+        logger.info(f"[sample] {os.path.basename(path)}: {n} Linears at {strength:g}, on previews "
+                    "only (on CPU between them)")
+        return True
+
+    if speed_lora and encoded is not None and not speed_idle:
+        if not _add_speed(speed_desc.strength if speed_lora_strength is None else speed_lora_strength):
+            speed_lora = None
+            sample_steps = desc.preview_steps
     if network_type == "lokr" and "lokr" not in desc.network_types:
         raise RuntimeError(f"{desc.display_name} does not offer LoKR")
     ftr = None
@@ -823,7 +1877,9 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
         ftr = _FineTune(driver, desc, dit, net, dit_path, device, max_train_epochs=None, rotations=ft_rotations,
                         save_every_rotations=ft_save_every_rotations, rotate_every=ft_rotate_every,
                         start_window=ft_start_window, epochs_done=ft_epochs_done, fused=ft_fused_backward,
-                        lr=learning_rate, master_dir=output_dir, mp=_largest_bucket_mp(group))
+                        lr=learning_rate, master_dir=output_dir, mp=driver.ft_load_mp(group), group=group,
+                        max_parts=ft_max_parts, held_grads=bool(dop_cond), optimizer_type=ft_optimizer_type,
+                        batch_gb=quant.batch_extra(desc, _largest_bucket_mp(group) or 0.25, bsz))
         max_train_epochs, save_every_n_epochs = ftr.epochs, ftr.save_every
         if ftr.streamer is not None:
             swapped = 1          # blocks stream: previews and caption re-encodes must not park + restore the whole DiT
@@ -837,13 +1893,14 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             blocks = set(train_blocks)
             logger.info(f"[blocks] the LoRA trains {len(blocks)} of {len(known)} blocks only: {', '.join(train_blocks)}")
         net.add_trainable(network_dim, network_alpha, blocks=blocks, kind=network_type, factor=lokr_factor)
-    if slider_prompts:
-        # the practice bank: the base model's own renders of the neutral prompt (adapter at 0, training adapter
-        # off, the speed LoRA on when it is loaded), decoded and re-encoded into training latents
-        import numpy as np
+    def render_bank():
+        """The practice bank: the base model's own renders of the neutral prompt (adapter at 0, training adapter
+        off, the speed LoRA on when it is loaded), decoded and re-encoded into training latents."""
+        nonlocal vae
         if vae is None:
             vae = driver.load_vae(vae_path, device)
         n_c = {k: v[0].to(device) for k, v in slider_enc[0].items()}
+        was_training = dit.training
         net.set_trainable_multiplier(0.0)
         net.set_enabled(ADAPTER, False)
         use_speed = speed_lora is not None and speed_desc is not None and net.has(SPEED)
@@ -852,7 +1909,7 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             net.set_enabled(SPEED, True)
         dit.eval()
         bank = []
-        with torch.no_grad():
+        with torch.no_grad(), driver.still_renders():     # practice pictures are stills, whatever the previews are
             for i in tqdm(range(len(group)), desc="[slider] practice images"):
                 if use_speed:
                     lat = driver.generate(dit, n_c, slider_bank_res, slider_bank_res, steps=speed_desc.settings.steps,
@@ -860,21 +1917,29 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                                           sigmas=speed_desc.settings.sigmas, options=speed_desc.settings.options)
                 else:
                     lat = driver.generate(dit, n_c, slider_bank_res, slider_bank_res, steps=desc.preview_steps,
-                                          seed=seed + 1000 + i, cfg=desc.preview_cfg)
-                img = driver.decode(vae, lat, slider_bank_res, slider_bank_res)
-                bank.append(driver.encode_images(vae, [np.array(img)])[0][None].cpu())
+                                          seed=seed + 1000 + i, cfg=sample_cfg_scale,
+                                          # on the GPU with the prompt: SDXL joins the two before moving them
+                                          **({"neg_cond": {k: v[0].to(device) for k, v in slider_neg.items()}}
+                                             if slider_neg is not None else {}))
+                bank.append(driver.practice_latent(vae, lat, slider_bank_res))
         if use_speed:
             net.set_enabled(SPEED, False)
             net.move_adapter(SPEED, "cpu")
         net.set_enabled(ADAPTER, True)
         net.set_trainable_multiplier(1.0)
+        if was_training:
+            dit.train()
         group.latents = bank
         torch.cuda.empty_cache()
         logger.info("[slider] %d practice images rendered at %dx%d", len(bank), slider_bank_res, slider_bank_res)
+
+    if slider_prompts:
+        render_bank()
     if do_compile:                       # decided before the load (below the Auto plan), applied last
         driver.compile_blocks(dit, "outside" if do_compile == "outside" else "inside",
                               blocks_to_swap if swapped else 0)
-    from fizgig.training.optimizers import create_optimizer, group_rates, optimizer_lr, owns_its_rate
+    from fizgig.training.optimizers import (automagic4_detail, create_optimizer, group_rates, owns_its_rate,
+                                            shown_lr)
     if ftr is not None:
         params, optimizer, opt_label = [], None, ftr.opt_label
     else:
@@ -883,8 +1948,17 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                      f"LoRA rank {network_dim} alpha {network_alpha:g}") +
                     f": {len(net.trainable_modules())} modules, {sum(p.numel() for p in params) / 1e6:.1f}M "
                     f"trainable params")
+        if share_worker is None:         # a round's LoRA in bf16, for a training share's estimate before its first round
+            try:
+                with open(os.path.join(output_dir, SHARE_DIR, "setup.json"), encoding="utf-8") as f:
+                    _s = json.load(f)
+                _s["lora_bytes"] = 2 * sum(p.numel() for p in params)
+                _s["precision"] = precision      # Auto's pick here: the helper trains on the same base numbers
+                _write_json(os.path.join(output_dir, SHARE_DIR, "setup.json"), _s)
+            except (OSError, ValueError):
+                pass
         opt_params = params
-        if str(optimizer_type or "").lower() == "automagic3":
+        if str(optimizer_type or "").lower() in ("automagic3", "automagic4"):
             groups = _optimizer_family_groups(desc, net, learning_rate)
             if groups:                   # one rate per group: each family of modules finds its own
                 opt_params = groups
@@ -892,45 +1966,88 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                     f"{g['family']} ({g['modules']} modules)" for g in groups) + " - each votes its own rate")
             if desc.automagic_sign_window and "polarity_history" not in (optimizer_args or ""):
                 optimizer_args = f"{optimizer_args or ''} polarity_history={desc.automagic_sign_window}".strip()
-                logger.info(f"[optimizer] Automagic v3: sign window {desc.automagic_sign_window} (this family's "
+                _v = "v4" if str(optimizer_type).lower() == "automagic4" else "v3"
+                logger.info(f"[optimizer] Automagic {_v}: sign window {desc.automagic_sign_window} (this family's "
                             f"default; set polarity_history in Optimizer Args to override)")
-        optimizer, opt_label = create_optimizer(optimizer_type, opt_params, learning_rate, optimizer_args)
+        _oargs = optimizer_args or ""
+        if (desc.optimizer_weight_decay is not None and "weight_decay" not in _oargs
+                and "adam" in str(optimizer_type or "").lower()):
+            _oargs = (_oargs + f" weight_decay={desc.optimizer_weight_decay:g}").strip()
+        optimizer, opt_label = create_optimizer(optimizer_type, opt_params, learning_rate, _oargs,
+                                                eps_floor_8bit=desc.optimizer_eps_floor_8bit)
     if owns_its_rate(optimizer):        # Automagic v3 sets its own rate: the watcher and schedulers stand down
         if adaptive_lr:
             logger.info("[adaptive_lr] ignored - the optimizer sets its own learning rate")
-        if per_image_lr or warmup_look_outliers:
-            logger.info("[per-image LR] per-image LR and the look warm-up are off - the optimizer sets its own rate")
-        adaptive_lr = per_image_lr = warmup_look_outliers = False
+        if optimizer.__class__.__name__ == "Prodigy":    # per-image LR stays: it weights each picture's loss
+            if warmup_look_outliers:
+                logger.info("[per-image LR] the look warm-up is off - the optimizer sets its own rate")
+            adaptive_lr = warmup_look_outliers = False
+        else:
+            if per_image_lr or warmup_look_outliers:
+                logger.info("[per-image LR] per-image LR and the look warm-up are off - the optimizer sets its own rate")
+            adaptive_lr = per_image_lr = warmup_look_outliers = False
         logger.info(f"[optimizer] {opt_label} owns the learning rate from here ({learning_rate:.2e} is its start); "
                     f"the LR scheduler stands down")
+    box_learning_rate = learning_rate   # the Learning Rate box, before adaptive LR's midpoint (saved for a resume)
     if adaptive_lr:                     # the watcher owns the rate: start at the geometric midpoint of Min/Max
         learning_rate = math.sqrt(adaptive_lr_min * adaptive_lr_max)
         for g in optimizer.param_groups:
             g["lr"] = learning_rate
         logger.info(f"[adaptive_lr] ENABLED - start_lr={learning_rate:.3e} min_lr={adaptive_lr_min:.3e} "
                     f"max_lr={adaptive_lr_max:.3e} (the Learning Rate box is ignored)")
-    adaptive = AdaptiveLR(adaptive_lr_min, adaptive_lr_max) if adaptive_lr else None
+    adaptive = (AdaptiveLR(adaptive_lr_min, adaptive_lr_max, clip_signal=desc.adaptive_lr_clip_signal)
+                if adaptive_lr else None)
     ema = None
-    if ema_decay and ema_decay > 0:
+    if str(ema_decay).lower().startswith("short"):
+        # short-run mode (from H3): the normal ramp never reaches 0.98 on a short run, so the window is sized to the
+        # run instead - decay 1 - 4/steps (about the last quarter), fast ramp
+        from fizgig.training.ema import EMAWeights
+        _total = max(1, int(group.num_train_items) * max(1, int(max_train_epochs)))
+        ema_decay = min(0.995, max(0.5, 1.0 - 4.0 / _total))
+        ema = EMAWeights(net, ema_decay, ramp=2)
+        logger.info(f"[ema] SHORT-RUN mode: {_total} steps -> decay {ema_decay:.3f} (window ~ a quarter of the run), "
+                    f"fast ramp - checkpoints and previews use the average")
+    elif ema_decay and float(ema_decay) > 0:
         from fizgig.training.ema import EMAWeights
         ema = EMAWeights(net, float(ema_decay))
-        logger.info(f"[ema] ON at decay {ema_decay:g} - checkpoints and previews use the running average")
+        logger.info(f"[ema] ON at decay {float(ema_decay):g} - checkpoints and previews use the running average")
 
     start_epoch = global_step = 0
     if resume_state_dir:
-        start_epoch, global_step, meta = _load_state(resume_state_dir, net, optimizer, device, arch)
+        _fresh_lrs = [g["lr"] for g in optimizer.param_groups] if optimizer is not None else []
+        start_epoch, global_step, meta = _load_state(resume_state_dir, net, optimizer, device, arch,
+                                                     untagged_own=desc.resumes_untagged_states, driver=driver)
+        if global_step is None:
+            global_step = start_epoch * steps_per_epoch
+        elif int(meta.get("batch_size", 1)) != bsz:
+            # it trained at another Batch size (moved to or from a pod that batches): a state is an epoch end, so the
+            # steps so far are its epochs at this run's steps per epoch - the LR schedule carries on from there
+            logger.info(f"[resume] it trained {meta.get('batch_size', 1)} picture(s) a step and goes on at {bsz}: "
+                        f"step {global_step} -> {start_epoch * steps_per_epoch}")
+            global_step = start_epoch * steps_per_epoch
         if adaptive:
             adaptive.load_state_dict(meta.get("adaptive_lr_state"))
+        if (optimizer is not None and meta.get("own_state") and not meta.get("fresh_optimizer")
+                and not owns_its_rate(optimizer)):
+            resume_lr(optimizer, _fresh_lrs, meta, box_learning_rate, adaptive)
         if ema is not None and meta["own_state"] and os.path.exists(os.path.join(resume_state_dir, "ema.pt")):
-            ema.load_state_dict(torch.load(os.path.join(resume_state_dir, "ema.pt"), map_location="cpu"))
+            _esd = torch.load(os.path.join(resume_state_dir, "ema.pt"), map_location="cpu")
+            if meta.get("legacy_perm"):     # an older trainer's order, as the optimizer's
+                _sh = [None] * len(_esd["shadow"])
+                for _i, _t in enumerate(_esd["shadow"]):
+                    _sh[meta["legacy_perm"][_i]] = _t
+                _esd["shadow"] = _sh
+            ema.load_state_dict(_esd)
         logger.info(f"[resume] from {resume_state_dir}: continuing at epoch {start_epoch + 1}/{max_train_epochs}")
     from fizgig.families.loss_watch import Watch
     watch = Watch(output_dir, group, user_config, driver, log=log_per_image_loss, per_image_lr=per_image_lr,
                   auto_recaption=auto_recaption, warmup_look=warmup_look_outliers,
                   resume=bool(resume_state_dir), start_epoch=start_epoch, te_path=te_path,
                   trigger_word=trigger_word, trigger_position=trigger_position,
+                  recaption_triggers=json.loads(recaption_triggers) if recaption_triggers else None,
                   recaption_instruction=recaption_instruction,
-                  recaption_instruction_detailed=recaption_instruction_detailed, captioner_path=captioner)
+                  recaption_instruction_detailed=recaption_instruction_detailed, captioner_path=captioner,
+                  recaption_task=recaption_task, recaption_task_detailed=recaption_task_detailed)
     # Gradient accumulation (Krea 2's rule): N micro-batches average into one update - each loss is divided by N, the
     # optimizer steps every N and at every epoch end (a partial group is flushed), so updates per epoch are
     # ceil(steps / N) and the schedule runs in those updates. Sliders already backpropagate two poles per step: 1.
@@ -954,6 +2071,62 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                 scheduler.step()
 
     last_prompt = [None]
+    slider_history = []                     # [{epoch, prompts, guidance}] - each live change, for the saved metadata
+    anchor_losses = []                      # this epoch's anchor losses (a prompt slider with anchors)
+
+    def slider_live(done):
+        """A prompt slider's new prompts (the web UI's Slider prompts panel), taken at an epoch boundary: the poles
+        encoded again, and a new base renders a new practice bank and becomes the previews' prompt. Training goes on
+        from where it is, toward the new ends."""
+        nonlocal slider_prompts, slider_guidance, slider_enc, encoded, sample_prompts, slider_anchors, anchor_enc
+        new = _read_slider_live(output_dir) if slider_prompts else None
+        if new is None:
+            return
+        # each end is the base and its own words, as the launch builds them (families/launch.py)
+        prompts = [new["base"], f"{new['base']} {new['pos']}", f"{new['base']} {new['neg']}"]
+        if (prompts == [str(x) for x in slider_prompts] and new["guidance"] == float(slider_guidance)
+                and new["anchors"] == list(slider_anchors)):
+            return
+        base_changed = prompts[0] != str(slider_prompts[0])
+        logger.info("[slider] new prompts from epoch %d: base '%s' | +1 -> '%s' | -1 -> '%s' (guidance %g)%s",
+                    done + 1, *prompts, new["guidance"],
+                    f" | anchors: {' | '.join(new['anchors'])}" if new["anchors"] else " | no anchors")
+        parked = []
+        try:
+            enc = _encode_override(driver, te_path, prompts + new["anchors"], dit, device, parkable=not swapped)
+            _all = [{k: v[None] for k, v in c.items()} for c in enc]
+            slider_enc, anchor_enc = _all[:3], _all[3:]
+            if base_changed:
+                if desc.preview_park_optimizer and optimizer is not None:     # room for the renders, as previews do
+                    for st in optimizer.state.values():
+                        for k, v in st.items():
+                            if torch.is_tensor(v) and v.is_cuda:
+                                st[k] = v.to("cpu")
+                                parked.append((st, k))
+                    torch.cuda.empty_cache()
+                render_bank()
+            # the previews followed the old base (and its first anchor): they follow the new ones
+            if prompts[0] and sample_prompts == [str(slider_prompts[0])] + list(slider_anchors[:1]):
+                sample_prompts = [prompts[0]] + new["anchors"][:1]
+                if encoded is not None and not sample_reference and not (sample_image and desc.preview_image):
+                    encoded = [enc[0]] + enc[3:4]           # text-only previews: the new prompts' own encodings
+        except Exception as exc:
+            logger.warning(f"[slider] could not take the new prompts ({type(exc).__name__}: {str(exc)[:200]}) - "
+                           "training goes on with the ones it had", exc_info=True)
+            return
+        finally:
+            for st, k in parked:
+                st[k] = st[k].to(device)
+        slider_prompts, slider_guidance, slider_anchors = prompts, new["guidance"], new["anchors"]
+        slider_history.append({"epoch": done, "prompts": prompts, "guidance": new["guidance"],
+                               "anchors": new["anchors"]})
+        try:
+            with open(os.path.join(output_dir, SLIDER_LIVE_APPLIED), "w", encoding="utf-8") as f:
+                json.dump({"epoch": done, "base": new["base"], "pos": new["pos"], "neg": new["neg"],
+                           "guidance": new["guidance"], "anchors": new["anchors"],
+                           "practice_rerendered": base_changed, "at": time.time()}, f)
+        except OSError:
+            pass
 
     def metadata(epoch):
         thumb = None if (metadata_thumbnail or "").lower() in ("off", "none") else (
@@ -975,16 +2148,36 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
         if context_lora_path:
             md.update({"ss_context_lora": os.path.basename(context_lora_path),
                        "ss_context_lora_strength": str(context_lora_strength)})
+        if reg_keys:                         # trained beside a regularisation set (a LoRA's, the Subjects card's)
+            md.update({"ss_fizgig_reg_images": str(len(reg_keys)),
+                       "ss_fizgig_reg_lr_multiplier": f"{float(reg_lr_multiplier):g}"})
         if slider:
             # the deploy contract: strength is the dial (-1 one pole, +1 the other); tools read this
             md.update({"ss_slider": "prompt_pairs" if slider_prompts else "image_pairs"})
             if slider_prompts:
                 md.update({"ss_slider_prompts": json.dumps([str(x) for x in slider_prompts]),
                            "ss_slider_guidance": f"{float(slider_guidance):g}"})
+                if slider_anchors:
+                    md.update({"ss_slider_anchors": json.dumps(list(slider_anchors)),
+                               "ss_slider_anchor_weight": f"{float(slider_anchor_weight):g}"})
+                if slider_history:          # the prompts it was steered through, from which epoch
+                    md.update({"ss_slider_prompt_history": json.dumps(slider_history)})
             else:
                 md.update({"ss_slider_diff_weight": f"{float(slider_diff_weight):g}"})
         if train_blocks:
             md.update({"ss_train_blocks": ",".join(train_blocks)})
+        if masked_training:
+            md.update({"ss_masked_training": "True", "ss_mask_floor": f"{float(mask_floor):g}",
+                       "ss_masked_images": str(masked_images)})
+            if mask_prior:
+                md["ss_mask_prior"] = f"{mask_prior:g}"
+        if face_on:
+            md["ss_face_weight"] = f"{float(face_weight):g}"
+            md["ss_face_area"] = str(face_area or "face")
+            md["ss_face_cycle"] = f"{_face_cyc[0]}:{_face_cyc[1]}"
+            if any(_face_end):
+                md["ss_face_until"] = f"{_face_end[0]}:{_face_end[1]}"
+        md.update(driver.run_metadata())
         return md
 
     def save_lora(path, epoch):
@@ -1000,36 +2193,363 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                 ema.swap_out()
         logger.info(f"[save] {path}")
 
+    previews_off = [False]
+
     def previews(epoch):
-        if encoded is None:
+        """The epoch's previews. A preview that fails (out of memory, say) switches previews off for the rest of the
+        run and training carries on, as the original Krea 2 trainer did: a picture is never worth the run."""
+        if encoded is None or previews_off[0]:
             return
-        conds, w, h, sd, prompts = encoded, sample_width, sample_height, sample_seed, sample_prompts
+        parked = []
+        try:
+            if desc.preview_park_optimizer and optimizer is not None:
+                for st in optimizer.state.values():
+                    for k, v in st.items():
+                        if torch.is_tensor(v) and v.is_cuda:
+                            st[k] = v.to("cpu")
+                            parked.append((st, k))
+                if parked:
+                    torch.cuda.empty_cache()
+                    logger.info(f"[preview] {len(parked)} optimizer tensors parked on CPU for the preview")
+            _previews(epoch)
+        except Exception as exc:
+            previews_off[0] = True
+            logger.warning(f"[previews] the epoch {epoch} preview failed ({type(exc).__name__}: {str(exc)[:200]}) - "
+                           f"previews are off for the rest of this run; training continues", exc_info=True)
+            gc.collect()
+            torch.cuda.empty_cache()
+        finally:
+            for st, k in parked:            # the next training step needs it back, whatever happened
+                st[k] = st[k].to(device)
+
+    ov_cache = [None, None]                  # the override's prompts and their encoding, kept while they don't change
+
+    def _preview_due(done):
+        """This epoch previews, by the launch cadence or the live override's (the Samples tab, changed mid-run)."""
+        every, until, after = sample_every_n_epochs, sample_until_epoch, sample_every_n_epochs_after
         ov = _read_sample_override(output_dir)
         if ov:
-            logger.info(f"[sample override] active - '{ov['prompt'][:60]}' seed={ov['seed']} {ov['width']}x{ov['height']}")
+            every = ov["every"] if ov.get("every") else every
+            until = ov["until"] if ov.get("until") is not None else until
+            after = ov["after"] if ov.get("after") is not None else after
+        return preview_due(done, every, until, after)
+    speed_bad = [False]                      # the speed LoRA matched no layers: not tried again
+    ck_tried = [None]                        # the preview checkpoint a live change last asked for
+    compared = [0]                           # the helper's last Check picture request this run answered
+
+    def _previews(epoch):
+        conds, w, h, sd, prompts = encoded, sample_width, sample_height, sample_seed, sample_prompts
+        steps_now, cfg_now, ask_steps, ask_cfg = sample_steps, sample_cfg_scale, asked_steps, asked_cfg
+        speed_now = speed_desc.settings if (speed_lora and speed_desc) else None
+        base_strength = (speed_desc.strength if speed_lora_strength is None else speed_lora_strength) \
+            if speed_now is not None else 0
+        strength_now = base_strength
+        ov = _read_sample_override(output_dir)
+        if ov and slider:       # a slider preview is its own prompt across strengths: an override never applies
+            logger.info("[sample override] ignored - slider previews always show the slider's own prompt")
+            ov = None
+        if ov:
+            logger.info(f"[sample override] active - {len(ov['prompts'])} prompt(s), '{ov['prompt'][:60]}' "
+                        f"seed={ov['seed']} {ov['width']}x{ov['height']}")
             try:
-                conds = _encode_override(driver, te_path, ov["prompt"], dit, device, parkable=not swapped,
-                                         references=ref_imgs)
-                sd, prompts = ov["seed"], [ov["prompt"]]
+                if ov_cache[0] != ov["prompts"]:     # encoded again only when the prompts changed
+                    ov_cache[:] = [list(ov["prompts"]), _encode_override(driver, te_path, ov["prompts"], dit, device,
+                                                                         parkable=not swapped, references=ref_imgs)]
+                conds = ov_cache[1]
+                sd, prompts = ov["seed"], list(ov["prompts"])
+                if ov.get("steps"):
+                    steps_now = ask_steps = ov["steps"]
+                if ov.get("cfg") is not None:
+                    cfg_now = ask_cfg = ov["cfg"]
+                if ov.get("turbo") is not None:
+                    if speed_now is None and ov["turbo"] > 0:
+                        logger.info("[sample override] Turbo strength ignored - no Turbo LoRA file is set in "
+                                    "Preferences for this run")
+                    elif speed_now is not None:
+                        strength_now = ov["turbo"]
                 if not ref_imgs:        # an edit keeps the reference's canvas: its latents are already encoded
                     w, h = ov["width"], ov["height"]
-                    if lowmem and max(w, h) > 768:
-                        w, h = _cap_canvas(w, h)
+                    if canvas_cap and max(w, h) > canvas_cap:
+                        w, h = _cap_canvas(w, h, canvas_cap)
             except Exception:
                 logger.exception("[sample override] could not encode the override prompt - using the configured ones")
                 conds = encoded
         if not sd:          # seed 0 = a fresh random seed every preview round, as on the other trainers
             sd = random.randint(1, 2 ** 31 - 1)
-        _render_previews(driver, dit, net, vae, conds, sample_dir, epoch, output_name=output_name,
-                         steps=sample_steps, cfg=sample_cfg_scale, neg=neg, width=w, height=h,
-                         seed=sd, ema=ema,
-                         speed=speed_desc.settings if (speed_lora and speed_desc) else None, lowmem=lowmem,
-                         swapped=bool(swapped), refs=ref_latents, slider=slider)
-        last_prompt[0] = prompts[-1] if prompts else None
+        if cfg_now and cfg_now > 1.0 and neg is None:
+            # CFG asked for mid-run on a run that has no negative encoded (a CFG-free family): render without it
+            logger.warning(f"[sample] CFG {cfg_now:g} needs a negative prompt this run did not encode - this preview "
+                           "renders at CFG 1")
+            cfg_now = 1.0
+        nonlocal ckpt_previews
+        on_ck = ckpt_previews is not None
+        if ov and ov.get("checkpoint") is not None and not slider and encoded is not None:
+            # the Samples tab's preview-model tick, changed while the run goes: unticked = this round on the training
+            # model (with the tab's own steps and CFG), ticked = on the checkpoint, loaded the first time it's asked for
+            want = ov["checkpoint"]
+            if not want:
+                on_ck = False
+            elif ckpt_previews is None or os.path.normcase(ckpt_previews.path) != os.path.normcase(want):
+                if ck_tried[0] != want:         # asked once per file: a run that can't take it says so once
+                    ck_tried[0] = want
+                    ckpt_previews = _make_ckpt_previews(want) or ckpt_previews
+                on_ck = ckpt_previews is not None and os.path.normcase(ckpt_previews.path) == os.path.normcase(want)
+        if speed_now is not None:       # the Turbo LoRA at this round's strength; 0 = this round without it
+            if strength_now <= 0:
+                speed_now = None
+            elif not on_ck or slider:     # on the training model: loaded the first time it is asked for
+                if net.has(SPEED) or (not speed_bad[0] and _add_speed(strength_now)):
+                    net.set_strength(SPEED, strength_now)
+                else:
+                    speed_bad[0], speed_now = True, None
+            if on_ck and speed_now is not None and ckpt_previews.speed is None:
+                speed_now = None                # the Turbo LoRA was added for the training model's previews
+        if on_ck and not slider:
+            ck = desc.preview_checkpoint_sampling          # the checkpoint's own recipe (Distilled: 4 steps, no CFG)
+            # a checkpoint that takes the speed LoRA (Kromoss): this round with it while its strength is above 0
+            turbo_ck = ckpt_previews.speed is not None and speed_now is not None
+            ck_steps = (steps_now if turbo_ck else (ask_steps or ck.steps))
+            ck_cfg = (cfg_now if turbo_ck else (ck.cfg if ask_cfg is None else ask_cfg))
+            if not turbo_ck and ck.cfg <= 1.0 < ck_cfg:
+                # a guidance-distilled checkpoint (Qwen's Turbo, Klein's Distilled) renders burnt above CFG 1
+                logger.info(f"[sample] {os.path.basename(ckpt_previews.path)} renders at CFG 1 (it's distilled); the "
+                            f"CFG {ck_cfg:g} asked for is for the training model's previews")
+                ck_cfg = 1.0
+            # a helper renders this round on the same checkpoint, from the epoch's LoRA (#339: MOSS-Image's SFT
+            # previews stayed on the training GPU with a helper standing by); Check picture stays on this GPU
+            hp_ck = _helper_previews(output_dir) if not (ref_latents or finetune) else None
+            pcf = desc.preview_checkpoint()
+            if hp_ck and not hp_ck.get("compare") and pcf is not None:
+                rd = os.path.join(output_dir, HELPER_ROUNDS, f"{epoch:06d}")
+                try:
+                    os.makedirs(rd, exist_ok=True)
+                    if ema is not None:
+                        ema.swap_in()
+                    try:
+                        net.save(os.path.join(rd, "lora.safetensors"), dtype=torch.bfloat16)   # as the checkpoint takes it
+                    finally:
+                        if ema is not None:
+                            ema.swap_out()
+                    cpu = lambda x: ({k: cpu(v) for k, v in x.items()} if isinstance(x, dict) else
+                                     [cpu(v) for v in x] if isinstance(x, (list, tuple)) else
+                                     x.detach().cpu() if torch.is_tensor(x) else x)
+                    torch.save({"conds": cpu(conds), "neg": cpu(neg)}, os.path.join(rd, "conds.pt"))
+                    job = {"family": desc.key, "epoch": epoch, "output_name": output_name, "prompts": list(prompts),
+                           "conds": "conds.pt", "negative": (sample_negative or "") if neg is not None else None,
+                           "seed": sd, "width": w, "height": h, "steps": ck_steps, "cfg": ck_cfg,
+                           "turbo": strength_now if turbo_ck else 0.0, "look": 0.0, "strengths": [],
+                           "checkpoint": {"pref_key": pcf[0].pref_key, "name": os.path.basename(ckpt_previews.path),
+                                          "int8": bool(ckpt_previews.int8), "turbo": bool(turbo_ck)},
+                           "network": {"dim": network_dim, "alpha": network_alpha, "type": network_type,
+                                       "factor": lokr_factor, "blocks": None},
+                           "options": dict(family_options or {}), "precision": precision,
+                           "context": [context_lora_path, context_lora_strength] if context_lora_path else None,
+                           "lowmem": False}
+                    with open(os.path.join(rd, "round.json.tmp"), "w", encoding="utf-8") as f:
+                        json.dump(job, f)
+                    os.replace(os.path.join(rd, "round.json.tmp"), os.path.join(rd, "round.json"))
+                    logger.info(f"[sample] epoch {epoch}: previews on {os.path.basename(ckpt_previews.path)} handed to "
+                                f"{hp_ck.get('name') or 'the helper'} - training carries on")
+                    write_mode({"model": os.path.basename(ckpt_previews.path), "steps": ck_steps, "cfg": ck_cfg,
+                                "turbo": speed_desc.name if turbo_ck else "", "strength": strength_now if turbo_ck else 0},
+                               epoch, False, hp_ck.get("name") or "helper")
+                    last_prompt[0] = prompts[-1] if prompts else None
+                    _record_prompts(sample_dir, output_name, epoch, prompts)
+                    return
+                except Exception:
+                    logger.warning("[sample] could not hand the previews to the helper - rendering them here",
+                                   exc_info=True)
+                    shutil.rmtree(rd, ignore_errors=True)
 
-    def state(epoch):
-        _save_state(output_dir, output_name, net, optimizer, epoch=epoch, global_step=global_step, arch_id=arch,
-                    ema=ema, extra={"adaptive_lr_state": adaptive.state_dict()} if adaptive else None)
+            def _ck_render(m, fl, swp):
+                if turbo_ck and not fl.has(SPEED):     # loaded onto the checkpoint the first round that asks for it
+                    fl.add_file(ckpt_previews.speed[0], SPEED, strength_now)
+                    driver.frozen_file_added(m, ckpt_previews.speed[0], strength_now, "speed")
+                if ckpt_previews.speed is not None and fl.has(SPEED):
+                    fl.set_strength(SPEED, strength_now if turbo_ck else 0.0)
+                return _render_previews(
+                    driver, m, fl, vae, conds, sample_dir, epoch, output_name=output_name, steps=ck_steps, cfg=ck_cfg,
+                    neg=neg, width=w, height=h, seed=sd,
+                    # the asked CFG, not the checkpoint's own: _render_previews reads CFG 1 as "the recipe's"
+                    speed=speed_desc.settings if turbo_ck else dataclasses.replace(ck, cfg=ck_cfg),
+                    swapped=bool(swp), refs=ref_latents)
+            ckpt_previews.render(dit, net, ema, _ck_render)
+            write_mode({"model": os.path.basename(ckpt_previews.path), "steps": ck_steps, "cfg": ck_cfg,
+                        "turbo": speed_desc.name if turbo_ck else "", "strength": strength_now if turbo_ck else 0},
+                       epoch)
+            last_prompt[0] = prompts[-1] if prompts else None
+            _record_prompts(sample_dir, output_name, epoch, prompts)
+            return
+        hp = _helper_previews(output_dir) if not (slider or ref_latents or finetune) else None
+        compare = None  # Check picture: this round renders here too, and the helper's is compared with it
+        if hp and hp.get("compare") and hp["compare"] == compared[0]:
+            hp = {**hp, "compare": 0}                   # that request was this run's already
+        if hp:          # a helper renders this round from the epoch's LoRA, with the same setup: training goes on
+            lp, ls = ((ov["look"], ov.get("look_strength")) if ov and ov.get("look") is not None
+                      else (preview_lora, preview_lora_strength))
+            look_on = bool(lp) and look_said[0] != "bad"   # ticked: the helper fetches its own copy if need be
+            if hp.get("compare"):                           # Check picture: exactly as this GPU renders it now
+                look_on = bool(_look_ready(lp, ls)) if lp else False
+            rd = os.path.join(output_dir, HELPER_ROUNDS, f"{epoch:06d}")
+            try:
+                os.makedirs(rd, exist_ok=True)
+                if ema is not None:
+                    ema.swap_in()
+                try:
+                    # exactly what trains; half the size (bf16) for a helper on a slow link (the lead measures it)
+                    net.save(os.path.join(rd, "lora.safetensors"),
+                             dtype=torch.bfloat16 if hp.get("dtype") == "bf16" else torch.float32)
+                finally:
+                    if ema is not None:
+                        ema.swap_out()
+                # the encoded prompts too: the helper needs no text encoder, and conditions exactly as here
+                cpu = lambda x: ({k: cpu(v) for k, v in x.items()} if isinstance(x, dict) else
+                                 [cpu(v) for v in x] if isinstance(x, (list, tuple)) else
+                                 x.detach().cpu() if torch.is_tensor(x) else x)
+                torch.save({"conds": cpu(conds), "neg": cpu(neg)}, os.path.join(rd, "conds.pt"))
+                job = {"family": desc.key, "epoch": epoch, "output_name": output_name, "prompts": list(prompts),
+                       "conds": "conds.pt",
+                       "negative": (sample_negative or "") if neg is not None else None, "seed": sd,
+                       "width": w, "height": h, "steps": steps_now, "cfg": cfg_now,
+                       "turbo": strength_now if speed_now is not None else 0.0,
+                       "look": (ls or preview_lora_strength) if look_on else 0.0,
+                       "strengths": list(sample_strengths) if epoch > 0 else [],
+                       "network": {"dim": network_dim, "alpha": network_alpha, "type": network_type,
+                                   "factor": lokr_factor, "blocks": sorted(train_blocks) if train_blocks else None},
+                       "options": dict(family_options or {}),
+                       "precision": precision, "context": [context_lora_path, context_lora_strength]
+                       if context_lora_path else None, "lowmem": bool(lowmem)}
+                if hp.get("compare"):
+                    compared[0] = hp["compare"]
+                    compare = (rd, job)
+                    raise _Compare
+                with open(os.path.join(rd, "round.json.tmp"), "w", encoding="utf-8") as f:
+                    json.dump(job, f)
+                os.replace(os.path.join(rd, "round.json.tmp"), os.path.join(rd, "round.json"))
+                logger.info(f"[sample] epoch {epoch}: previews handed to {hp.get('name') or 'the helper'} "
+                            "- training carries on")
+                last_prompt[0] = prompts[-1] if prompts else None
+                _record_prompts(sample_dir, output_name, epoch, prompts)
+                write_mode({"model": "", "steps": steps_now, "cfg": cfg_now,
+                            "turbo": speed_desc.name if speed_now else "",
+                            "strength": strength_now if speed_now else 0}, epoch, look_on, hp.get("name") or "helper")
+                return
+            except _Compare:
+                logger.info(f"[sample] epoch {epoch}: Check picture - rendered here and on "
+                            f"{hp.get('name') or 'the helper'}, to compare")
+            except Exception:
+                logger.warning("[sample] could not hand the previews to the helper - rendering them here",
+                               exc_info=True)
+                shutil.rmtree(rd, ignore_errors=True)
+        local = _render_previews(driver, dit, net, vae, conds, sample_dir, epoch, output_name=output_name,
+                         steps=steps_now, cfg=cfg_now, neg=neg, width=w, height=h,
+                         seed=sd, ema=ema,
+                         speed=speed_now, lowmem=lowmem,
+                         swapped=bool(swapped), refs=ref_latents, slider=slider,
+                         strengths=sample_strengths if epoch > 0 else (),   # before training the LoRA is all zero
+                         look=(look_now := (_look_ready() if not ov or ov.get("look") is None   # as launched
+                                            else ov["look"] != "" and _look_ready(ov["look"], ov.get("look_strength")))))
+        if compare is not None:     # the helper's copy of this round, for Check picture (not for the gallery)
+            rd, job = compare
+            job["compare"] = [os.path.abspath(p) for p in local]
+            with open(os.path.join(rd, "round.json.tmp"), "w", encoding="utf-8") as f:
+                json.dump(job, f)
+            os.replace(os.path.join(rd, "round.json.tmp"), os.path.join(rd, "round.json"))
+        last_prompt[0] = prompts[-1] if prompts else None
+        _record_prompts(sample_dir, output_name, epoch, prompts)
+        write_mode({"model": "", "steps": steps_now, "cfg": cfg_now, "turbo": speed_desc.name if speed_now else "",
+                    "strength": strength_now if speed_now else 0}, epoch, look_now)
+
+    def _make_ckpt_previews(path):
+        """Previews on this preview checkpoint, or None (with the reason logged): at the start, or when the Samples
+        tab's tick turns it on mid-run."""
+        if not desc.train_preview_checkpoint:
+            logger.warning(f"[sample] {desc.display_name} has no checkpoint previews - ignoring --preview_checkpoint")
+        elif finetune:      # the checkpoint carries a LoRA; a fine-tune changes the model itself, so it previews on that
+            logger.info("[sample] a fine-tune previews on the model it trains, not the preview checkpoint")
+        elif not os.path.isfile(path):
+            logger.warning(f"[sample] preview checkpoint {path} not found - previews use the training model")
+        else:
+            from fizgig.families.base_check import checkpoint_takes_speed
+            ck_speed = speed_lora if (speed_lora and speed_desc and checkpoint_takes_speed(desc, path)) else None
+            if ck_speed:
+                logger.info(f"[sample] {os.path.basename(path)} takes the {speed_desc.name}: previews on it use it "
+                            f"while its strength is above 0")
+            return _CheckpointPreviews(
+                driver, path, device, preview_checkpoint_cache, preview_int8,
+                context=(context_lora_path, context_lora_strength) if context_lora_path else None,
+                speed=(ck_speed, speed_desc.strength if speed_lora_strength is None else speed_lora_strength)
+                if ck_speed else None)
+        return None
+
+    ckpt_previews = _make_ckpt_previews(preview_checkpoint) if (preview_checkpoint and encoded is not None) else None
+    def write_mode(mode, epoch=None, look=False, helper=""):
+        """What this run's previews render with now, for the gallery (<sample_dir>/.previews_<name>.json): written at
+        the start and after each preview round, so a live change of steps, CFG or Turbo strength shows. After a round
+        (`epoch`) its setup joins `rounds` (epoch -> checkpoint / look / turbo), so each picture keeps its own."""
+        if mode.get("turbo") and speed_desc is not None and speed_desc.gallery_note:
+            mode = {**mode, "turbo_note": speed_desc.gallery_note}     # the family's word on its Turbo previews
+        path = os.path.join(sample_dir, f".previews_{output_name}.json")
+        try:
+            with open(path, encoding="utf-8") as f:
+                rounds = json.load(f).get("rounds") or {}               # this run's earlier rounds (a resume's too)
+        except (OSError, ValueError, AttributeError):
+            rounds = {}
+        if epoch is not None:
+            rounds[str(epoch)] = {"checkpoint": bool(mode.get("model")), "look": bool(look),
+                                  **({"small": f"{sample_width} × {sample_height}"} if small_from else {}),
+                                  "turbo": bool(mode.get("turbo")), **({"helper": helper} if helper else {})}
+        mode = {**mode, "family": desc.key, "rounds": rounds}
+        try:
+            os.makedirs(sample_dir, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(mode, f)
+        except OSError as e:
+            logger.warning(f"[sample] could not record the preview settings ({e})")
+
+    if encoded is not None:         # what this run's previews render with, at the start
+        if ckpt_previews is not None and not slider:
+            ck = desc.preview_checkpoint_sampling
+            mode = {"model": os.path.basename(preview_checkpoint), "turbo": "",
+                    "steps": asked_steps or (ck.steps if ck else sample_steps),
+                    "cfg": (ck.cfg if ck else sample_cfg_scale) if asked_cfg is None
+                    else (1.0 if ck and ck.cfg <= 1.0 else asked_cfg)}
+            if ckpt_previews.speed is not None and not speed_idle:
+                mode.update(turbo=speed_desc.name, strength=ckpt_previews.speed[1], steps=sample_steps,
+                            cfg=sample_cfg_scale)
+        else:
+            mode = {"model": "", "steps": sample_steps, "cfg": sample_cfg_scale,
+                    "turbo": speed_desc.name if (speed_lora and speed_desc and not speed_idle) else "",
+                    "strength": (speed_desc.strength if speed_lora_strength is None else speed_lora_strength)
+                    if (speed_lora and speed_desc and not speed_idle) else 0}
+        write_mode(mode)
+
+    def state(epoch, required=False):
+        """Save the resume state. A failed write (a full disk, or a sync / antivirus program holding the file) is
+        retried once, then only warned about: the epoch's LoRA is already saved, and the state only serves a resume.
+        A pause needs it (required=True), so there the second failure stops the run."""
+        for attempt in (1, 2):
+            try:
+                _save_state(output_dir, output_name, net, optimizer, epoch=epoch, global_step=global_step,
+                            arch_id=arch, ema=ema,
+                            extra={"learning_rate": box_learning_rate,
+                                   **({"adaptive_lr_state": adaptive.state_dict()} if adaptive else {}),
+                                   **({"batch_size": bsz} if bsz > 1 else {})})
+                return True
+            except (OSError, RuntimeError) as e:
+                if attempt == 2 and required:
+                    raise
+                if attempt == 1:
+                    logger.warning(f"[state] saving the epoch {epoch} resume state failed ({e}) - trying again")
+                    time.sleep(5)
+                else:
+                    # a half-written state must not count as the newest when states are pruned
+                    shutil.rmtree(os.path.join(output_dir, f"{output_name}-{epoch:06d}-state"), ignore_errors=True)
+                    logger.warning(f"[state] the epoch {epoch} resume state could not be saved ({e}). Training "
+                                   f"carries on and the epoch's LoRA is saved; only resuming from this epoch is "
+                                   f"lost. Check free disk space, and keep the output folder out of OneDrive / "
+                                   f"Dropbox sync: {output_dir}")
+        return False
 
     if sample_at_first and start_epoch == 0:
         previews(ftr.epochs_done if ftr is not None else 0)
@@ -1038,103 +2558,642 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
     gen = torch.Generator().manual_seed(seed + start_epoch)
     pause_flag = os.path.join(output_dir, ".pause_requested")
     recorder = LossRecorder()
+    # the web UI's loss graph: each step's loss, numbered across a resume / a fine-tune's continuation
+    step_off = ftr.epochs_done * steps_per_epoch if ftr is not None else 0
+    steplog = StepLog(output_dir, output_name, start_step=step_off + global_step)
+    for _w in ("sample", "save"):          # a request left from an earlier run is not this one's
+        take_request(output_dir, _w)
+    # a test setting, ignored unless set: FIZGIG_TEST_VRAM_CAP_GB caps this process's VRAM (a real CUDA out-of-memory
+    # where Windows would otherwise spill into shared memory), from step FIZGIG_TEST_VRAM_CAP_AT_STEP (default 0)
+    test_cap = _test_vram_cap(device)
     progress = tqdm(total=steps_per_epoch * max_train_epochs, initial=global_step, desc="steps", smoothing=0)
+    between = [None]          # when the last epoch's steps ended: the time until the next epoch's is left out of s/it
     dit.train()
     pending = 0                            # micro-batches backpropagated since the last optimizer step
+    lr_acc = []                            # this window's per-step LR multipliers (driver.step_policy)
+
+    _block_params = {}
+
+    def _step_freeze(blocks):
+        """requires_grad off for the trainable adapter's parameters in `blocks` (block ids) - under a fine-tune, the
+        active window's weights in those blocks; returns them."""
+        if not blocks:
+            return []
+        if ftr is not None:
+            out = [p for p in ftr.be.params_in_blocks(blocks) if p.requires_grad]
+            for p in out:
+                p.requires_grad_(False)
+            return out
+        if not _block_params:
+            from fizgig.families.lora import TRAINABLE as _TR
+            for _full, _w in net.wrapped.items():
+                if _TR in _w.adapters:
+                    _block_params.setdefault(driver.block_of(_full), []).extend(_w.adapters[_TR].parameters())
+        out = [p for b in blocks for p in _block_params.get(b, ())]
+        for p in out:
+            p.requires_grad_(False)
+        return out
+
+    def _share_combine(sn):
+        """The helper's share back: start + this GPU's change + the helper's (what one GPU would have moved over the
+        whole epoch, give or take both halves starting from the same point). If it doesn't come back in time, the
+        round's epochs it held are returned: this GPU then trains those images itself, so every image still trains
+        every epoch."""
+        from safetensors.torch import load_file, save_file
+        took = time.time() - sn["t0"]
+        _write_json(os.path.join(sn["dir"], "lead.json"), {"steps": sn["steps"], "seconds": round(took, 1)})
+        theirs = os.path.join(sn["dir"], "theirs.safetensors")
+        deadline, cap = time.time() + max(120.0, 3 * took), time.time() + 900
+        if not os.path.exists(theirs):
+            logger.info(f"[share] epoch {sn['epoch']}: waiting for {sn['name']}'s share")
+        while not os.path.exists(theirs) and time.time() < min(deadline, cap):
+            if os.path.exists(os.path.join(sn["dir"], "failed.json")):
+                break
+            _f = _helper_share(output_dir)              # still sending, training or handing it back: wait on
+            if _f and int(_f.get("busy") or 0) == sn["epoch"]:
+                deadline = max(deadline, time.time() + 60)
+            time.sleep(0.5)
+        # closed: whatever arrives for this round from now on is too late (the helper's side drops it)
+        _write_json(os.path.join(sn["dir"], "closed.json"), {"at": time.time()})
+        try:
+            if not os.path.exists(theirs):
+                logger.warning(f"[share] epoch {sn['epoch']}: {sn['name']}'s share didn't come back - this GPU "
+                               "trains its images too")
+                return list(range(sn["epoch"], sn["last"] + 1))
+            mine = net.state_dict(torch.float32)
+            try:
+                th = load_file(theirs)                  # the helper's change over the round
+                bad = next((k for k, v in th.items() if k not in mine or v.shape != mine[k].shape
+                            or not torch.isfinite(v).all()), None)
+            except Exception as e:
+                th, bad = None, f"unreadable ({e})"
+            if th is None or bad is not None:
+                logger.warning(f"[share] epoch {sn['epoch']}: {sn['name']}'s share came back wrong ({bad}) - this "
+                               "GPU trains its images too")
+                return list(range(sn["epoch"], sn["last"] + 1))
+            comb = {k: (v + th[k].float()) if k in th else v for k, v in mine.items()}
+            save_file(comb, os.path.join(sn["dir"], "combined.safetensors"))
+            before = [p.detach().float().clone() for p in ema.params] if ema is not None else None
+            net.load_trainable(os.path.join(sn["dir"], "combined.safetensors"))
+            if ema is not None:          # the average moves by the helper's change too, or saves and previews (made
+                with torch.no_grad():    # from it) would hold only this GPU's half of the round
+                    for sh, p, b in zip(ema.shadow, ema.params, before):
+                        sh.add_(p.detach().float().to(sh.device) - b.to(sh.device))
+            logger.info(f"[share] epoch {sn['epoch']}: combined - {sn['steps']} images here, the rest on {sn['name']} "
+                        f"(waited {max(0.0, time.time() - sn['t0'] - took):.0f} s for it)")
+            return []
+        finally:
+            for n in ("start.safetensors", "combined.safetensors", "theirs.safetensors"):
+                try:
+                    os.remove(os.path.join(sn["dir"], n))
+                except OSError:
+                    pass
+
+    last_gn = [None]
+    # A step's numbers (its loss, each picture's loss, the grad norm) reach the CPU one step late: copied without
+    # waiting (the caching host allocator gives a pinned buffer) and read at the next step's record point, by when
+    # the GPU has finished them. Reading them at once (.item(), float()) made the CPU wait for the GPU at the end of
+    # every step, so the next step's loading and set-up couldn't overlap its work (#221, from OneTrainer's
+    # one-step-behind loss read). Flushed at the epoch's end, before anything reads the records.
+    lag = []
+
+    live_rate = [None]          # the last live rate read (every 20 steps): the bar's for an optimizer owning its rate
+
+    def _step_rate(raw=False):
+        """The rate the step applied: the optimizer's (Automagic v4: its working rate, rate x mean brake, #353), or
+        under a fine-tune's free-each-gradient - one optimizer per weight, none to read (#312) - the stepper's rate
+        times this step's multiplier. raw (the bar, every step): the group rate, read without a GPU sync - except
+        for an optimizer that owns its rate (Automagic, Prodigy), whose group rate is only its start: the last live
+        rate read instead (#353: the run card showed the Learning rate box's value)."""
+        if optimizer is not None:
+            if raw:
+                if owns_its_rate(optimizer) and live_rate[0] is not None:
+                    return live_rate[0]
+                return float(optimizer.param_groups[0]["lr"])
+            live_rate[0] = shown_lr(optimizer)
+            return live_rate[0]
+        if ftr is not None and ftr.fused is not None:
+            return float(ftr.fused.lr) * float(ftr.fused.scale)
+        return float(learning_rate)
+
+    def _later(fn, **vals):
+        """Call fn(**vals as Python numbers / lists) one step from now, without waiting for the GPU now."""
+        cpu = {k: (v.detach().to("cpu", non_blocking=True) if torch.is_tensor(v) and v.is_cuda else v)
+               for k, v in vals.items()}
+        ev = None
+        if any(torch.is_tensor(v) and v.is_cuda for v in vals.values()):
+            ev = torch.cuda.Event()
+            ev.record()
+        lag.append((ev, fn, cpu))
+
+    def _flush():
+        while lag:
+            ev, fn, cpu = lag.pop(0)
+            if ev is not None:
+                ev.synchronize()
+            fn(**{k: (v.tolist() if torch.is_tensor(v) else v) for k, v in cpu.items()})
+
+    def _gn_done(gn, clip):
+        last_gn[0] = float(gn)             # the run card's Grad norm
+        if clip:
+            adaptive.record_clip(gn, max_grad_norm)
 
     def _update():
         nonlocal pending
         if ftr is not None and ftr.fused is not None:
             pending = 0                    # every parameter already stepped from its own gradient hook
+            lr_acc.clear()
             return
         if max_grad_norm:
-            torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
+            pre = torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
+            _later(_gn_done, gn=pre, clip=bool(adaptive is not None and adaptive.clip_signal))   # read next step
+        m = sum(lr_acc) / len(lr_acc) if lr_acc else 1.0
+        lr_acc.clear()
+        if optimizer.__class__.__name__ in ("Automagic3", "Automagic4"):
+            m = 1.0                        # Automagic owns the rate (as on the old H3 trainer); Prodigy's lr is a
+            #                                multiplier, so a step policy's or LR boost's scale composes into it
+        if m != 1.0:                       # the window's mean, composed into the LR for this step only (never the loss:
+            held = [g["lr"] for g in optimizer.param_groups]        # Adam is invariant to a constant on the gradient)
+            for g in optimizer.param_groups:
+                g["lr"] = g["lr"] * m
         optimizer.step()
-        if scheduler is not None:
+        if m != 1.0:
+            for g, lr in zip(optimizer.param_groups, held):
+                g["lr"] = lr
+        driver.after_optimizer_step()
+        if scheduler is not None and not catching[0]:
             scheduler.step()
         if ema is not None:
             ema.update()                   # after the clipped step, so the average tracks what was applied
         pending = 0
 
-    for epoch in range(start_epoch, max_train_epochs):
+    # Warm-up reassurance: a run's first steps are slow (first-sight kernel planning, cuBLAS picks, allocator and
+    # cache warm-up, and on a compiled run the blocks compiling once for each picture size - every size comes up in
+    # the first epoch) and speed up step by step, so a crawling bar can look like a hang. Measured, not assumed: the
+    # note only appears once the warm-up has run 30 s (a quick one says nothing), repeats every ~30 s with the speed
+    # now against the first steps', and ends with "Up to speed" once steps stop getting faster - or with epoch 3.
+    _sizes = len({tuple(k[-2:]) for ds in getattr(group, "datasets", [])
+                  for k in getattr(getattr(ds, "batch_manager", None), "bucket_resos", ())}) or 1
+    warm = {"start": time.time(), "said": 0.0, "prev": None, "dts": [], "done": False}
+
+    def _warmup_tick(ep):
+        if warm["done"]:
+            return
+        now = time.time()
+        if warm["prev"] is not None:
+            warm["dts"].append(now - warm["prev"])
+        warm["prev"] = now
+        dts = warm["dts"]
+        med = lambda xs: sorted(xs)[len(xs) // 2]
+        # steady: the last 10 steps no faster than the 10 before (within 10%), once every picture size has been
+        # met (the first epoch done) where a new size could still compile
+        steady = (len(dts) >= 20 and med(dts[-10:]) >= 0.9 * med(dts[-20:-10])
+                  and (ep >= 1 or _sizes <= 1 or not do_compile))
+        if ep >= 2 or steady:
+            warm["done"] = True
+            if warm["said"]:
+                logger.info(f"[warm-up] Up to speed: {med(dts[-10:]):.2f} s/step"
+                            + (f", from {med(dts[:3]):.1f} s at the start." if len(dts) >= 3 else "."))
+            return
+        if now - warm["start"] < 30.0 or now - warm["said"] < 30.0:
+            return
+        first = not warm["said"]
+        warm["said"] = now
+        if first:
+            logger.info("[warm-up] Speeding up: the first steps are slow while the GPU plans its kernels"
+                        + (f", compiles the blocks once for each of the run's {_sizes} picture sizes"
+                           if do_compile and _sizes > 1 else ", compiles the blocks" if do_compile else "")
+                        + " and fills its caches. Each step is quicker than the last until it settles"
+                        + (" within the first epoch or two" if steps_per_epoch > 1 else "")
+                        + ". Nothing is stuck.")
+        elif len(dts) >= 6:
+            logger.info(f"[warm-up] Still speeding up: {med(dts[-5:]):.2f} s/step now, from {med(dts[:3]):.1f} s "
+                        "at the start.")
+    share_now = [None]       # this epoch's training share: {frac, epoch, ...} or None (this GPU trains every image)
+    _share_keys = sorted({str(it.item_key) for ds in getattr(group, "datasets", [])
+                          for b in getattr(getattr(ds, "batch_manager", None), "buckets", {}).values() for it in b})
+    share_skip = [0]
+    share_off_said = [False]
+    catching = [False]       # training a round's images the helper didn't bring back (counted once already)
+
+    def _epoch_batches(epoch):
+        """This epoch's batches as (i, batch, only): its own pass (only None), then - when it closes a round whose
+        share didn't come back - the helper's images of each of the round's epochs again (only: those keys), so
+        both sides stay in step: every image trains every epoch whatever happens to the helper."""
+        nonlocal global_step
+        low = _low_share(epoch)
+        if low > 0 and low < 1:
+            logger.info(f"[stages] epoch {epoch + 1}: {low * 100:.0f}% of steps at the smaller size")
+        elif low == 1 and epoch == 0:
+            logger.info("[stages] training at the smaller size")
+        elif low_loader is not None and epoch > 0 and _low_share(epoch - 1) > 0 and low == 0:
+            logger.info(f"[stages] epoch {epoch + 1}: the full size from here")
+        for i, batch in enumerate(loader):
+            # the step's size from the epoch and the step, so a resumed run draws the same
+            if low and random.Random((epoch + 1) * 100003 + i).random() < low:
+                batch = _low_batch()
+            yield i, batch, None
+        sn = share_now[0]
+        if share_worker is not None or sn is None or epoch + 1 != sn["last"]:
+            return
+        if pending:                        # a partial group: settle the optimizer before the combine
+            _update()
+        _wn = adaptive._weight_norm(net.trainable_modules()) if adaptive and adaptive.prev_weight_norm else None
+        missed = _share_combine(sn)
+        _k = sn["last"] - sn["epoch"] + 1
+        if _wn is not None and _k > 1:
+            # the helper's change covers the round's k epochs: Adaptive LR's weight-growth check counts one
+            # epoch's worth of it here, not k (or a multi-epoch round would read as a jump and roll back)
+            adaptive.prev_weight_norm += (adaptive._weight_norm(net.trainable_modules()) - _wn) * (1 - 1 / _k)
+        if not missed:
+            return
+        gs0, n0 = global_step, progress.n
+        catching[0] = True
+        try:
+            for ep in missed:
+                only = _share_split(seed, ep, _share_keys, sn["frac"])
+                logger.info(f"[share] epoch {ep}: training {sn['name']}'s {len(only)} images here")
+                for i, batch in enumerate(loader):
+                    if str((batch.get("item_keys") or [""])[0]) in only:
+                        yield i, batch, only
+                        global_step, progress.n = gs0, n0      # the bar and the epoch shown stay where they are
+            if pending:
+                _update()
+        finally:
+            catching[0] = False
+            global_step = gs0              # those steps were counted when they were skipped
+            progress.n = n0
+            progress.refresh()
+
+    def _share_ok():
+        # gradient_checkpointing off (or partly): a big card planned this run without it, and a helper trains with it - the halves
+        # would differ, so no share (set a helper to share before the run starts and it keeps checkpointing)
+        return (not (slider or ftr is not None or dop_cond) and watch.watch is None and optimizer is not None
+                and gradient_checkpointing and not gc_off_blocks)
+
+    def _worker_epochs():
+        """--share_worker: each epoch the lead hands over (its job file: the start LoRA, the share, the LR), in turn;
+        a stop file, or no job for 30 minutes, ends it."""
+        _write_json(os.path.join(share_worker, "ready.json"), {"at": time.time(), "steps_per_epoch": steps_per_epoch})
+        idle = time.time()
+        while True:
+            jobs = sorted(glob.glob(os.path.join(share_worker, "*.job.json")))
+            if os.path.exists(os.path.join(share_worker, "stop")) or (not jobs and time.time() - idle > 1800):
+                return
+            if not jobs:
+                time.sleep(0.5)
+                continue
+            work = jobs[0][:-len(".job.json")] + ".working"
+            os.replace(jobs[0], work)
+            with open(work, encoding="utf-8") as f:
+                job = json.load(f)
+            job["work"] = work
+            share_now[0] = job
+            for ep in job.get("epochs") or [job["epoch"]]:
+                yield int(ep) - 1
+            idle = time.time()
+
+    if share_worker is None:
+        # what keeps this run's previews on this GPU (a helper renders a normal LoRA run's only), for the web UI to say
+        # (previews on the family's preview checkpoint go to the helper too, since #339)
+        _pv_off = ("a slider's previews" if slider else "an edit LoRA's previews" if ref_latents else
+                   "a fine-tune's previews" if finetune else "")
+        _write_json(os.path.join(output_dir, HELPER_PREVIEWS_OFF), {"run": output_name, "launch": _launch, "why": _pv_off})
+        if _pv_off and _helper_previews(output_dir):
+            logger.info(f"[helpers] this run's previews render on this GPU: helpers don't render {_pv_off} yet")
+    if share_worker is None and _share_ok():
+        # Start together (the Helpers tab's tick): while the web UI is getting this run's helper ready, the first
+        # epoch waits for it, so both sides train from the start. Unticked, the helper leaving or its start giving
+        # up lets go of the wait (as does a web UI that stopped refreshing it)
+        _noted = 0.0
+        while _helper_share(output_dir, output_name) is None and not os.path.exists(pause_flag):
+            _w = _share_wait_note(output_dir, output_name, _launch)
+            if _w is None:
+                break
+            if time.time() - _noted > 30:
+                logger.info(f"[share] waiting for {_w.get('name') or 'the helper'} to get ready before the first "
+                            f"epoch, so both train from the start" + (f": {_w['text']}" if _w.get("text") else "")
+                            + " (untick Start together on the Helpers tab to start now)")
+                _noted = time.time()
+            time.sleep(2)
+    prior = _MaskPrior(driver, dit, net, mask_prior, swapped) if mask_prior else None
+    # Training maps (training/train_maps.py): where a few fixed pictures are still wrong and where the LoRA acts
+    maps = None
+    if training_maps:
+        if not desc.training_maps or slider or ftr is not None or share_worker:
+            logger.info("[maps] training maps are off for this run (" + (
+                "sliders" if slider else "fine-tunes" if ftr is not None else "a helper's share" if share_worker
+                else f"{desc.display_name} doesn't have them") + ")")
+        else:
+            from fizgig.training.train_maps import TrainingMaps
+            maps = TrainingMaps(output_dir, output_name, getattr(group, "datasets", []), images=training_maps_images,
+                                driver=driver, desc=desc,
+                                trigger=str(dop_trigger or trigger_word or metadata_trigger_phrase or "").strip())
+            if maps.keys:
+                maps.start(resume=bool(resume_state_dir))
+                if not resume_state_dir:
+                    maps.capture(0, driver, dit, net, device, swapped=bool(swapped), ema=ema)
+            else:
+                logger.info("[maps] training maps: no picture could be read from the cache - off for this run")
+                maps = None
+    for epoch in (_worker_epochs() if share_worker else range(start_epoch, max_train_epochs)):
+        while face_phase.get("said"):        # the boost's switches during the last epoch, each on a line of its own
+            logger.info(face_phase["said"].pop(0))
+        face_phase["epoch"] = epoch
+        if face_on and _face_cyc[1] > 0 and not any(_face_end):   # Boost the face on N epochs, then M normal
+            face_phase["on"] = epoch % (_face_cyc[0] + _face_cyc[1]) < _face_cyc[0]   # ones, repeating from epoch 1
+            logger.info(f"[face boost] epoch {epoch + 1}: " + ("boosted" if face_phase["on"] else "normal (no boost)"))
         shared_epoch.value = epoch + 1
+        driver.begin_epoch(epoch + 1 + (ftr.epochs_done if ftr is not None else 0))   # a continued fine-tune counts on
+        if share_worker and epoch + 1 == int(share_now[0]["epoch"]):   # a round's first epoch: the lead's LoRA
+            _sj = share_now[0]
+            if net.load_trainable(_sj["start"]) == 0:
+                raise RuntimeError("[share] the lead's LoRA matched none of this model's layers")
+            # the lead's rate: its scheduler's place (this run's own schedule, stepped to it), or none - Adaptive LR
+            # or a constant rate, held for the round as the lead holds it through an epoch
+            scheduler = None
+            if _sj.get("sched") is not None:
+                scheduler = _step_scheduler(optimizer, lr_scheduler, lr_warmup_steps,
+                                            updates_per_epoch * max_train_epochs, lr_scheduler_num_cycles,
+                                            lr_scheduler_power)
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message=r"Detected call of `lr_scheduler\.step\(\)` before")
+                    for _ in range(int(_sj["sched"])):
+                        scheduler.step()
+            else:
+                for g, lr in zip(optimizer.param_groups, _sj.get("lrs") or []):
+                    g["lr"] = lr
+            logger.info(f"[share] epoch {epoch + 1}: from the lead's LoRA, LR {optimizer.param_groups[0]['lr']:.3g}"
+                        + (" (its schedule, at the lead's step)" if scheduler is not None else ""))
+            _sj.update(steps=0, t0=time.time())
+        elif share_worker is None:
+            if share_now[0] is not None and epoch + 1 > share_now[0]["last"]:
+                share_now[0] = None
+            _hs = _helper_share(output_dir, output_name) if share_now[0] is None and _share_ok() else None
+            if ((not gradient_checkpointing or gc_off_blocks) and not share_off_said[0] and share_now[0] is None
+                    and _helper_share(output_dir, output_name)):
+                share_off_said[0] = True
+                logger.info("[share] a helper is ready to share, but this run trains without (all of) gradient checkpointing "
+                            "(a big card's plan) and a helper trains with it - the halves would differ, so this GPU "
+                            "trains every image. Set the helper to share before starting a run and both keep it on.")
+            if _hs:                  # a helper trains its share of this round's epochs, from the same start
+                # the round: up to `every` epochs, ending early at any epoch that previews or saves (so the pictures
+                # and files hold both halves), at a pause, and at the run's end
+                _last = epoch + 1
+                while (_last < epoch + max(1, int(_hs.get("every") or 1)) and _last < max_train_epochs
+                       and not (sample_every_n_epochs and _preview_due(_last))
+                       and not preview_due(_last, save_every_n_epochs, save_until_epoch, save_every_n_epochs_after)
+                       and not os.path.exists(pause_flag)):
+                    _last += 1
+                _sd = os.path.join(output_dir, SHARE_DIR, f"{epoch + 1:06d}")
+                shutil.rmtree(_sd, ignore_errors=True)    # a resumed run's earlier go at this epoch: not this round
+                os.makedirs(_sd, exist_ok=True)
+                net.save(os.path.join(_sd, "start.safetensors"), dtype=torch.bfloat16)
+                _write_json(os.path.join(_sd, "job.json"), {
+                    "epoch": epoch + 1, "epochs": list(range(epoch + 1, _last + 1)), "frac": float(_hs["frac"]),
+                    "seed": seed, "lrs": [g["lr"] for g in optimizer.param_groups],
+                    "sched": scheduler.last_epoch if scheduler is not None else None, "launch": _launch})
+                share_now[0] = {"epoch": epoch + 1, "last": _last, "frac": float(_hs["frac"]), "dir": _sd,
+                                "steps": 0, "t0": time.time(), "name": _hs.get("name") or "the helper"}
+                logger.info(f"[share] epoch{'s' if _last > epoch + 1 else ''} {epoch + 1}"
+                            + (f"-{_last}" if _last > epoch + 1 else "") + f": {share_now[0]['name']} trains about "
+                            f"{float(_hs['frac']) * 100:.0f}% of the images, combined at the end")
         if ftr is not None and ftr.needs_window(epoch):
             optimizer = params = None       # let go of the outgoing window before the swap, or both sit in VRAM
             params, optimizer = ftr.enter(epoch)                 # the epoch's window, and a fresh optimizer for it
+        if ftr is not None and dop_cond and dop_ft is None:
+            if ftr.epochs_done > 0 or start_epoch > 0:      # continued: the model is no longer the original
+                if os.path.isfile(dop_ft_file):
+                    dop_ft = torch.load(dop_ft_file, weights_only=False)
+                    logger.info(f"[dop] the original model's predictions from {os.path.basename(dop_ft_file)}")
+                else:
+                    logger.warning(f"[dop] off: this fine-tune continues from a checkpoint and "
+                                   f"{os.path.basename(dop_ft_file)} isn't in the output folder - DOP's targets "
+                                   "are made from the original model at a fine-tune's start")
+                    dop_ft, dop_cond = {}, {}
+            else:
+                _tp = time.time()
+                dop_ft = _dop_ft_targets(driver, dit, loader, dop_cond, dop_cond_for, device,
+                                         samples=dop_ft_samples, seed=seed, min_t=min_timestep, max_t=max_timestep)
+                torch.save(dop_ft, dop_ft_file)
+                mb = sum(t.numel() * t.element_size() for rows in dop_ft.values() for s, p in rows
+                         for t in [p, *(v for v in s.values() if torch.is_tensor(v))]) / 1e6
+                logger.info(f"[dop] fine-tune: {dop_ft_samples} of the original model's predictions for each of "
+                            f"{len(dop_ft)} images ({mb:.0f} MB, {time.time() - _tp:.0f} s) - each DOP pass holds "
+                            f"the model to one of them. Saved for a continued run: {os.path.basename(dop_ft_file)}")
+        if between[0] is not None:          # the last epoch's end work (saves, checks, previews, the next epoch's
+            progress.start_t += time.time() - between[0]   # set-up) out of the bar's s/it: training speed only
+            between[0] = None
         torch.cuda.reset_peak_memory_stats()
         t0 = time.time()
-        for i, batch in enumerate(loader):
+        _theirs = (_share_split(seed, epoch + 1, _share_keys, share_now[0]["frac"]) if share_now[0] is not None
+                   else None)                       # the helper's images this epoch (both sides draw the same)
+        warm["prev"] = None                  # an epoch's first step isn't timed against the last one's end
+        for i, batch, _only in _epoch_batches(epoch):
+            _warmup_tick(epoch - start_epoch)
+            if _only is not None:              # a catch-up: the helper's images this GPU trains after all
+                pass
+            elif share_now[0] is not None:
+                _mine = (str((batch.get("item_keys") or [""])[0]) in _theirs) == bool(share_worker)
+                if _mine and share_worker and os.path.exists(share_now[0]["work"][:-len(".working")] + ".cancel"):
+                    _mine = False              # the lead went on without this round: the rest of it is skipped
+                if not _mine:                  # the other GPU trains this one this epoch
+                    recorder.drop(step=i)
+                    global_step += 1
+                    progress.update(1)
+                    share_skip[0] += 1
+                    if scheduler is not None and share_skip[0] % accum == 0:
+                        scheduler.step()       # the schedule stays where one GPU's would be
+                    continue
+                share_now[0]["steps"] += 1
             if watch.excluded(batch):          # two failed AI recaptions and still stuck: no forward, no loss
                 recorder.drop(step=i)
                 global_step += 1
                 progress.update(1)
                 continue
+            _skip, _lrm = driver.step_policy(batch, epoch + 1 + (ftr.epochs_done if ftr is not None else 0))
+            if _skip:                          # a retired category ("stop"): no forward, no loss, no record
+                recorder.drop(step=i)
+                global_step += 1
+                progress.update(1)
+                continue
+            if lr_boost:             # experimental: items whose name holds a pattern train at a multiple of the LR
+                _ik = " ".join(str(k) for k in batch.get("item_keys") or [])
+                _lrm *= next((m for pat, m in lr_boost if pat in _ik), 1.0)
+            lr_acc.append(_lrm)
             latents = batch["latents"].to(device)
+            # a batched step only when this step really holds more than one item: a single-item bucket in a batched
+            # run (an H3 clip or voice, which always train alone, or a bucket's last picture) takes the one-item path
+            _many = bsz > 1 and len(batch.get("item_keys") or [None] * latents.shape[0]) > 1
             if slider:
                 # both poles backpropagate before the strength flips: checkpointed blocks recompute their forward
-                # in backward, at whatever strength is set then
+                # in backward, at whatever strength is set then. The family's per-step freeze applies as on any step
+                # (H3: the Training mode's block window, never the token refiner)
                 optimizer.zero_grad(set_to_none=True)
+                _frozen_sl = _step_freeze(driver.step_frozen_blocks(batch))
                 if slider_prompts:
-                    _l, _t = _prompt_slider_step(driver, dit, net, latents, slider_enc, gen,
-                                                 guidance=slider_guidance, min_t=min_timestep, max_t=max_timestep)
+                    _l, _t, _al = _prompt_slider_step(
+                        driver, dit, net, latents, slider_enc, gen, guidance=slider_guidance, min_t=min_timestep,
+                        max_t=max_timestep, anchor=anchor_enc[global_step % len(anchor_enc)] if anchor_enc else None,
+                        anchor_weight=slider_anchor_weight)
+                    if _al is not None:
+                        anchor_losses.append(_al)
                 else:
-                    cond = {k[len("cond__"):]: v.to(device) for k, v in batch.items() if k.startswith("cond__")}
+                    cond = driver.batch_cond(batch, device)
                     _neg = batch.get("latents_control_0")
                     if _neg is None:
                         raise RuntimeError("[slider] this item has no pair image - an image-pair slider needs one in "
                                            "the second folder for every training image, matched by file name")
                     _neg = _neg.to(device)
+                    _lm = _loss_mask(batch)
                     _l = 0.0
                     try:
                         for m, a, b in ((1.0, latents, _neg), (-1.0, _neg, latents)):
                             net.set_trainable_multiplier(m)
                             _pl, _info = driver.training_loss(dit, a, cond, gen, min_t=min_timestep,
                                                               max_t=max_timestep, diff_ref=b,
-                                                              diff_weight=slider_diff_weight)
+                                                              diff_weight=slider_diff_weight,
+                                                              **({"loss_mask": _lm} if _lm is not None else {}))
                             (0.5 * _pl).backward()
                             _l += 0.5 * _pl.item()
                     finally:
                         net.set_trainable_multiplier(1.0)
                     _t = _info.get("t", 0.5)
+                for _p in _frozen_sl:
+                    _p.requires_grad_(True)
                 loss, _info = torch.tensor(_l), {"t": _t}
             else:
-                cond = {k[len("cond__"):]: v.to(device) for k, v in batch.items() if k.startswith("cond__")}
-                refs = [batch[k].to(device) for k in sorted((k for k in batch if k.startswith("latents_control_")),
-                                                            key=lambda k: int(k.rsplit("_", 1)[1]))]
-                loss, _info = driver.training_loss(dit, latents, cond, gen, min_t=min_timestep, max_t=max_timestep,
-                                                   **({"refs": refs} if refs else {}))
+                if _many:
+                    _frozen_now = _step_freeze(driver.step_frozen_blocks(batch))
+                    loss, _info = _batch_loss(batch, latents)
+                else:
+                    cond = driver.batch_cond(batch, device)
+                    # caption dropout: this step's draw from the step number, so a resumed run drops the same steps
+                    if uncond is not None and random.Random(global_step * 7919 + 17).random() < caption_dropout:
+                        cond = {**cond, **{k: v.to(device) for k, v in uncond.items()}}
+                    refs = [batch[k].to(device) for k in sorted((k for k in batch if k.startswith("latents_control_")),
+                                                                key=lambda k: int(k.rsplit("_", 1)[1]))]
+                    # per-step routing (a family's step_frozen_blocks): those blocks' trainable weights sit out this
+                    # step's forward and backward, so the backward stops at the first trained block and they get no grad
+                    _frozen_now = _step_freeze(driver.step_frozen_blocks(batch))
+                    _lm = _loss_mask(batch)
+                    loss, _info = driver.training_loss(dit, latents, cond, gen, min_t=min_timestep, max_t=max_timestep,
+                                                       **({"refs": refs} if refs else {}),
+                                                       **({"loss_mask": _lm} if _lm is not None else {}),
+                                                       **({"prior": prior} if prior is not None and _lm is not None
+                                                          else {}))
+                if "lr_mult" in _info and lr_acc:
+                    lr_acc[-1] *= _info["lr_mult"]     # where the step landed (the H3 noise-band LR)
                 if pending == 0 and optimizer is not None:
                     optimizer.zero_grad(set_to_none=True)
-                if reg_keys and all(str(k) in reg_keys for k in batch.get("item_keys") or [None]):
-                    mult = reg_lr_multiplier       # a regularisation image: a fixed nudge, never the watch's
+                _wb = watch.weigh(_info, batch.get("item_keys"), reg_keys, reg_lr_multiplier) if _many else None
+                if _wb is not None:                # a batch: each picture at its own weight (loss_watch.Watch.weigh)
+                    _scaled, loss, _kept = _wb
                 else:
-                    mult = watch.multiplier(batch)  # per-image LR (batch size 1): the raw loss is still what's recorded
-                _scaled = loss * mult if mult != 1.0 else loss
+                    if reg_keys and all(str(k) in reg_keys for k in batch.get("item_keys") or [None]):
+                        mult = reg_lr_multiplier       # a regularisation image: a fixed nudge, never the watch's
+                    else:
+                        mult = watch.multiplier(batch)  # per-image LR: the raw loss is still what's recorded
+                    _scaled = loss * mult if mult != 1.0 else loss
+                _dc = dop_cond_for(batch, cond) if dop_cond and global_step % dop_every == 0 else None
+                _dk = str((batch.get("item_te_paths") or [None])[0])
+                if _dc is not None and ftr is not None and dop_ft and _dk in dop_ft:
+                    # one backward for both: the free-each-gradient fine-tune steps each weight as its gradient
+                    # lands, so a second backward would be a second optimizer step
+                    _dl = _dop_ft_loss(driver, dit, dop_ft[_dk], _dc, device)
+                    _scaled = _scaled + dop_weight * _dl
+                    dop_sum[0] += _dl.item()
+                    dop_sum[1] += 1
+                    _dc = None
+                if ftr is not None and ftr.fused is not None:
+                    ftr.fused.scale = lr_acc[-1] if lr_acc else 1.0   # each weight steps in this backward's hooks
                 (_scaled / accum if accum > 1 else _scaled).backward()
+                if _dc is not None and ftr is None:
+                    dop_sum[0] += _dop_step(driver, dit, net, latents, _dc, gen, weight=dop_weight,
+                                            min_t=min_timestep, max_t=max_timestep, accum=accum,
+                                            swapped=bool(swapped))
+                    dop_sum[1] += 1
+                for _p in _frozen_now:
+                    _p.requires_grad_(True)
             pending += 1
             if pending >= accum:
                 _update()
             global_step += 1
-            recorder.add(epoch=epoch, step=i, loss=loss.item())
-            watch.observe(epoch + 1, global_step, batch, _info.get("t", 0.5), loss.item())
-            progress.set_postfix(avr_loss=f"{recorder.moving_average:.4f}", refresh=False)
+            if test_cap and global_step >= test_cap[1]:
+                _apply_test_vram_cap(*test_cap)
+                test_cap = None
+            _flush()                           # the last step's numbers: finished on the GPU by now
+
+            def _rec(lv, per=None, _e=epoch, _i=i, _g=global_step, _keys=batch.get("item_keys"), _ts=_info.get("ts"),
+                     _t=_info.get("t", 0.5), _kept=(_kept if not slider and _many and _wb is not None else None),
+                     _rate=(None if global_step % 20 else      # the rate now and then (Automagic's averages it)
+                            _step_rate())):
+                recorder.add(epoch=_e, step=_i, loss=lv)
+                steplog.add(step_off + _g, _e + 1 + (ftr.epochs_done if ftr is not None else 0), lv, _rate)
+                if per is not None:            # a batch: one record per picture
+                    watch.observe_each(_e + 1, _g, _keys, _ts, per, _kept)
+                else:
+                    watch.observe(_e + 1, _g, {"item_keys": _keys}, _t, lv)
+            _per = (_info.get("per_raw") or _info["per"].detach().float()) \
+                if not slider and _many and _wb is not None else None
+            _later(_rec, lv=loss.detach().float(), per=_per)
+            if pending == 0 and ftr is None:   # the web UI's Sample now / Save now, between optimizer steps
+                if take_request(output_dir, "save"):
+                    save_lora(os.path.join(output_dir, f"{output_name}-step{global_step:07d}.safetensors"), epoch + 1)
+                    logger.info(f"[save now] step {global_step} saved as {output_name}-step{global_step:07d}.safetensors")
+                if take_request(output_dir, "sample"):
+                    logger.info(f"[sample now] previews at step {global_step} (epoch {epoch + 1} in progress)")
+                    _tp = time.time()
+                    previews(epoch + 1)
+                    progress.start_t += time.time() - _tp
+            # the run card's Learning: loss, the step's learning rate (Adaptive LR's, Automagic's) and grad norm
+            progress.set_postfix(avr_loss=f"{recorder.moving_average:.4f}",
+                                 lr=f"{_step_rate(raw=True):.2e}",
+                                 **({"gn": f"{last_gn[0]:.3f}"} if last_gn[0] is not None else {}), refresh=False)
             progress.update(1)
 
         if pending:                        # a partial group: settle the optimizer before the epoch-end work
             _update()
+        _flush()                           # the epoch's last numbers, before the epoch-end work reads the records
+        between[0] = time.time()          # the epoch-end work starts: left out of the bar's s/it (above)
         _off = ftr.epochs_done if ftr is not None else 0
         logger.info(f"epoch {epoch + 1 + _off}/{max_train_epochs + _off}  avr_loss={recorder.moving_average:.4f}  "
                     f"step={global_step}  {(time.time() - t0) / max(1, steps_per_epoch):.2f}s/step  "
-                    f"lr={learning_rate if optimizer is None else optimizer_lr(optimizer):.3e}  "
+                    f"lr={_step_rate():.3e}  "
+                    + (f"({automagic4_detail(optimizer)})  " if automagic4_detail(optimizer) else "")
                     + (f"({group_rates(optimizer)})  " if optimizer is not None and group_rates(optimizer) else "") +
                     f"peak VRAM {torch.cuda.max_memory_reserved() / 1024 ** 3:.1f} GB")
+        steplog.flush()
+        if share_worker and epoch + 1 < int((share_now[0].get("epochs") or [share_now[0]["epoch"]])[-1]):
+            continue                         # a round of several epochs: the LoRA goes back after its last
+        if share_now[0] is not None and share_worker:
+            _sj = share_now[0]
+            # its change over the round, against the start it was handed (small numbers: bf16 keeps them)
+            from safetensors.torch import load_file, save_file
+            _st = load_file(_sj["start"])
+            _now = net.state_dict(torch.float32)
+            save_file({k: (v - _st[k].float()).to(torch.bfloat16).contiguous() for k, v in _now.items() if k in _st},
+                      _sj["out"] + ".part")
+            os.replace(_sj["out"] + ".part", _sj["out"])
+            _write_json(_sj["work"][:-len(".working")] + ".done.json",
+                        {"ok": True, "steps": _sj["steps"], "seconds": round(time.time() - _sj["t0"], 1)})
+            os.remove(_sj["work"])
+            logger.info(f"[share] epoch {epoch + 1}: {_sj['steps']} images trained here, handed back")
+            continue
+        if dop_sum[1]:
+            logger.info(f"[dop] epoch {epoch + 1}: preservation loss {dop_sum[0] / dop_sum[1]:.5f} over {dop_sum[1]} "
+                        "step(s) - how far the LoRA moves the class prompt from the base model")
+            dop_sum[0], dop_sum[1] = 0.0, 0
         if adaptive:
             adaptive.epoch_boundary(epoch, recorder.moving_average, net.trainable_modules(), optimizer)
         # problem-image verdicts + queued caption fixes / auto-recaptions, re-encoded before the next epoch
         watch.boundary(epoch + 1, dit, device, parkable=not swapped)
 
         done = epoch + 1
-        cadence = bool(save_every_n_epochs) and done % save_every_n_epochs == 0 and done < max_train_epochs
+        # the save schedule (the Training tab's How often to save; a fine-tune saves at whole rotations)
+        cadence = done < max_train_epochs and preview_due(
+            done, save_every_n_epochs, *((0, 0) if ftr is not None else (save_until_epoch, save_every_n_epochs_after)))
         if ftr is not None:
             # a fine-tune saves and previews at whole rotations only, and the preview renders the checkpoint just
             # saved: the window goes back to NF4 (the master holds every trained weight) and its optimizer is
@@ -1147,9 +3206,7 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                 n_ep = done + ftr.epochs_done
                 save_lora(os.path.join(output_dir, f"{output_name}-{n_ep:06d}.safetensors"), done)
                 if cadence and sample_every_n_epochs:
-                    _tp = time.time()
                     previews(n_ep)
-                    progress.start_t += time.time() - _tp
                 if os.path.exists(pause_flag):
                     logger.info(f"[pause] requested - rotation complete at epoch {n_ep}, checkpoint saved; exiting "
                                 f"cleanly (continue from {output_name}-{n_ep:06d}.safetensors)")
@@ -1160,41 +3217,63 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             save_lora(os.path.join(output_dir, f"{output_name}-{done:06d}.safetensors"), done)
         state_saved = False
         if save_state and cadence:
-            state(done)
-            prune_state_dirs(output_dir, output_name, keep_last_n_states)
-            state_saved = True
-        if sample_every_n_epochs and done % sample_every_n_epochs == 0:
-            _tp = time.time()
+            state_saved = state(done)
+            if state_saved:
+                prune_state_dirs(output_dir, output_name, keep_last_n_states)
+        if sample_every_n_epochs and _preview_due(done):
             previews(done)
-            progress.start_t += time.time() - _tp       # the bar's s/it is training speed, not previews
             # this epoch's checkpoint was saved before its preview existed, with the previous epoch's as its
             # thumbnail (#122): re-embed its own. An explicit --metadata_thumbnail (or "off") stays.
             if cadence and not (metadata_thumbnail or "").strip():
                 own = sample_for_epoch(output_dir, output_name, done)
                 if own:
                     refresh_checkpoint_thumbnail(os.path.join(output_dir, f"{output_name}-{done:06d}.safetensors"), own)
-        if os.path.exists(pause_flag) and done < max_train_epochs:
+        if maps is not None:           # epoch-end work: already left out of the bar's s/it (between)
+            maps.capture(done, driver, dit, net, device, swapped=bool(swapped), ema=ema)
+        if (os.path.exists(pause_flag) and done < max_train_epochs
+                and not (share_now[0] is not None and done < share_now[0]["last"])):   # a share round ends first
             if state_saved:
                 logger.info(f"[pause] requested - state for epoch {done} already saved; exiting cleanly")
             else:
                 logger.info(f"[pause] requested - saving state at epoch {done} and exiting cleanly")
-                state(done)
+                state(done, required=True)
             progress.close()
             sys.exit(0)
+        if anchor_losses:                # how far the dial moved its anchors this epoch (0 = not at all)
+            logger.info(f"[slider] anchor loss, epoch {done}: {sum(anchor_losses) / len(anchor_losses):.5f} "
+                        f"over {len(anchor_losses)} steps")
+            anchor_losses.clear()
+        if slider_prompts and done < max_train_epochs:
+            slider_live(done)
 
+    if share_worker:                     # a helper's share: the lead keeps the LoRA
+        progress.close()
+        logger.info("[share] the lead's run is done here")
+        return None
     progress.close()
+    while face_phase.get("said"):
+        logger.info(face_phase["said"].pop(0))
+    steplog.flush()
+    for _old in glob.glob(os.path.join(output_dir, SHARE_DIR, "*")):   # the share's rounds and bundles: done with
+        if os.path.basename(_old) != "setup.json":
+            try:                         # a file the web UI has open stays (Windows): never the run's final save
+                shutil.rmtree(_old, ignore_errors=True) if os.path.isdir(_old) else os.remove(_old)
+            except OSError:
+                pass
     final = os.path.join(output_dir, f"{output_name}.safetensors")
     if ftr is not None:
         optimizer = params = None
         ftr.park()
         save_lora(final, max_train_epochs)
-        if hasattr(ftr.rot.master, "cleanup"):
-            ftr.rot.master.cleanup()          # the final checkpoint holds everything the scratch did
+        ftr.be.cleanup()                  # the final checkpoint holds everything the scratch did
         if sample_every_n_epochs:
             previews(max_train_epochs + ftr.epochs_done)
         logger.info(f"Fine-tune complete -> {final}")
         return final
     save_lora(final, max_train_epochs)
+    # the last epoch under its number too (#176): a resumed run that extends this one ends on the same plain name, and
+    # without a numbered copy that epoch would be overwritten and lost
+    shutil.copyfile(final, os.path.join(output_dir, f"{output_name}-{max_train_epochs:06d}.safetensors"))
     if save_state_on_train_end:
         state(max_train_epochs)
     logger.info(f"Training complete -> {final}")
@@ -1214,15 +3293,26 @@ def setup_parser():
                    help="blocks streamed between CPU and GPU (not with nf4); -1 = as few as fit free VRAM")
     p.add_argument("--network_dim", type=int, default=32)
     p.add_argument("--network_type", default="lora", choices=("lora", "lokr"))
+    p.add_argument("--preview_lora", default=None,
+                   help="a LoRA on previews of the training model only, never in training (MOSS-Image's SFT look "
+                        "LoRA); a file not there yet is picked up at a later preview")
+    p.add_argument("--preview_lora_strength", type=float, default=1.0)
     p.add_argument("--speed_lora_strength", type=float, default=None,
                    help="the preview speed LoRA's strength (default: the family's recommended value)")
     p.add_argument("--log_per_image_loss", action="store_true", help="detect problem images (Problem Images window)")
+    p.add_argument("--training_maps", action="store_true",
+                   help="training maps: where a few fixed pictures are still wrong and where the LoRA acts, each epoch")
+    p.add_argument("--training_maps_images", type=int, default=3, help="how many pictures the training maps follow")
     p.add_argument("--per_image_lr", action="store_true", help="scale each step by the image's loss-watch multiplier")
     p.add_argument("--auto_recaption", action="store_true", help="recaption stuck images (needs --captioner)")
     p.add_argument("--warmup_look_outliers", action="store_true", help="LR warm-up for Look Filter outliers")
     p.add_argument("--trigger_position", default="start", choices=("start", "end"))
+    p.add_argument("--recaption_triggers", default=None,
+                   help="auto-recaption's trigger word per other folder, as JSON {key prefix: word}")
     p.add_argument("--recaption_instruction", default=None)
     p.add_argument("--recaption_instruction_detailed", default=None)
+    p.add_argument("--recaption_task", default=None, help="the first try's Captions tab task, for the log")
+    p.add_argument("--recaption_task_detailed", default=None, help="the second try's Captions tab task, for the log")
     p.add_argument("--captioner", default=None,
                    help="auto-recaption's captioner: the Krea 2 Qwen3-VL-4B text encoder file (as the Captions tab)")
     p.add_argument("--lokr_factor", type=int, default=8, help="LoKR only: w1 is about factor x factor")
@@ -1230,6 +3320,9 @@ def setup_parser():
     p.add_argument("--learning_rate", type=float, default=1e-4)
     p.add_argument("--max_train_epochs", type=int, default=16)
     p.add_argument("--save_every_n_epochs", type=int, default=1)
+    p.add_argument("--save_until_epoch", type=int, default=0,
+                   help="With --save_every_n_epochs_after: saves every --save_every_n_epochs up to this epoch")
+    p.add_argument("--save_every_n_epochs_after", type=int, default=0, help="...then on whole multiples of this")
     p.add_argument("--save_state", action="store_true")
     p.add_argument("--save_state_on_train_end", action="store_true")
     p.add_argument("--keep_last_n_states", type=int, default=2)
@@ -1246,6 +3339,13 @@ def setup_parser():
     p.add_argument("--text_encoder", default=None)
     p.add_argument("--sample_prompts", default=None, help="One prompt per line")
     p.add_argument("--sample_every_n_epochs", type=int, default=0)
+    p.add_argument("--preview_small_card_cap", type=int, default=0,
+                   help="on a card under 20 GB, cap the previews' long side to this many px (the Faster, smaller "
+                        "previews tick)")
+    p.add_argument("--sample_until_epoch", type=int, default=0,
+                   help="With --sample_every_n_epochs_after: previews every --sample_every_n_epochs up to this epoch")
+    p.add_argument("--sample_every_n_epochs_after", type=int, default=0,
+                   help="...then on whole multiples of this")
     p.add_argument("--sample_width", type=int, default=None)
     p.add_argument("--sample_height", type=int, default=None)
     p.add_argument("--sample_steps", type=int, default=None)
@@ -1253,7 +3353,17 @@ def setup_parser():
     p.add_argument("--sample_negative", default=None)
     p.add_argument("--sample_at_first", action="store_true")
     p.add_argument("--sample_seed", type=int, default=42)
-    p.add_argument("--sample_reference", default=None, help="Edit previews: the photo every preview prompt edits")
+    p.add_argument("--sample_strengths", default="",
+                   help="Also render each preview at these LoRA strengths, comma-separated (e.g. 0.5)")
+    p.add_argument("--family_option", action="append", default=[], metavar="KEY=VALUE",
+                   help="a family's own training option (the driver's set_options), e.g. photo_blocks=20-49")
+    p.add_argument("--preview_checkpoint", default=None,
+                   help="Render training previews on this checkpoint (families with train_preview_checkpoint)")
+    p.add_argument("--preview_checkpoint_cache", default="auto", choices=("auto", "on", "off"),
+                   help="Keep the preview checkpoint in system RAM between epochs")
+    p.add_argument("--preview_int8", action="store_true", help="INT8 matmuls on the preview checkpoint")
+    p.add_argument("--sample_reference", nargs="+", default=None,
+                   help="Edit previews: the photo every preview prompt edits, then any extra pictures it brings in")
     p.add_argument("--sample_image", default=None,
                    help="A picture previews see through the text encoder's vision path (families with preview_image)")
     p.add_argument("--slider_pairs", action="store_true",
@@ -1264,6 +3374,10 @@ def setup_parser():
     p.add_argument("--slider_prompts", nargs=3, default=None, metavar=("NEUTRAL", "POSITIVE", "NEGATIVE"),
                    help="Slider from three prompts, no images (needs --text_encoder and --vae)")
     p.add_argument("--slider_guidance", type=float, default=3.0, help="Prompt-pair slider: how hard to push")
+    p.add_argument("--slider_anchors", nargs="+", default=None, metavar="PROMPT",
+                   help="Prompt-pair slider: prompts the dial must leave as they are (one a step, in turn)")
+    p.add_argument("--slider_anchor_weight", type=float, default=1.0,
+                   help="Prompt-pair slider: how much the anchors count against the dial's own loss")
     p.add_argument("--slider_bank", type=int, default=16, help="Prompt-pair slider: practice images to render")
     p.add_argument("--train_blocks", default="",
                    help="Comma-separated block ids (the driver's block map) to train; empty = every block")
@@ -1272,6 +3386,8 @@ def setup_parser():
         p.add_argument(f"--metadata_{k}", default=None)
     p.add_argument("--trigger_word", default=None, help="Recorded as the trigger phrase when none is given")
     p.add_argument("--resume", default=None)
+    p.add_argument("--share_worker", default=None, help="a helper's training share: take each epoch's start LoRA "
+                   "and share from this folder's job files, train this computer's images, write the result back")
     p.add_argument("--adaptive_lr", action="store_true")
     p.add_argument("--adaptive_lr_min", type=float, default=1e-4)
     p.add_argument("--adaptive_lr_max", type=float, default=2e-4)
@@ -1285,16 +3401,29 @@ def setup_parser():
     p.add_argument("--ft_save_every_rotations", type=int, default=1,
                    help="checkpoint (and preview) every N rotations; never mid-rotation")
     p.add_argument("--ft_rotate_every", type=int, default=1, help="epochs each window trains before the next")
+    p.add_argument("--ft_max_parts", type=int, default=0,
+                   help="most parts per fine-tune window (0 = as many as fit; 1 = one part per window, most headroom)")
     p.add_argument("--ft_start_window", type=int, default=0, help="continuing: the window to start at")
     p.add_argument("--ft_epochs_done", type=int, default=0, help="continuing: epochs already trained (numbering)")
     p.add_argument("--ft_fused_backward", action="store_true",
                    help="step each weight as its gradient lands and free it (less VRAM; no clipping or accumulation)")
     p.add_argument("--reg_lr_multiplier", type=float, default=0.2,
-                   help="fine-tune: LR multiplier for images in a dataset block marked is_reg = true")
+                   help="LR multiplier for images in a dataset block marked is_reg = true (a fine-tune's or a LoRA's "
+                        "regularisation set)")
+    p.add_argument("--reg_per_epoch", type=int, default=0,
+                   help="regularisation images an epoch trains on (a different handful each epoch); 0 = all of them")
+    p.add_argument("--batch_size_auto", action="store_true",
+                   help="Batch size Auto: the family's measured fastest batch on a 40 GB+ card (description batch_auto)")
+    p.add_argument("--gradient_checkpointing", default="auto", choices=("auto", "on"),
+                   help="auto: off for a compiled LoRA run with no block swap when the measured peak fits free VRAM")
     p.add_argument("--compile_blocks", default="auto", choices=("auto", "on", "outside", "off"),
                    help="torch.compile the DiT blocks (families with compiles=True); auto weighs warm-up vs run length")
-    p.add_argument("--ema_decay", type=float, default=0.0)
-    p.add_argument("--optimizer_type", default="adamw")
+    p.add_argument("--ema_decay", type=lambda v: v if str(v).lower().startswith("short") else float(v), default=0.0,
+                   help="EMA decay (0.98), 0 = off, or 'short' (sized to the run)")
+    p.add_argument("--optimizer_type", default=None,
+                   help="default: adamw for a LoRA, adafactor for a fine-tune (which takes adafactor, adamw8bit, "
+                        "adamw, pagedadamw8bit, ademamix8bit, pagedademamix8bit or lion8bit; anything else trains "
+                        "it with adafactor)")
     p.add_argument("--optimizer_args", default="")
     p.add_argument("--lr_scheduler", default="constant",
                    choices=["constant", "constant_with_warmup", "cosine", "cosine_with_restarts", "linear",
@@ -1302,13 +3431,54 @@ def setup_parser():
     p.add_argument("--lr_warmup_steps", type=int, default=0)
     p.add_argument("--lr_scheduler_num_cycles", type=int, default=1)
     p.add_argument("--lr_scheduler_power", type=float, default=1.0)
+    p.add_argument("--dop", action="store_true",
+                   help="Differential Output Preservation: without the trigger the LoRA is held to the base model")
+    p.add_argument("--dop_trigger", default=None, help="DOP: the trigger(s) in the captions, comma-separated for several subjects "
+                   "(default --trigger_word)")
+    p.add_argument("--dop_class", default="",
+                   help="DOP: what replaces each trigger, e.g. 'woman, man' (one for all, or one per "
+                   "trigger in order); empty = the triggers are dropped")
+    p.add_argument("--dop_weight", type=float, default=1.0, help="DOP: the preservation loss's weight")
+    p.add_argument("--dop_every", type=int, default=1, help="DOP: a preservation pass every N steps")
+    p.add_argument("--lr_boost", action="append", default=[], metavar="PATTERN=MULT",
+                   help="experimental: items whose name contains PATTERN train at MULT x the LR on their step")
+    p.add_argument("--dop_ft_samples", type=int, default=8,
+                   help="DOP on a fine-tune: the original model's predictions made per image before the first step")
+    p.add_argument("--stage_dataset_config", default=None,
+                   help="Start at a smaller size: that size's dataset TOML (its own cache folder)")
+    p.add_argument("--stage_until", type=float, default=0.3,
+                   help="the share of the run at the smaller size (the change blends over --stage_blend of it)")
+    p.add_argument("--stage_blend", type=float, default=0.1, help="the share of the run the change blends over")
+    p.add_argument("--caption_dropout", type=float, default=0.0,
+                   help="the share of steps that train with no caption (the empty caption's encoding, made once)")
+    p.add_argument("--masked_training", action="store_true",
+                   help="weight each picture's loss by its mask (photo-masklabel.png beside photo.png): white counts "
+                        "fully, grey partly, black at --mask_floor; pictures without a mask train as normal")
+    p.add_argument("--mask_floor", type=float, default=0.1,
+                   help="masked training: how much outside the mask counts (0 = nothing, 1 = as much as inside)")
+    p.add_argument("--face_weight", type=float, default=1.0,
+                   help="Boost the face (an experiment): each still's largest face counts this many times as much in "
+                        "the loss (a soft oval from the face detector), on top of any mask; 1 = off, 0 = the face not at all")
+    p.add_argument("--face_cycle", default="1:0",
+                   help="--face_weight on N epochs then off M, repeating from epoch 1 (N:M; the off ones train as if "
+                        "it were off): 1:1 = every 2nd epoch, 2:1 = two boosted then one normal, 1:0 = every epoch")
+    p.add_argument("--face_until", default="0:0",
+                   help="--face_weight ends after epoch E or step S, whichever comes first (E:S, 0 = no limit; it "
+                        "can stop mid-epoch): 12:600 = the first 12 epochs or 600 steps")
+    p.add_argument("--face_area", choices=("face", "head", "person", "no_clothes", "body_clothes", "body", "clothes",
+                                           "not_faces", "background"), default="face",
+                   help="--face_weight's area: the face, or the head (face and hair; a mask trims it to the person)")
+    p.add_argument("--mask_prior", type=float, default=0.0,
+                   help="masked training: outside the mask, keep the LoRA to the model's own prediction (LoRA at 0) "
+                        "at this weight (OneTrainer's masked prior preservation; 0 = off; one extra forward a step)")
     return p
 
 
 def main():
-    if (sys.platform != "win32" and not os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
-            and os.environ.get("FIZGIG_NO_EXPANDABLE") != "1"):
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    if sys.platform != "win32" and os.environ.get("FIZGIG_NO_EXPANDABLE") != "1":
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        if os.environ.get("FIZGIG_GPU_BACKEND") == "rocm":    # ROCm reads its own name, not the CUDA one (#341)
+            os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:True")
     os.environ.setdefault("KMP_BLOCKTIME", "0")
     os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
     logging.basicConfig(level=logging.INFO)
@@ -1323,22 +3493,32 @@ def main():
         a.family, a.dit, a.dataset_config, a.output_dir, a.output_name, precision=a.precision,
         blocks_to_swap=a.blocks_to_swap, speed_lora_strength=a.speed_lora_strength, network_type=a.network_type, lokr_factor=a.lokr_factor,
         log_per_image_loss=a.log_per_image_loss, per_image_lr=a.per_image_lr, auto_recaption=a.auto_recaption,
+        training_maps=a.training_maps, training_maps_images=a.training_maps_images,
         warmup_look_outliers=a.warmup_look_outliers, trigger_word=a.trigger_word, trigger_position=a.trigger_position,
+        recaption_triggers=a.recaption_triggers,
         recaption_instruction=a.recaption_instruction,
         recaption_instruction_detailed=a.recaption_instruction_detailed, captioner=a.captioner,
+        recaption_task=a.recaption_task, recaption_task_detailed=a.recaption_task_detailed,
         network_dim=a.network_dim, network_alpha=a.network_alpha, learning_rate=a.learning_rate,
-        max_train_epochs=a.max_train_epochs, save_every_n_epochs=a.save_every_n_epochs, save_state=a.save_state,
+        max_train_epochs=a.max_train_epochs, save_every_n_epochs=a.save_every_n_epochs,
+        save_until_epoch=a.save_until_epoch, save_every_n_epochs_after=a.save_every_n_epochs_after, save_state=a.save_state,
         save_state_on_train_end=a.save_state_on_train_end, keep_last_n_states=a.keep_last_n_states, seed=a.seed,
         training_adapter=a.training_adapter, training_adapter_strength=a.training_adapter_strength,
         context_lora_path=a.context_lora_path, context_lora_strength=a.context_lora_strength,
-        min_timestep=a.min_timestep, max_timestep=a.max_timestep, speed_lora=a.speed_lora,
+        min_timestep=a.min_timestep, max_timestep=a.max_timestep, speed_lora=a.speed_lora, preview_lora=a.preview_lora,
+        preview_lora_strength=a.preview_lora_strength,
         vae_path=a.vae, te_path=a.text_encoder,
-        sample_prompts=prompts, sample_every_n_epochs=a.sample_every_n_epochs, sample_width=a.sample_width,
+        sample_prompts=prompts, sample_every_n_epochs=a.sample_every_n_epochs,
+        preview_small_card_cap=a.preview_small_card_cap,
+        sample_until_epoch=a.sample_until_epoch, sample_every_n_epochs_after=a.sample_every_n_epochs_after,
+        sample_width=a.sample_width,
         sample_height=a.sample_height, sample_steps=a.sample_steps, sample_cfg_scale=a.sample_cfg_scale,
         sample_negative=a.sample_negative, sample_at_first=a.sample_at_first, sample_seed=a.sample_seed,
-        sample_reference=[a.sample_reference] if a.sample_reference else None, sample_image=a.sample_image,
+        sample_strengths=tuple(float(x) for x in a.sample_strengths.split(",") if x.strip()),
+        sample_reference=list(a.sample_reference) if a.sample_reference else None, sample_image=a.sample_image,
         slider_pairs=a.slider_pairs, slider_diff_weight=a.slider_diff_weight, slider_prompts=a.slider_prompts,
-        slider_guidance=a.slider_guidance, slider_bank=a.slider_bank, slider_bank_res=a.slider_bank_res,
+        slider_guidance=a.slider_guidance, slider_anchors=a.slider_anchors or (),
+        slider_anchor_weight=a.slider_anchor_weight, slider_bank=a.slider_bank, slider_bank_res=a.slider_bank_res,
         train_blocks=[b.strip() for b in a.train_blocks.split(",") if b.strip()] or None,
         metadata_title=a.metadata_title, metadata_author=a.metadata_author,
         metadata_description=a.metadata_description, metadata_license=a.metadata_license,
@@ -1349,9 +3529,21 @@ def main():
         lr_scheduler=a.lr_scheduler, lr_warmup_steps=a.lr_warmup_steps,
         lr_scheduler_num_cycles=a.lr_scheduler_num_cycles, lr_scheduler_power=a.lr_scheduler_power,
         gradient_accumulation_steps=a.gradient_accumulation_steps, compile_blocks=a.compile_blocks,
+        gradient_checkpointing=True if a.gradient_checkpointing == "on" else "auto",
+        batch_size_auto=a.batch_size_auto,
         finetune=a.finetune, ft_rotations=a.ft_rotations, ft_save_every_rotations=a.ft_save_every_rotations,
-        ft_rotate_every=a.ft_rotate_every, ft_start_window=a.ft_start_window, ft_epochs_done=a.ft_epochs_done,
-        ft_fused_backward=a.ft_fused_backward, reg_lr_multiplier=a.reg_lr_multiplier)
+        ft_rotate_every=a.ft_rotate_every, ft_max_parts=a.ft_max_parts, ft_start_window=a.ft_start_window, ft_epochs_done=a.ft_epochs_done,
+        ft_fused_backward=a.ft_fused_backward, reg_lr_multiplier=a.reg_lr_multiplier,
+        reg_per_epoch=a.reg_per_epoch,
+        preview_checkpoint=a.preview_checkpoint, preview_checkpoint_cache=a.preview_checkpoint_cache,
+        preview_int8=a.preview_int8,
+        family_options=dict(o.split("=", 1) for o in a.family_option if "=" in o),
+        dop=a.dop, dop_trigger=a.dop_trigger, dop_class=a.dop_class, dop_weight=a.dop_weight, dop_every=a.dop_every,
+        dop_ft_samples=a.dop_ft_samples,
+        lr_boost=[(x.split("=", 1)[0], float(x.split("=", 1)[1])) for x in a.lr_boost if "=" in x] or None,
+        share_worker=a.share_worker, masked_training=a.masked_training, mask_floor=a.mask_floor,
+        mask_prior=a.mask_prior, face_weight=a.face_weight, face_area=a.face_area, face_cycle=a.face_cycle, face_until=a.face_until, caption_dropout=a.caption_dropout, stage_dataset_config=a.stage_dataset_config,
+        stage_until=a.stage_until, stage_blend=a.stage_blend)
 
 
 if __name__ == "__main__":

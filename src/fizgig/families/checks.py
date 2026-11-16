@@ -9,6 +9,7 @@ batch_size and megapixels. Every function returns a list of messages; an empty l
 """
 import glob
 import os
+import re
 
 
 def number(label, raw, cast, minimum=None):
@@ -49,7 +50,6 @@ def numbers(v):
                                       ("LoRA+ LR Ratio", "LORA_LR_RATIO", int, 1),
                                       ("Gradient Accumulation", "GRADIENT_ACCUMULATION", int, 1),
                                       ("Max Grad Norm", "MAX_GRAD_NORM", float, 0),
-                                      ("Network Dropout", "NETWORK_DROPOUT", float, 0),
                                       ("Batch Size (Dataset)", "batch_size", int, 1),
                                       ("Target Megapixels (Dataset)", "megapixels", float, 0)):
         out += number(label, v.get(key, ""), cast, minimum)
@@ -158,13 +158,46 @@ def run(v, *, blocks_swap, swap_max, arch_label, name_error):
         out.append(name_error)
     if not v.get("LORA_OUTPUT_DIR"):
         out.append("LoRA output directory is empty")
-    resume = v.get("RESUME_TRAINING")
-    if resume and str(resume).strip() and not os.path.exists(resume):
+    resume = str(v.get("RESUME_TRAINING") or "").strip()
+    if resume and not os.path.exists(resume):
         out.append(f"Resume training path does not exist: {resume}")
+    elif resume and os.path.isdir(resume):     # a file is a fine-tune's checkpoint (its own continuation)
+        out += state_folder_problems(resume)
+    lora_out = str(v.get("LORA_OUTPUT_DIR") or "").strip()
+    if lora_out and _is_state(lora_out):
+        # #352: a state folder picked as the output folder - the run's files would land inside that saved state
+        out.append(f"The LoRA output folder is a saved training state ({os.path.basename(os.path.normpath(lora_out))}). "
+                   f"Set the output folder to the folder that holds it ({os.path.dirname(os.path.normpath(lora_out))}), "
+                   f"and put the state folder in Resume Training (Other Options) to carry that run on.")
     return out
 
 
-def training_folder(image_dir, caption_ext, *, check_captions=True, media_exts=()):
+def _is_state(path):
+    """A saved training state folder: Fizgig's (training_state.json) or the old trainer's (model.safetensors, the
+    epoch in the folder name)."""
+    return os.path.isdir(path) and (os.path.isfile(os.path.join(path, "training_state.json")) or (
+        os.path.isfile(os.path.join(path, "model.safetensors"))
+        and re.search(r"-\d{6}-state$", os.path.basename(os.path.normpath(path))) is not None))
+
+
+def state_folder_problems(path):
+    """Resume Training must name the state folder itself (#352: the folder holding it was passed, and the trainer
+    stopped on "not a saved training state"). Names the newest state inside when there is one."""
+    if _is_state(path):
+        return []
+    try:
+        inside = [e for e in os.scandir(path) if e.is_dir() and _is_state(e.path)]
+    except OSError:
+        inside = []
+    if inside:
+        newest = max(inside, key=lambda e: e.stat().st_mtime)
+        return [f"Resume Training is set to {path}, the folder that holds the saved states, not a state itself. Pick "
+                f"the state folder inside it, e.g. {newest.name} (the newest)."]
+    return [f"Resume Training is set to {path}, which isn't a saved training state. Pick a folder named like "
+            f"'<lora name>-000012-state'."]
+
+
+def training_folder(image_dir, caption_ext, *, check_captions=True, media_exts=(), label="the training folder"):
     """The training folder must exist; its photos (and clips) need captions - none at all, or some missing, and
     the run would quietly leave them out. check_captions is off for runs that read none (a RefMod plain encode,
     a prompt slider)."""
@@ -175,17 +208,18 @@ def training_folder(image_dir, caption_ext, *, check_captions=True, media_exts=(
         # glob.escape: a folder like "[subject] photos" otherwise finds no captions at all
         caption_files = glob.glob(os.path.join(glob.escape(image_dir), "*" + caption_ext))
         if not caption_files:
-            out.append(f"No caption files (*{caption_ext}) found in {image_dir}. "
+            out.append(f"No caption files (*{caption_ext}) found in {image_dir if label == 'the training folder' else label}. "
                        f"Use the Captions tab to generate them first.")
         else:
+            from fizgig.dataset.masks import is_mask_file      # photo-masklabel.png is a mask, not a picture
             stems = {os.path.splitext(os.path.basename(p))[0] for p in caption_files}
             uncaptioned = sorted(f for f in os.listdir(image_dir)
                                  if os.path.splitext(f)[1].lower() in media_exts
-                                 and os.path.splitext(f)[0] not in stems)
+                                 and os.path.splitext(f)[0] not in stems and not is_mask_file(f))
             if uncaptioned:
                 shown = ", ".join(uncaptioned[:6]) + (f" … and {len(uncaptioned) - 6} more"
                                                       if len(uncaptioned) > 6 else "")
-                out.append(f"{len(uncaptioned)} file(s) in the training folder have no {caption_ext} caption and "
+                out.append(f"{len(uncaptioned)} file(s) in {label} have no {caption_ext} caption and "
                            f"would be left out of the run: {shown}. Caption them on the Captions tab (clips are "
                            f"captioned from their middle frame), or move them out of the folder.")
     return out

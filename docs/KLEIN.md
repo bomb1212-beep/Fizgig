@@ -7,8 +7,9 @@ Flux 2 Klein 9B is Fizgig's fast, light trainer, tuned for one model. Training r
 ## Training
 
 - **Proven presets** for single subject through multi-character — or roll your own.
+- **Edit LoRAs** — pairs of an original and your edited version (Training Parameters → Edit LoRA). Pick **The photo + extra pictures** to bring in up to 3 more pictures per edit (another person, an object, a place) from their own folder, named `photo_1.png`, `photo_2.png` … for `photo.png`, any shape.
 - **Context LoRA** — load an existing LoRA as a frozen *active* layer so the new one learns to coexist: a face on top of a style, an outfit on top of a character. No other trainer does this.
-- **Adaptive LR** — a bi-directional plateau tracker: set the Min/Max window and it probes up on steady descent, pulls down (with rollback) on plateau or instability.
+- **Adaptive LR** — a bi-directional plateau tracker: set the Min/Max window and it probes up on steady descent, pulls down (with rollback) on plateau or instability. A rate that had to be cut soon after a raise becomes that run's ceiling, so it isn't tried again.
 - **fp8 Base training** — the fp8 Base stays resident at ~9.6 GB, so a full 9B LoRA trains in ~14 GB and fits a 16 GB card. Automatic.
 - **Distilled training samples** — 4-step previews that match ComfyUI output closely, multiple prompts (one per line on the Samples tab), and optional **reference-conditioned** samples (Klein is an edit model — previews can edit a real photo).
 - **Pause / Resume** — graceful epoch-boundary pause that frees your GPU mid-run and resumes with full state.
@@ -30,7 +31,7 @@ Klein is the model with a charted block map, which drives Model Area targeting, 
 
 The overlaps are real, so the Profiler reports five buckets (style+composition, style/identity overlap, identity, identity/detail overlap, details) rather than forcing each block into one. Style also concentrates at **late timesteps** (trainer `min_timestep=0, max_timestep=400`), so the Style area pairs the style+composition blocks with that range.
 
-On the workbench, Klein's Repair Studio has a slider for each of its 32 blocks (8 double + 24 single), and Extract's activation-weighted presets add block and timestep targeting on top of the Fast weight-only presets. Full tool descriptions are in [TRAINING.md](TRAINING.md#the-workbench).
+On the workbench, Klein's Repair Studio has a slider for each of its 32 blocks (8 double + 24 single), and Extract's presets keep one part of a LoRA — Identity, Style+Composition or Details — or any blocks you pick. Full tool descriptions are in [TRAINING.md](TRAINING.md#the-workbench).
 
 ## Model files
 

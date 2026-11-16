@@ -21,13 +21,15 @@ The slider LoRAs from 6.7.0 now train on Krea 2: a LoRA whose strength is a dial
 
 ### Ultra mode
 
-A new tick box at the bottom of the Krea 2 slider section. Ultra mode trains the slider on the composition blocks (0 to 7) and the text-fusion blocks only, leaving the fine-detail blocks alone. The result holds up at much higher strengths: one test slider ran cleanly at 20 in ComfyUI. How far yours goes depends on what you train and for how long. The file is also much smaller.
+A new tick box at the bottom of the Krea 2 slider section. Ultra mode trains the slider on the composition blocks (0 to 7) and the text-fusion blocks only, leaving the fine-detail blocks alone. The result holds up at much higher strengths: one test slider ran cleanly at 20 in ComfyUI. How far yours goes depends on what you train and for how long. The file is also much smaller. Ultra mode works best for sliders trained from prompts; it can work well with photo pairs too, especially when the change is compositional (pose, framing, layout) rather than fine detail.
 
 ## Fine-tuning for Qwen Image 2.1
 
 Qwen Image 2.1 can now fine-tune the whole base model, so Fizgig fine-tunes three families: Krea 2, Qwen Image 2.1 and MiniMax H3. On Krea 2 and Qwen, pick **Fine-tune the whole model** under **Kind of training**. MiniMax H3 keeps its own fine-tune checkbox for now. When H3 moves onto the driver system shortly, its fine-tuning gets the same card as Krea 2 and Qwen. Training counts in rotations, and each checkpoint is a complete model file you load in place of the base. An optional folder of class photos (regularisation) trains alongside at a lower learning rate to keep the model's general knowledge intact.
 
-A fine-tune takes longer than a LoRA, but far less than people expect. It trains one part of the model at a time, so it fits a single consumer GPU, and a full rotation through every part takes several epochs: four on a 24 or 32 GB card. With the defaults (10 rotations, 1 epoch per part) that's 40 epochs, at about 0.85 seconds a step on Krea 2 at 0.25 MP against about 0.6 for a LoRA. In total that's about as long as the 64-epoch Standard Krea 2 LoRA preset, and about twice the 30-epoch Ultra Fast one. A 16 GB card can fine-tune too, but it splits the model into more parts and streams from system RAM (about 5 seconds a step), so expect a much longer run there.
+A fine-tune takes longer than a LoRA, but far less than people expect. It trains one part of the model at a time, so it fits a single consumer GPU, and a full rotation through every part takes several epochs: four on a 24 or 32 GB card. With the defaults (10 rotations, 1 epoch per part) that's 40 epochs, at about 0.85 seconds a step on Krea 2 at 0.25 MP against about 0.6 for a LoRA. In total, expect a default fine-tune to take 3 to 4 times as long as the Ultra Fast Krea 2 LoRA preset: its lower learning rate needs more steps to get there. A 16 GB card can fine-tune too, but it splits the model into more parts and streams from system RAM (about 5 seconds a step), so expect a much longer run there.
+
+In practice: a single-character Qwen Image 2.1 fine-tune at the default settings (including the 1e-5 learning rate that choosing Fine-tune sets) can be done in as little as 30 minutes on an RTX 5090. Put several characters in the same dataset folder, each with its own unique name or trigger word, and a multi-character fine-tune takes a couple of hours.
 
 When it's done, use the result as a new checkpoint in place of the base, or press **Checkpoint to LoRA** on the fine-tune card to turn the difference between your fine-tune and the base into a LoRA. Concepts come out far better separated than in a LoRA trained directly. See [FINETUNE.md](https://github.com/shootthesound/Fizgig/blob/v6.8.0/docs/FINETUNE.md).
 
@@ -54,8 +56,7 @@ Qwen Image 2.1 is released under the Qwen Research License: non-commercial use o
 
 ## New in 6.8.1
 
-- **Qwen Image 2.1 previews: Steps and CFG can be edited again.** A "Use Distilled model for samples" tick left over from Klein locked the Samples tab's Steps, CFG and Negative boxes on other models. It now only affects Klein.
+- **Qwen Image 2.1 previews: Steps and CFG can be edited again.** A "Use Distilled model for samples" tick left over from Klein locked the Samples tab's Steps, CFG and Negative boxes on other models. It now only affects Klein. For Qwen, Turbo strength 0, 20 steps and CFG 3 work very well; a CFG above 1 slows down training samples and Repair Studio, LoRA the Explorer and LoRA Royale previews somewhat.
 - **CFG works with Turbo previews.** A CFG above 1 on the Samples tab now applies with the Turbo LoRA on too, along with the negative prompt.
 - **Qwen Image 2.1 in Repair Studio, LoRA the Explorer and LoRA Royale** now previews with the Samples tab's steps, CFG, negative prompt and Turbo strength, so one place sets how every Qwen preview looks.
-- **Recommended for Qwen Image 2.1:** Turbo strength 0, 20 steps and CFG 3 work very well. A CFG above 1 slows down training samples and Repair Studio, LoRA the Explorer and LoRA Royale previews somewhat.
 - **A fine-tune no longer picks up a Context LoRA.** On Krea 2 and Qwen, the Context LoRA row hides while Fine-tune is chosen, and a path left in the box is no longer sent to the trainer.

@@ -7,16 +7,16 @@ writes the paths into prefs.json for you.
     python -m fizgig.scripts.fetch_models --family krea2      # ~45 GB, no HF account needed
     python -m fizgig.scripts.fetch_models --family klein      # ~39 GB, needs an HF token
     python -m fizgig.scripts.fetch_models --family minimax    # ~47 GB, no HF account needed
-    python -m fizgig.scripts.fetch_models --family qwen_image21 --include-optional   # ~38 GB, no HF account needed
+    python -m fizgig.scripts.fetch_models --family qwen_image21    # ~41 GB, no HF account needed
     python -m fizgig.scripts.fetch_models --family tools      # ~1.6 GB helper models
     python -m fizgig.scripts.fetch_models --all
 
 Two kinds of asset, handled differently:
 
-  * WEIGHTS  — single .safetensors files. Downloaded into <repo>/models/ (or --models-dir)
+  * WEIGHTS  — single .safetensors files. Downloaded into <repo>/user_data/models/ (or --models-dir)
                and written into prefs.json against the pref key the GUI reads.
-  * TOOLS    — Florence-2, the InsightFace face model, the EN->ZH translator and Gizmo's
-               Whisper transcriber. These are loaded BY NAME at runtime, not by path, so
+  * TOOLS    — Florence-2, the InsightFace face model, Make masks' person segmenter, the EN->ZH
+               translator and Gizmo's Whisper transcriber. These are loaded BY NAME at runtime, not by path, so
                there's nothing to put in prefs — "fetching" them means warming the cache
                they'll be loaded from, which turns a mid-workflow stall into a one-off
                up-front download (and, for Whisper, guarantees Gizmo transcribes offline).
@@ -41,7 +41,8 @@ EMIT_PROGRESS = False
 class Weight:
     """One .safetensors file: where it lives on HF, where it goes, which pref points at it."""
 
-    def __init__(self, pref_key, repo, path_in_repo, gb, note, optional=False, gated=False, local_name=None):
+    def __init__(self, pref_key, repo, path_in_repo, gb, note, optional=False, gated=False, local_name=None,
+                 replaces=()):
         self.pref_key = pref_key
         self.repo = repo
         self.path_in_repo = path_in_repo
@@ -50,6 +51,11 @@ class Weight:
         self.note = note
         self.optional = optional
         self.gated = gated
+        self.replaces = tuple(replaces)          # earlier versions of this file: a pref on one moves to this one
+        self.alt = None                          # the other build offered beside it (ModelFile.fetch_choice)
+        self.switch_from = ""                    # picked over that build: a pref on it moves to this one
+        self.same_as = ""                        # another family's pref for the same file (ModelFile.same_as)
+        self.signature = ()                      # (tensor, shape) only the right file has (ModelFile.signature)
 
 
 # The Captions tab captions ANY dataset with the Krea 2 Qwen3-VL text encoder — it follows an
@@ -59,6 +65,27 @@ class Weight:
 _CAPTION_TE = Weight("krea2_text_encoder", "Comfy-Org/Krea-2",
                      "text_encoders/qwen3vl_4b_fp8_scaled.safetensors", 5.2,
                      "Qwen3-VL text encoder — powers the Captions tab (shared with Krea 2)")
+
+class Strangers:
+    """The Subjects card's 32 base-model strangers (families/multi_person.py: a pinned Hugging Face dataset, into
+    user_data, no pref). Fetched with every family's files, as the captioner is, so a multi-person run never has to
+    download them at its start (a pod hit Hugging Face's rate limit there). Shaped like a Weight for the listing."""
+    pref_key, repo, path_in_repo = "", "ShootTheSound/fizgig-multi-person-strangers", ""
+    filename, gb, optional, gated, replaces = "multi_person_strangers/", 0.02, False, False, ()
+    note = "Multi-person strangers - the Subjects card's side-by-side pictures (21 MB)"
+
+
+_STRANGERS = Strangers()
+
+
+def fetch_strangers(log=print, dry_run=False):
+    if dry_run:
+        log(f"  [plan] {_STRANGERS.filename} (~0.02 GB) — {_STRANGERS.note}")
+        return True
+    sys.path.insert(0, os.path.join(REPO_DIR, "src"))
+    from fizgig.families import multi_person
+    return multi_person.download_strangers(log=log)
+
 
 # Paths verified against the HuggingFace API, not the README — the two can drift.
 FAMILIES = {
@@ -81,17 +108,13 @@ FAMILIES = {
         Weight("minimax_turbo_lora", "larryvrh/MiniMax-H3-Turbo-Lora",
                "minimax_h3_turbo_v4_step600.safetensors", 0.78,
                "Turbo LoRA — fast 6-step in-training previews"),
-        # Training adapters, picked by the Training tab's dropdown: Circlestone (the default, one
-        # 620 MB file for both bases) and Ostris's pair (155 MB each, one per base, for video-only
-        # datasets). All fetched — small next to the DiT.
-        Weight("minimax_circlestone_adapter", "circlestone-labs/MiniMax-H3-Image-Training-Adapter",
-               "minimax_h3_image_training_adapter.safetensors", 0.62,
-               "Training adapter (Circlestone) — the default, one file for both bases"),
+        # Ostris's training adapters (310 MB each, one per base, picked by the Training Base). Both
+        # fetched — small next to the DiT.
         Weight("minimax_training_adapter", "ostris/minimax_h3_training_adapter",
-               "minimax_h3_training_adapter_v1.safetensors", 0.16,
+               "minimax_h3_training_adapter_v3.safetensors", 0.31,
                "Training adapter (fl2va) — de-distills the base while your LoRA learns (Ostris)"),
         Weight("minimax_ref_training_adapter", "ostris/minimax_h3_training_adapter",
-               "minimax_h3_ref2va_training_adapter_v1.safetensors", 0.16,
+               "minimax_h3_ref2va_training_adapter_v3.safetensors", 0.31,
                "Training adapter (ref2va) — the same, for runs on the reference base (Ostris)"),
         # ref2va is a DIFFERENT fine-tune, needed only for reference distillation — 21 GB most
         # users don't want on a first setup, so it rides behind --include-optional like the
@@ -100,6 +123,7 @@ FAMILIES = {
                "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors", 21.0,
                "Reference DiT (ref2va) — reference distillation only", optional=True),
         _CAPTION_TE,
+        _STRANGERS,
     ],
     "klein": [
         Weight("base_dit", "black-forest-labs/FLUX.2-klein-base-9b-fp8",
@@ -115,6 +139,7 @@ FAMILIES = {
                "flux-2-klein-9b-fp8.safetensors", 9.0,
                "Distilled DiT — 4-step previews and the workbench", gated=True),
         _CAPTION_TE,
+        _STRANGERS,
     ],
 }
 
@@ -134,10 +159,21 @@ def _described_families():
     for d in _REG.values():
         if not d.training_ready:
             continue
-        ws = [Weight(f.pref_key, f.repo, f.path, f.size_gb, f.label + (" — " + f.note if f.note else ""),
-                     optional=not f.required, local_name=f.local_name or None)
-              for f in d.model_files if f.repo and f.path]
-        out[d.key] = ws + ([] if any(w.pref_key == _CAPTION_TE.pref_key for w in ws) else [_CAPTION_TE])
+        ws = []
+        for f in d.model_files:
+            if not (f.repo and f.path and f.bulk_fetch):
+                continue
+            w = Weight(f.pref_key, f.repo, f.path, f.size_gb, f.label + (" — " + f.note if f.note else ""),
+                       optional=f.fetch_is_optional, gated=f.gated, local_name=f.local_name or None,
+                       replaces=f.replaces)
+            w.same_as = f.same_as
+            w.signature = tuple(f.signature)
+            if f.fetch_choice and f.alt_repo and f.alt_path:
+                w.alt = Weight(f.pref_key, f.alt_repo, f.alt_path, f.alt_size_gb or f.size_gb,
+                               f"{f.label} — {f.fetch_choice[1]}", optional=w.optional, gated=f.gated,
+                               replaces=f.replaces)
+            ws.append(w)
+        out[d.key] = ws + ([] if any(w.pref_key == _CAPTION_TE.pref_key for w in ws) else [_CAPTION_TE]) + [_STRANGERS]
     return out
 
 
@@ -159,7 +195,8 @@ FAMILIES.update(DESCRIBED)
 TOOLS = [
     ("MiaoshouAI/Florence-2-base-PromptGen", 1.0, "Florence-2 captioner"),
     ("Helsinki-NLP/opus-mt-en-zh", 0.3, "EN->ZH translator (bilingual captions)"),
-    ("insightface:buffalo_l", 0.3, "Face model — Look Filter + likeness scoring"),
+    ("faces:models", 0.5, "Face models — face finder + AdaFace ViT (Look Filter, likeness scoring)"),
+    ("masks:segmenter", 0.02, "Person segmenter — Image Prep's Make masks"),
     # hf-model: config + tokenizer + safetensors only. The repo also carries .bin/.msgpack/.h5
     # duplicates of the same weights — an unfiltered snapshot would pull 1.16 GB for a 0.3 GB
     # model. Gizmo checks this cache before loading (gizmo.py local_whisper_dir) and stays
@@ -249,16 +286,16 @@ def _download_with_progress(w, models_dir, token, log):
     scraping keeps the parsing in one place and survives huggingface_hub changing its display.
     """
     import threading
-    from huggingface_hub import hf_hub_download
+    from fizgig.utils import hf_public
 
     total = _remote_size(w, token) or int(w.gb * 1024 ** 3)
     held = {}
 
     def run():
         try:
-            held["path"] = hf_hub_download(
+            held["path"] = hf_public.download(
                 repo_id=w.repo, filename=w.path_in_repo, local_dir=models_dir,
-                token=token or os.environ.get("HF_TOKEN") or None)
+                token=token or os.environ.get("HF_TOKEN") or None, log=log)
         except BaseException as e:      # re-raised on the calling thread below
             held["err"] = e
 
@@ -279,6 +316,88 @@ def _download_with_progress(w, models_dir, token, log):
     return held["path"]
 
 
+def _header_shape(path, name):
+    """The shape of tensor `name` in a .safetensors header, or None (unreadable, or no such tensor)."""
+    try:
+        with open(path, "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            if n > 100_000_000:
+                return None
+            return tuple(json.loads(f.read(n)).get(name, {}).get("shape") or ()) or None
+    except (OSError, ValueError, struct.error):
+        return None
+
+
+def is_other_file(path, signature):
+    """True only when the header proves `path` is not the file `signature` describes (the tensor is there at
+    another shape); a file it can't read, or one without the tensor (another format), is never called wrong."""
+    if not signature:
+        return False
+    got = _header_shape(path, signature[0])
+    return got is not None and got != tuple(signature[1])
+
+
+def repair_links(prefs, models_dir, log=print):
+    """Prefs pointing at another model's file, found by ModelFile.signature: moved to the right file when one is
+    set for another model or sits in the models folder under this file's own name, else cleared so Download models
+    for me fetches it. A file in the models folder under one model's name holding another's goes to that one's name
+    when it is free, with the prefs on it, so the first model's download doesn't link it again. Klein 9B's FLUX.2 VAE
+    and Z-Image's FLUX.1 VAE were both saved as models/ae.safetensors before 9.0.5. Returns True when prefs changed."""
+    try:
+        sys.path.insert(0, os.path.join(REPO_DIR, "src"))
+        from fizgig.families.registry import FAMILIES as reg
+    except Exception:
+        return False
+    files = [f for d in reg.values() for f in d.model_files if getattr(f, "signature", ())]
+
+    def where(v):
+        v = str(v or "").strip()
+        return v if not v or os.path.isabs(v) else os.path.normpath(os.path.join(REPO_DIR, v))
+
+    def same(a, b):
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+    def own(f):
+        return os.path.join(models_dir, f.local_name or os.path.basename(f.path))
+
+    changed = False
+    for f in files:                           # a models-folder file under this name holding another model's
+        p = own(f)
+        if not (os.path.isfile(p) and is_other_file(p, f.signature)):
+            continue
+        other = next((o for o in files if o.signature != f.signature and not is_other_file(p, o.signature)
+                      and _header_shape(p, o.signature[0]) is not None), None)
+        if other is None:
+            continue
+        if os.path.exists(own(other)):          # a second copy: its prefs go to the one under the right name, and
+            if is_other_file(own(other), other.signature):     # this model's download replaces it
+                continue
+            log(f"  [moved] {os.path.basename(p)} holds {other.label}'s file: its rows now use "
+                f"{os.path.basename(own(other))}")
+        else:
+            try:
+                os.replace(p, own(other))
+            except OSError:
+                continue
+            log(f"  [moved] {os.path.basename(p)} -> {os.path.basename(own(other))}: it is {other.label}'s file")
+        for k, v in list(prefs.items()):
+            if isinstance(v, str) and v.strip() and same(where(v), p):
+                prefs[k] = own(other)
+        changed = True
+    for f in files:                           # a pref on another model's file
+        p = where(prefs.get(f.pref_key))
+        if not (p and os.path.isfile(p) and is_other_file(p, f.signature)):
+            continue
+        cands = [own(f)] + [where(prefs.get(o.pref_key)) for o in files if o.signature == f.signature]
+        good = next((c for c in cands if c and os.path.isfile(c) and not is_other_file(c, f.signature)
+                     and _header_shape(c, f.signature[0]) is not None), "")
+        prefs[f.pref_key] = good
+        log(f"  [fixed] {f.pref_key} pointed at another model's file ({os.path.basename(p)}): "
+            + (f"now {os.path.basename(good)}" if good else "cleared, so Download models for me fetches it"))
+        changed = True
+    return changed
+
+
 def fetch_weight(w, models_dir, prefs, token=None, log=print, dry_run=False):
     """Download one weight if needed and point its pref at it. Returns True if usable."""
     dest = os.path.join(models_dir, w.filename)
@@ -293,14 +412,32 @@ def fetch_weight(w, models_dir, prefs, token=None, log=print, dry_run=False):
     # every one of those would have been "too small", silently re-downloaded, and the user's
     # path overwritten with ours.
     current = str(prefs.get(w.pref_key) or "").strip()
+    if current and w.switch_from and os.path.basename(current) == w.switch_from:
+        log(f"  [pick] {w.pref_key}: {os.path.basename(current)} -> {w.filename} (your choice on the download card)")
+        current = ""
+    if current and os.path.basename(current) in w.replaces:
+        log(f"  [new]  {w.pref_key}: {os.path.basename(current)} is replaced by {w.filename}")
+        current = ""                             # an earlier version of ours: fetch the new one and point at it
     if current and os.path.isfile(current):
-        if os.path.basename(current) != w.filename:
+        if os.path.basename(current) != w.filename and w.switch_from:
+            log(f"  [keep] {w.pref_key} -> {os.path.basename(current)}: your own file, so {w.filename} was not "
+                "downloaded. To use the pick, clear that row in Preferences, then download again.")
+        elif os.path.basename(current) != w.filename:
             log(f"  [keep] {w.pref_key} -> {os.path.basename(current)} (your own choice, not replacing it)")
         else:
             log(f"  [ok]   {w.filename} — already set up")
         return True
 
-    if os.path.isfile(dest) and _valid_safetensors(dest, min_bytes):
+    # the same file set for another model (any name: the user's own copy, e.g. ComfyUI's renamed VAE): linked, not fetched
+    same_as = getattr(w, "same_as", "")
+    other = str(prefs.get(same_as) or "").strip() if same_as else ""
+    if other and os.path.isfile(other):
+        log(f"  [have] {w.filename} — already set for another model ({os.path.basename(other)}), linking into "
+            "Preferences")
+        prefs[w.pref_key] = other
+        return True
+
+    if os.path.isfile(dest) and _valid_safetensors(dest, min_bytes) and not is_other_file(dest, w.signature):
         log(f"  [have] {w.filename} — on disk, linking into Preferences")
         prefs[w.pref_key] = dest
         return True
@@ -314,12 +451,15 @@ def fetch_weight(w, models_dir, prefs, token=None, log=print, dry_run=False):
         if EMIT_PROGRESS:
             got = _download_with_progress(w, models_dir, token, log)
         else:
-            from huggingface_hub import hf_hub_download
-            got = hf_hub_download(repo_id=w.repo, filename=w.path_in_repo, local_dir=models_dir,
-                                  token=token or os.environ.get("HF_TOKEN") or None)
+            from fizgig.utils import hf_public
+            got = hf_public.download(repo_id=w.repo, filename=w.path_in_repo, local_dir=models_dir,
+                                     token=token or os.environ.get("HF_TOKEN") or None, log=log)
     except Exception as e:
         name = type(e).__name__
-        if "Gated" in name or "401" in str(e) or "403" in str(e):
+        from fizgig.utils import hf_public
+        if isinstance(e, hf_public.LoginExpired):
+            log(f"  [login] {w.filename}: {e}")
+        elif "Gated" in name or "401" in str(e) or "403" in str(e):
             log(f"  [gated] {w.repo} needs you to accept its licence first:")
             log(f"          https://huggingface.co/{w.repo}")
             log(f"          Then re-run with --token hf_... (or set HF_TOKEN).")
@@ -352,50 +492,55 @@ def fetch_weight(w, models_dir, prefs, token=None, log=print, dry_run=False):
 def fetch_tool(spec, log=print, dry_run=False):
     """Warm a by-name model's cache. Never fatal — these all re-download on demand anyway."""
     model_id, gb, note = spec
-    if model_id.startswith("insightface:"):
-        # Cheap presence check first. Unlike the HF downloads, warming this one means actually
-        # constructing FaceAnalysis and letting onnxruntime load the models — several seconds of
-        # console noise. Both family buttons fetch the tools, so that would otherwise happen
-        # twice for anyone who trains with both families.
-        name = model_id.split(":", 1)[1]
-        home = os.environ.get("INSIGHTFACE_HOME") or os.path.expanduser("~/.insightface")
-        if os.path.isdir(os.path.join(home, "models", name)):
+    if model_id.startswith("faces:"):
+        # The face finder's two files + AdaFace ViT (face_utils.ensure_face_models: pinned, checksummed)
+        from fizgig import face_utils as F
+        have = os.path.isfile(F.ADAFACE_FILE["dest"]) and all(
+            os.path.isfile(os.path.join(F.insightface_root(), "models", "buffalo_l", n))
+            for n in F.INSIGHTFACE_FILES["files"])
+        if have:
+            log(f"  [ok]   {model_id} — already present")
+            return True
+    if model_id.startswith("masks:"):
+        from fizgig.dataset import automask
+        from fizgig.user_data import MODELS_DIR
+        if os.path.isfile(automask.model_path(MODELS_DIR)):
             log(f"  [ok]   {model_id} — already present")
             return True
     log(f"  [get]  {model_id} (~{gb:g} GB) — {note}")
     if dry_run:
         return True
     try:
-        if model_id.startswith("insightface:"):
-            # No public download API — instantiating is what actually populates ~/.insightface,
-            # and it proves onnxruntime can load the model rather than just that bytes arrived.
-            from insightface.app import FaceAnalysis
-            app = FaceAnalysis(name=model_id.split(":", 1)[1],
-                               allowed_modules=["detection", "genderage"],
-                               providers=["CPUExecutionProvider"])
-            app.prepare(ctx_id=-1)
+        if model_id.startswith("faces:"):
+            from fizgig.face_utils import ensure_face_models
+            ensure_face_models(log=log)
+        elif model_id.startswith("masks:"):
+            # Make masks' segmenter: the same download and hash check as its first use (dataset/automask.py)
+            from fizgig.dataset import automask
+            from fizgig.user_data import MODELS_DIR
+            automask.ensure_model(MODELS_DIR, log=lambda m: None)
         elif model_id.startswith("hf-config:"):
             # Tokenizer vocab + processor/config json only — NEVER the weights. The weights
             # repos here are multi-GB and the user already has them as local safetensors;
             # a bare snapshot_download would pull the whole thing.
-            from huggingface_hub import snapshot_download
-            snapshot_download(repo_id=model_id.split(":", 1)[1],
-                              allow_patterns=["*.json", "*.txt", "*.model"])
+            from fizgig.utils import hf_public
+            hf_public.snapshot(log=log, repo_id=model_id.split(":", 1)[1],
+                               allow_patterns=["*.json", "*.txt", "*.model"])
         elif model_id.startswith("hf-files:"):
             # A repo's small named files only (e.g. a processor/ folder), never its weights.
-            from huggingface_hub import snapshot_download
+            from fizgig.utils import hf_public
             repo, _, pats = model_id[len("hf-files:"):].partition("|")
-            snapshot_download(repo_id=repo, allow_patterns=pats.split(","))
+            hf_public.snapshot(log=log, repo_id=repo, allow_patterns=pats.split(","))
         elif model_id.startswith("hf-model:"):
             # Configs + tokenizer + the safetensors weights — skipping the .bin/.msgpack/.h5
             # duplicates these repos also carry. Keep in lockstep with the runtime's
             # local-cache check (gizmo.py _WHISPER_PATTERNS).
-            from huggingface_hub import snapshot_download
-            snapshot_download(repo_id=model_id.split(":", 1)[1],
-                              allow_patterns=["*.json", "*.txt", "*.model", "*.safetensors"])
+            from fizgig.utils import hf_public
+            hf_public.snapshot(log=log, repo_id=model_id.split(":", 1)[1],
+                               allow_patterns=["*.json", "*.txt", "*.model", "*.safetensors"])
         else:
-            from huggingface_hub import snapshot_download
-            snapshot_download(repo_id=model_id)
+            from fizgig.utils import hf_public
+            hf_public.snapshot(log=log, repo_id=model_id)
         log(f"  [done] {model_id}")
         return True
     except Exception as e:
@@ -404,17 +549,38 @@ def fetch_tool(spec, log=print, dry_run=False):
         return False
 
 
+def _chosen(w, choices):
+    """The build to fetch for a file with a choice: {pref_key: "main" | "alt"} picks one and lets it replace the other
+    (so a pref on the other moves); without a pick, the main file as before, the user's own file kept."""
+    pick = (choices or {}).get(getattr(w, "pref_key", ""))
+    if getattr(w, "alt", None) is None or pick not in ("main", "alt"):     # the strangers pack has no build to pick
+        return w
+    use, other = (w.alt, w) if pick == "alt" else (w, w.alt)
+    import copy
+    use = copy.copy(use)
+    use.switch_from = other.filename
+    return use
+
+
 def fetch(families, models_dir=None, repo_dir=REPO_DIR, token=None, include_optional=False,
-          log=print, dry_run=False):
-    """Fetch every asset for the named families. Returns True if nothing failed."""
-    models_dir = os.path.abspath(models_dir or os.path.join(repo_dir, "models"))
-    prefs_file = os.path.join(repo_dir, "prefs.json")
+          log=print, dry_run=False, choices=None):
+    """Fetch every asset for the named families. Returns True if nothing failed. choices: {pref_key: "main" | "alt"}
+    for files offered with an alternative build (ModelFile.fetch_choice)."""
+    models_dir = os.path.abspath(models_dir or os.path.join(repo_dir, "user_data", "models"))
+    if os.path.normcase(os.path.abspath(repo_dir)) == os.path.normcase(REPO_DIR):
+        from fizgig import user_data
+        user_data.migrate()
+    prefs_file = os.path.join(repo_dir, "user_data", "prefs.json")
+    if os.environ.get("FIZGIG_USER_DATA") and os.path.normcase(os.path.abspath(repo_dir)) == os.path.normcase(REPO_DIR):
+        prefs_file = os.path.join(os.environ["FIZGIG_USER_DATA"], "prefs.json")    # a second Fizgig's own settings
     if not dry_run:
         os.makedirs(models_dir, exist_ok=True)
     prefs = _load_prefs(prefs_file)
     prefs_before = json.dumps(prefs, sort_keys=True)
+    if not dry_run:
+        repair_links(prefs, models_dir, log=log)      # a pref on another model's file (Klein / Z-Image's VAE)
 
-    planned = [w for fam in families if fam in FAMILIES for w in FAMILIES[fam]
+    planned = [_chosen(w, choices) for fam in families if fam in FAMILIES for w in FAMILIES[fam]
                if include_optional or not w.optional]
     total = sum(w.gb for w in planned) + (
         sum(g for _, g, _ in TOOLS) if "tools" in families else 0)
@@ -428,7 +594,7 @@ def fetch(families, models_dir=None, repo_dir=REPO_DIR, token=None, include_opti
     ok = True
     for fam in families:
         if fam == "tools":
-            log("Helper models (Florence-2, face model, translator, Whisper):")
+            log("Helper models (Florence-2, face model, person segmenter, translator, Whisper):")
             for spec in TOOLS:
                 fetch_tool(spec, log=log, dry_run=dry_run)   # never fails the run
             log("")
@@ -438,9 +604,13 @@ def fetch(families, models_dir=None, repo_dir=REPO_DIR, token=None, include_opti
             ok = False
             continue
         log(f"{fam}:")
-        for w in FAMILIES[fam]:
+        for w in (_chosen(x, choices) for x in FAMILIES[fam]):     # the download card's pick, where a file has one
             if w.optional and not include_optional:
                 log(f"  [skip] {w.filename} (~{w.gb:g} GB) — optional: {w.note}")
+                continue
+            if isinstance(w, Strangers):
+                if not fetch_strangers(log=log, dry_run=dry_run):
+                    ok = False
                 continue
             if not fetch_weight(w, models_dir, prefs, token=token, log=log, dry_run=dry_run):
                 ok = False
@@ -462,11 +632,13 @@ def main():
                    help="Repeatable. Krea 2 needs no HF account; Klein is gated.")
     p.add_argument("--all", action="store_true", help="Every family, including the helper models.")
     p.add_argument("--include-optional", action="store_true",
-                   help="Also fetch the optional files (Krea 2 Turbo DiT ~13 GB, "
-                        "MiniMax ref2va DiT ~21 GB).")
-    p.add_argument("--models-dir", default=None, help="Default: <repo>/models")
+                   help="Also fetch the optional files (Krea 2 Turbo DiT ~13 GB, MiniMax ref2va DiT ~21 GB, "
+                        "SDXL's separate VAE, Anima's Turbo LoRA).")
+    p.add_argument("--models-dir", default=None, help="Default: <repo>/user_data/models")
     p.add_argument("--token", default=None, help="HuggingFace token for gated repos (or HF_TOKEN).")
     p.add_argument("--dry-run", action="store_true", help="Show what would be fetched.")
+    p.add_argument("--choose", action="append", default=[], metavar="PREF=main|alt",
+                   help="For a file offered with another build (MOSS-Image Base or Kromoss): which one to fetch.")
     p.add_argument("--progress", action="store_true",
                    help="Emit machine-readable '[progress] done total name' lines instead of "
                         "huggingface_hub's progress bar. Used by the GUI.")
@@ -487,8 +659,15 @@ def main():
     if not families:
         p.error("pick --family krea2|klein|tools (repeatable), or --all")
 
+    choices = dict(c.split("=", 1) for c in a.choose if "=" in c)
     ok = fetch(families, models_dir=a.models_dir, token=a.token,
-               include_optional=a.include_optional, dry_run=a.dry_run)
+               include_optional=a.include_optional, dry_run=a.dry_run, choices=choices)
+    if "minimax" in families and not a.dry_run:      # H3's quick-preview decoder (taeh3) comes with its models
+        try:
+            from fizgig.minimax import taeh3
+            taeh3.fetch(os.path.abspath(a.models_dir) if a.models_dir else None, log=print)
+        except Exception as e:
+            print(f"H3 quick-preview decoder: skipped ({type(e).__name__}: {e})")
     sys.exit(0 if ok else 1)
 
 

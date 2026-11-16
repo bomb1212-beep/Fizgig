@@ -3,12 +3,12 @@
 Fizgig Installer
 ================
 Sets up Fizgig with its own Python virtual environment.
-Installs PyTorch built against CUDA 12.8 — required for Klein 9B and Krea 2 training,
+Installs PyTorch built against CUDA 13.4 — required for Klein 9B and Krea 2 training,
 preview rendering, profiling, extraction, and Repair Studio on NVIDIA GPUs.
 
 Features:
 - Creates isolated venv for Fizgig dependencies
-- Installs CUDA 12.8 PyTorch (supports RTX 30xx / 40xx / 50xx Blackwell)
+- Installs CUDA 13.4 PyTorch (supports RTX 30xx / 40xx / 50xx Blackwell)
 - Installs InsightFace face detection (runs on CPU for GPU independence)
 - Downloads face detection models automatically
 - Installs Florence-2 AI captioning (transformers library; runs on GPU)
@@ -23,10 +23,11 @@ import sys
 import subprocess
 import platform
 import shutil
+import time
 from pathlib import Path
 
 # Minimum Python version required
-MIN_PYTHON_VERSION = (3, 10)
+MIN_PYTHON_VERSION = (3, 11)   # PyTorch 2.15 has no Python 3.10 wheels
 
 # Directory paths
 SCRIPT_DIR = Path(__file__).parent.absolute()
@@ -198,8 +199,29 @@ def _remove_venv(venv_dir=None):
         return False
 
 
+REBUILD = "--rebuild" in sys.argv[1:]     # the updater's R: delete the venv without asking, then install fresh
+
+
+def _remove_venv_for_rebuild():
+    """The updater hands over to this installer and exits; on Windows its python.exe stays locked for a moment, so
+    keep trying for up to a minute before giving up with the usual plain-language message."""
+    for _ in range(30):
+        try:
+            shutil.rmtree(VENV_DIR)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            time.sleep(2)
+    return _remove_venv()
+
+
 def create_venv():
     """Create virtual environment"""
+    if VENV_DIR.exists() and REBUILD:
+        print(f"Rebuilding: removing the old virtual environment at {VENV_DIR} ...")
+        if not _remove_venv_for_rebuild():
+            return False
     if VENV_DIR.exists():
         print(f"Virtual environment already exists at: {VENV_DIR}")
         health = venv_health()
@@ -302,8 +324,38 @@ def install_dependencies():
     from uv_install_deps import install_requirements
     if install_requirements(REQUIREMENTS_FILE, VENV_DIR, python_path):
         print("Dependencies installed successfully.")
+        install_linux_window(python_path)
         return True
     return False
+
+
+def install_linux_window(python_path):
+    """Linux: Qt WebEngine for the app window (launch_fizgig.sh). pywebview finds no engine inside the venv otherwise
+    (a distro's GTK bindings aren't visible there) and the web UI opens in the browser instead. Not in requirements.txt:
+    the pod image installs that and never opens a window. A failure here only means the browser."""
+    if platform.system() != "Linux":
+        return
+    print("Installing Qt for Fizgig's app window on Linux...")
+    r = subprocess.run([str(python_path), "-m", "uv", "pip", "install", "--python", str(python_path),
+                        "pywebview[qt]>=5,<7"])
+    if r.returncode != 0:
+        print("NOTE: Qt for the app window didn't install. launch_fizgig.sh will open Fizgig in your browser instead "
+              "(or use launch_fizgig_browser.sh).")
+    check_linux_tk(python_path)
+
+
+def check_linux_tk(python_path):
+    """Linux: Gizmo is a Tkinter window, and a distro's Python has no Tk until its package is installed (Ubuntu's
+    python3-tk). Pip can't install it, so say which package to install. Never fails the install."""
+    if platform.system() != "Linux" or os.environ.get("RUNPOD_POD_ID"):
+        return
+    if subprocess.run([str(python_path), "-c", "import tkinter; tkinter.Tcl()"], capture_output=True).returncode == 0:
+        return
+    v = f"{sys.version_info.major}.{sys.version_info.minor}"
+    print("NOTE: Gizmo (the clip / voice / music prep app) needs Tk, which this Python doesn't have. Install it with")
+    print(f"  Ubuntu / Debian: sudo apt install python3-tk   (or python{v}-tk)")
+    print("  Fedora: sudo dnf install python3-tkinter    Arch: sudo pacman -S tk")
+    print("Everything else in Fizgig works without it.")
 
 
 def verify_cuda():
@@ -350,36 +402,26 @@ else:
 
 
 def download_insightface_models():
-    """Trigger InsightFace model download by running a test detection"""
+    """The face models: InsightFace's face finder (its detector + gender/age files only) and AdaFace ViT, the
+    likeness model (face_utils.ensure_face_models: pinned, checksummed). Never fatal: they also fetch on first use."""
     python_path = get_python_path()
 
-    print("Downloading InsightFace models (buffalo_l)...")
-    print("(First-time download, ~300MB)")
+    print("Downloading the face models (face finder + AdaFace ViT likeness model, ~0.5 GB)...")
 
-    # Python script to download models
-    download_script = '''
+    download_script = f'''
 import os
 import sys
-
-# Suppress TensorFlow warnings
+os.environ.setdefault("ORT_DISABLE_TELEMETRY", "1")   # no onnxruntime telemetry (Linux builds 1.29+)
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-
+sys.path.insert(0, {str(SCRIPT_DIR / "src")!r})
 try:
-    from insightface.app import FaceAnalysis
-
-    print("Initializing FaceAnalysis (this downloads models)...")
-    app = FaceAnalysis(
-        name='buffalo_l',
-        allowed_modules=['detection', 'genderage', 'recognition'],
-        providers=['CPUExecutionProvider']
-    )
-    app.prepare(ctx_id=-1)  # -1 = CPU only
-    print("Models downloaded successfully!")
-    sys.exit(0)
+    from fizgig.face_utils import ensure_face_models
+    ensure_face_models()
+    print("Face models ready.")
 except Exception as e:
-    print(f"Warning: Could not download models: {e}")
-    print("Models will be downloaded on first use.")
-    sys.exit(0)  # Don't fail installation
+    print(f"Warning: Could not download the face models: {{e}}")
+    print("They will download on first use.")
+sys.exit(0)  # Don't fail installation
 '''
 
     try:
@@ -404,8 +446,8 @@ except Exception as e:
 def create_launcher_scripts():
     """Verify/create launcher scripts.
 
-    Windows: run_fizgig.bat ships WITH the repo (the consoleless chain: .bat -> run_silent.vbs
-    -> pythonw launch.pyw). This step used to overwrite it with an ancient console-attached
+    Windows: the launchers ship WITH the repo (Launch Fizgig.bat, the app window; Launch Fizgig in browser.bat, the web UI
+    with the browser opened on it; Launch Gizmo.bat). This step used to overwrite it with an ancient console-attached
     version (python + pause), which (a) gave every fresh install a lingering console window
     that ended in 'Press any key to continue', and (b) dirtied a tracked file so the next
     update_fizgig.bat's `git pull` refused to run. Never write it here.
@@ -413,7 +455,7 @@ def create_launcher_scripts():
     # Gizmo's launcher is the same story and gets the same treatment: tracked, verified, never
     # written. It needs no install of its own — Tkinter is stdlib, PIL and imageio-ffmpeg are
     # already pinned — so it simply arrives with an ordinary update.
-    for name in ("run_fizgig.bat", "Launch Gizmo (Video clip prep tool).bat"):
+    for name in ("Launch Fizgig.bat", "Launch Fizgig in browser.bat", "Launch Gizmo.bat"):
         bat_path = SCRIPT_DIR / name
         if bat_path.exists():
             print(f"Launcher present: {bat_path} (ships with the repo — not modified)")
@@ -421,20 +463,11 @@ def create_launcher_scripts():
             print(f"WARNING: {bat_path} is missing — restore it with "
                   f'`git checkout -- "{name}"`')
 
-    # Linux/Mac shell script (not shipped in the repo — generated here)
-    sh_content = '''#!/bin/bash
-cd "$(dirname "$0")"
-source venv/bin/activate
-python lora_trainer_gui.py
-'''
-
-    sh_path = SCRIPT_DIR / "run_fizgig.sh"
-    if not sh_path.exists():
-        with open(sh_path, 'w', newline='\n') as f:
-            f.write(sh_content)
-        if platform.system() != "Windows":
+    # Linux/Mac: launch_fizgig.sh, launch_fizgig_browser.sh and launch_gizmo.sh ship with the repo too
+    for name in ("launch_fizgig.sh", "launch_fizgig_browser.sh", "launch_gizmo.sh"):
+        sh_path = SCRIPT_DIR / name
+        if sh_path.exists() and platform.system() != "Windows":
             os.chmod(sh_path, 0o755)
-        print(f"Created: {sh_path}")
     return True
 
 
@@ -446,20 +479,21 @@ def print_summary():
     print("\nTo launch Fizgig:")
 
     if platform.system() == "Windows":
-        print(f"  Double-click: {SCRIPT_DIR / 'run_fizgig.bat'}")
-        print("  Or run: .\\run_fizgig.bat")
+        print(f"  Double-click: {SCRIPT_DIR / 'Launch Fizgig.bat'}  (its own window)")
+        print(f"  or {SCRIPT_DIR / 'Launch Fizgig in browser.bat'}  (in your web browser)")
     else:
-        print(f"  Run: ./run_fizgig.sh")
+        print("  Run: ./launch_fizgig.sh  (its own window)  or  ./launch_fizgig_browser.sh  (in your web browser)")
 
     print("\nFace Detection:")
-    print("  - InsightFace models will download on first use (~300MB)")
+    print("  - Face finder + AdaFace ViT likeness model (~0.5 GB, downloaded above or on first use)")
     print("  - Uses CPU for detection (works on any GPU)")
     print("  - Supports gender classification for face filtering")
+    print("  - Furry / anime: pick a YOLO face model on the Image Prep tab (docs/FACE_BACKENDS.md)")
 
     print("\nAI Captioning (Florence-2):")
     print("  - Florence models auto-download from Hugging Face on first use")
     print("  - Model sizes: base (~500MB), large (~1.5GB)")
-    print("  - Runs on GPU via CUDA 12.8 PyTorch (fast)")
+    print("  - Runs on GPU via CUDA 13.4 PyTorch (fast)")
 
     print("\n" + "=" * 60)
 
@@ -596,6 +630,12 @@ def main():
 
     # Print summary
     print_summary()
+    if REBUILD and platform.system() == "Windows":
+        # the updater opened this in its own window; keep it open so the result can be read
+        try:
+            input("Rebuild finished. Press Enter to close this window.")
+        except EOFError:
+            pass
 
 
 if __name__ == "__main__":

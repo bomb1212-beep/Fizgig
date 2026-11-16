@@ -86,12 +86,25 @@ def encode_datasets(datasets, encode_fn, args):
     for i, dataset in enumerate(datasets):
         logger.info(f"Encoding dataset [{i}]")
         all_cache_paths = []
+        from fizgig.training.progress import CacheProgress, dataset_items
+        shown = CacheProgress("pictures", dataset_items(dataset))
 
         for _, batch in tqdm(dataset.retrieve_latent_cache_batches(num_workers)):
-            # Ensure RGB (strip alpha)
+            shown.add(len(batch))
+            # RGB, unless the family's VAE takes alpha (description rgba) and the picture is see-through somewhere
+            keep_alpha = getattr(args, "keep_alpha", False)
+            def _see(a):
+                return isinstance(a, np.ndarray) and a.ndim == 3 and a.shape[-1] == 4 and bool((a[..., 3] < 255).any())
+            from fizgig.utils.image import on_white
             for item in batch:
-                if isinstance(item.content, np.ndarray) and item.content.shape[-1] == 4:
-                    item.content = item.content[..., :3]
+                ctrls = item.control_content or []
+                see = _see(item.content) or any(_see(c) for c in ctrls)
+                if not (keep_alpha and _see(item.content)):
+                    item.content = on_white(item.content)
+                if not keep_alpha and ctrls:
+                    item.control_content = [on_white(c) for c in ctrls]
+                # the cache's mark: the picture or a before-image went in with its alpha ("1") or laid on white
+                item.alpha = ("1" if keep_alpha else "white") if see else ""
 
             all_cache_paths.extend([item.latent_cache_path for item in batch])
 
@@ -105,12 +118,33 @@ def encode_datasets(datasets, encode_fn, args):
                 # veto the skip for a file that exists and matches — MiniMax uses it for a
                 # clip cached without the still that --clip_still asks for.
                 _needs = getattr(args, "needs_reencode", None)
+
+                from fizgig.dataset.image_dataset import source_stamp
+
+                def _newer(item):
+                    """The picture changed since it was cached (same name, new pixels: an edited photo, a folder
+                    refilled with another person's photos, or LoRA Isolation's side-by-sides rebuilt from a new
+                    strangers set): its size and date against the stamp in the cache, either way; a cache without a
+                    stamp (written before it) by the picture being newer."""
+                    try:
+                        from safetensors import safe_open
+                        with safe_open(item.latent_cache_path, framework="pt") as f:
+                            md = f.metadata() or {}
+                        if getattr(item, "alpha", "") != md.get("alpha", ""):
+                            return True         # cached on its hidden colour (or another way than now)
+                        was = md.get("source")
+                        if was:
+                            return was != source_stamp(item.item_key)
+                        return os.path.getmtime(item.item_key) > os.path.getmtime(item.latent_cache_path)
+                    except Exception:           # unreadable: the size check above has the final say
+                        return False
                 batch = [item for item in batch
                          if not os.path.exists(item.latent_cache_path)
                          or _ID.latent_cache_matches_reso(item.latent_cache_path,
                                                           item.bucket_size,
                                                           dataset.architecture) is not True
-                         or (_needs is not None and _needs(item.latent_cache_path))]
+                         or (_needs is not None and _needs(item.latent_cache_path))
+                         or _newer(item)]
                 if not batch:
                     continue
 
