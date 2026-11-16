@@ -13,12 +13,12 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 AUTO = ROOT / "automation"
-os.environ.setdefault("HF_HOME", str(ROOT / "models" / ".hf-cache"))
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(AUTO))
-from local_caption import GemmaServer, LocalClient
 from pipeline import models as model_paths
+os.environ.setdefault("HF_HOME", str(model_paths.models_dir() / ".hf-cache"))
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+from local_caption import GemmaServer, LocalClient
 EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 EVENT_PREFIX = "@@FIZGIG_EVENT@@"
 EVENTS = False

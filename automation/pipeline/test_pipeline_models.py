@@ -38,6 +38,25 @@ class ModelPathTests(unittest.TestCase):
         self.assertEqual(rows["krea2_raw_dit"]["source"], "config.json")
         self.assertEqual(rows["krea2_vae"]["source"], "prefs.json")
 
+    def test_prefs_follow_fizgig_into_user_data(self):
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            new = root / "user_data" / "prefs.json"
+            with mock.patch.object(models, "ROOT", root), mock.patch("fizgig.user_data.PREFS_FILE", str(new)):
+                self.assertEqual(models.prefs_path(), new)            # neither yet: where Fizgig 8 will write it
+                (root / "prefs.json").write_text('{"a": "old"}', encoding="utf-8")
+                self.assertEqual(models.prefs_path(), root / "prefs.json")   # not moved yet: the old one
+                self.assertEqual(models.prefs(), {"a": "old"})
+                new.parent.mkdir()
+                new.write_text('{"a": "new"}', encoding="utf-8")
+                self.assertEqual(models.prefs(), {"a": "new"})        # moved (or both): user_data wins
+                (root / "models").mkdir()
+                self.assertEqual(models.models_dir(), root / "models")
+                (root / "user_data" / "models").mkdir()
+                self.assertEqual(models.models_dir(), root / "user_data" / "models")
+
     def test_problems_name_the_family_key_to_fill(self):
         problems = models.problems("krea2", {"models": {}}, base={})
         self.assertTrue(problems)

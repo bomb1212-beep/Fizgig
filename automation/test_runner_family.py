@@ -250,9 +250,12 @@ class PlanTests(unittest.TestCase):
         self.assertNotIn("--adaptive_lr", train)
 
     def test_the_family_preset_supplies_what_the_job_does_not_name(self):
+        from fizgig.families.registry import get
         train = self.plan("krea2").stages[-1].cmd
-        # The Ultra Fast preset's optimizer and precision reach the trainer without being in config.json.
-        self.assertEqual(train[train.index("--optimizer_type") + 1], "adamw8bit")
+        # The Ultra Fast preset's optimizer and precision reach the trainer without being in config.json. The value is
+        # the preset's own (AdamW8bit until Fizgig 9 moved Krea 2's presets to Muon), not one pinned here.
+        preset = dict(get("krea2").presets[0][1])
+        self.assertEqual(train[train.index("--optimizer_type") + 1], preset["OPTIMIZER_TYPE"])
         self.assertIn("--precision", train)
 
 

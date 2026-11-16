@@ -6,8 +6,10 @@
 
 A path given there wins; every key it leaves out falls back to `prefs.json`, the file the Fizgig GUI owns. This module
 only ever reads `prefs.json`: a path typed into the GUI and a path in `config.json` are the same thing to the trainer.
+Since Fizgig 8 that file lives in `user_data/` (fizgig.user_data); before Fizgig 8's first start has moved it there,
+it is still the one in the Fizgig folder (prefs_path).
 
-Relative paths are resolved against the Fizgig_auto root so the local Qwen files do not depend on how the folder is
+Relative paths are resolved against the Fizgig root so the local Qwen files do not depend on how the folder is
 mounted. ComfyUI's own model files stay absolute: pointing at them is the whole reason 26 GB is not copied.
 """
 from __future__ import annotations
@@ -33,8 +35,27 @@ def config():
     return read_json(AUTO / "config.json", {})
 
 
+def prefs_path():
+    """Fizgig's prefs.json: user_data/prefs.json since Fizgig 8 (fizgig.user_data.PREFS_FILE, which FIZGIG_USER_DATA
+    can move), or the Fizgig folder's own while Fizgig 8 has not started yet to move it. Reading never moves it:
+    user_data.migrate() is Fizgig's to run."""
+    try:
+        from fizgig.user_data import PREFS_FILE
+        new = Path(PREFS_FILE)
+    except ImportError:                  # run without src on the path
+        new = ROOT / "user_data" / "prefs.json"
+    old = ROOT / "prefs.json"
+    return old if old.exists() and not new.exists() else new
+
+
+def models_dir():
+    """Where Fizgig keeps downloaded models: user_data/models since Fizgig 8, the Fizgig folder's models/ before."""
+    new, old = ROOT / "user_data" / "models", ROOT / "models"
+    return old if old.is_dir() and not new.is_dir() else new
+
+
 def prefs():
-    return read_json(ROOT / "prefs.json", {})
+    return read_json(prefs_path(), {})
 
 
 def description(family):
@@ -64,7 +85,7 @@ def overrides(family, cfg=None):
 
 
 def resolve_path(value):
-    """Absolute form of a configured path: relative paths hang off the Fizgig_auto root, `~` is expanded."""
+    """Absolute form of a configured path: relative paths hang off the Fizgig root, `~` is expanded."""
     path = Path(os.path.expanduser(str(value).strip()))
     return str(path if path.is_absolute() else (ROOT / path))
 
