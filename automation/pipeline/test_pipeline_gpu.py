@@ -348,6 +348,9 @@ class EntryPointRaceTests(_FakeTool2Fixture, unittest.TestCase):
         go = self.dir / "go"
         release = self.dir / "release"
         invocations = self.dir / "tool2_invocations.txt"
+        # The racers claim in a lock folder of their own, never the real automation/gpu.lock: a real training or
+        # generation job holding that lock would otherwise make both racers lose, and a racer must never block one.
+        locks = self.dir / "locks"
         runner = (
             "import sys, time\n"
             "from pathlib import Path\n"
@@ -355,6 +358,8 @@ class EntryPointRaceTests(_FakeTool2Fixture, unittest.TestCase):
             "    time.sleep(0.02)\n"
             f"sys.path.insert(0, {str(ROOT / 'src')!r})\n"
             f"sys.path.insert(0, {str(AUTO)!r})\n"
+            "from pipeline import gpu\n"
+            f"gpu.AUTO = Path({str(locks)!r})\n"
             "from pipeline import gen_qwen_edit as gen\n"
             "fake = {'python': sys.executable, 'batch': sys.argv[1]}\n"
             "gen.tool_paths = lambda cfg=None: fake\n"
@@ -392,6 +397,8 @@ class EntryPointRaceTests(_FakeTool2Fixture, unittest.TestCase):
         self.assertEqual(busy_messages, 1, f"the loser must be refused with GpuBusy; stderr: {outcomes}")
         self.assertEqual(invocations.read_text(encoding="utf-8").count("invoked"), 1,
                          "the refused process must submit nothing")
+        self.assertTrue(locks.is_dir(), "the racers must claim in the test's own lock folder")
+        self.assertFalse((locks / gpu.GPU_LOCK).exists(), "the winner must release its claim")
 
 
 if __name__ == "__main__":
