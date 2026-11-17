@@ -371,12 +371,10 @@ def write_manifest(path, manifest):
 
 
 def prompt_for(card, prompt):
-    """`trigger, caption_base, fixed_traits, outfit, the eval prompt`, in the order spec 3.4 fixes."""
-    parts = [card.get("trigger", ""), card.get("caption_base", "")]
-    parts += list(card.get("fixed_traits") or [])
-    parts.append((card.get("outfits") or {}).get("default", ""))
-    parts.append(prompt.get("prompt", ""))
-    return ", ".join(p.strip() for p in parts if p and str(p).strip())
+    """The card's words around the eval prompt, built as batch B builds its own (prompting.build): an epoch is
+    judged on the pictures it will actually be asked for."""
+    from . import prompting
+    return prompting.build(card, prompt.get("prompt", ""))
 
 
 def pending(manifest):

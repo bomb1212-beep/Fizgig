@@ -234,6 +234,12 @@ class Comfy:
         if len(same) == 1:
             return same[0]
         if len(same) > 1:
+            # Two runs that both end in `suamom_seed.safetensors`, each reached through its own junction: the listed
+            # name whose file *is* the wanted file settles it, without guessing by name.
+            real = [o for o in same if any(_same_file(Path(root) / o, wanted) for root in roots)]
+            if len(real) == 1:
+                return real[0]
+        if len(same) > 1:
             raise ComfyError(f"{wanted.name} is ambiguous as a {kind}: ComfyUI lists "
                              + ", ".join(sorted(same)) + "; point comfy.root at the right copy")
         raise ComfyError(
@@ -465,6 +471,14 @@ class Comfy:
 def _output_images(outputs):
     return [dict(filename=i.get("filename"), subfolder=i.get("subfolder"), type=i.get("type"))
             for o in outputs.values() for i in (o.get("images") or [])]
+
+
+def _same_file(a, b):
+    """True when two paths name the same file on disk (through a junction, a symlink or a hardlink)."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
 
 
 def _model_roots(comfy_root, kind):

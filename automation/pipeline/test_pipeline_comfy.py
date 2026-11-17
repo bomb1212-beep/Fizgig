@@ -1,5 +1,6 @@
 """Offline checks for the ComfyUI client: the prompt journal, atomic writes and filename resolution."""
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -334,6 +335,28 @@ class NameResolutionTests(unittest.TestCase):
         with self.assertRaises(comfy.ComfyError) as caught:
             client.name_for("lora", "G:/elsewhere/same.safetensors")
         self.assertIn("ambiguous", str(caught.exception))
+
+    def test_an_ambiguous_name_is_settled_by_the_file_it_really_is(self):
+        # Two seed runs both end in suamom_seed.safetensors, each reached through its own link under loras/: the
+        # listed name whose file is the wanted file wins, and nothing is guessed from the name alone.
+        root = Path(self.temp.name) / "ComfyUI"
+        loras = root / "models" / "loras"
+        for run in ("old", "new"):
+            (loras / run).mkdir(parents=True)
+        elsewhere = Path(self.temp.name) / "runs" / "new"
+        elsewhere.mkdir(parents=True)
+        wanted = elsewhere / "same.safetensors"
+        wanted.write_bytes(b"new weights")
+        (loras / "old" / "same.safetensors").write_bytes(b"old weights")
+        try:
+            os.link(wanted, loras / "new" / "same.safetensors")
+        except OSError as exc:
+            self.skipTest(f"no hardlinks here: {exc}")
+        fake = FakeComfy()
+        fake.object_info["LoraLoaderModelOnly"]["input"]["required"]["lora_name"] = [
+            ["old\\same.safetensors", "new\\same.safetensors"], {}]
+        client = comfy.Comfy("http://127.0.0.1:9", comfy_root=str(root), opener=fake)
+        self.assertEqual(client.name_for("lora", str(wanted)), "new\\same.safetensors")
 
     def test_krea2_is_reported_as_an_installed_clip_type(self):
         self.assertIn("krea2", self.client.clip_types())

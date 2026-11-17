@@ -57,6 +57,20 @@ class ProjectDiscoveryTests(unittest.TestCase):
     def test_a_missing_projects_folder_is_empty_not_an_error(self):
         self.assertEqual(dataset_tab.project_roots(self.auto), [])
 
+    def test_the_projects_folder_follows_config_json(self):
+        # The 2026-11-14 layout: config.json sends projects outside automation/, relative to the trainer root (the
+        # folder above automation/), as pipeline.project.projects_dir resolves it.
+        data = Path(self.temp.name) / "data" / "projects"
+        (data / "moved").mkdir(parents=True)
+        (data / "moved" / "project.json").write_text('{"id": "moved"}', encoding="utf-8")
+        make_project(self.auto, "left_behind")
+        (self.auto / "config.json").write_text(json.dumps({"pipeline": {"projects_dir": "data/projects"}}),
+                                               encoding="utf-8")
+        self.assertEqual(dataset_tab.projects_base(self.auto), data.resolve())
+        self.assertEqual([p.name for p in dataset_tab.project_roots(self.auto)], ["moved"])
+        (self.auto / "config.json").write_text("{}", encoding="utf-8")
+        self.assertEqual([p.name for p in dataset_tab.project_roots(self.auto)], ["left_behind"])
+
     def test_the_summary_reads_what_is_on_disk(self):
         folder = make_project(self.auto, "p", candidates=5,
                               decisions={"c_0": {"decision": "accept"}, "c_1": {"decision": "reject"}},
@@ -185,7 +199,7 @@ class CommandTests(unittest.TestCase):
         for module in sorted(dataset_tab.CANCELABLE):
             source = (Path(dataset_tab.__file__).parent / "pipeline" / f"{module}.py").read_text(encoding="utf-8")
             self.assertIn("--cancel-file", source, f"{module} is listed as cancelable but takes no stop file")
-        self.assertEqual(dataset_tab.CANCELABLE, {"epochs", "batch_gen", "fix", "gen_qwen_edit", "ph3_edit"})
+        self.assertEqual(dataset_tab.CANCELABLE, {"epochs", "batch_gen", "fix", "gen_qwen_edit", "ph3_edit", "ph3_refine"})
 
     def test_planning_and_drawing_are_separate_buttons(self):
         # `epochs run` reads the manifest `plan` wrote and does not plan for itself, so one button cannot mean both.

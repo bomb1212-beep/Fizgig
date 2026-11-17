@@ -91,5 +91,25 @@ class ModelPathTests(unittest.TestCase):
                          ["text_encoders", "clip"])
 
 
+class LaunchedFromTheRootTests(unittest.TestCase):
+    """The GUI starts stages as `python -m pipeline.X` with the repo root as working directory, where Fizgig 8+ keeps
+    its launcher `fizgig.py`. The family registry must still come from the `fizgig` package in src/."""
+
+    def test_the_registry_loads_with_the_root_first_on_the_path(self):
+        import os
+        import subprocess
+
+        if not (ROOT / "fizgig.py").is_file():
+            self.skipTest("no fizgig.py launcher at the repo root")
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join((str(AUTO), str(ROOT / "src"))),
+               "PYTHONIOENCODING": "utf-8"}
+        code = ("import sys; sys.path.insert(0, ''); from pipeline import models; "
+                "print(models.description('krea2').key, models.prefs_path().name)")
+        result = subprocess.run([sys.executable, "-B", "-c", code], cwd=str(ROOT), env=env,
+                                capture_output=True, text=True, encoding="utf-8", timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr[-1500:])
+        self.assertEqual(result.stdout.split(), ["krea2", "prefs.json"])
+
+
 if __name__ == "__main__":
     unittest.main()

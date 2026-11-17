@@ -81,6 +81,14 @@ def _temp_beside(path):
     return path.with_name(f"{path.name}.tmp-{os.getpid()}-{threading.get_ident()}-{os.urandom(4).hex()}")
 
 
+def slot_plan_of(project):
+    """`project.slot_plan()`, or the card's `slot_quotas` for a stand-in that only carries a card (tests)."""
+    method = getattr(project, "slot_plan", None)
+    if callable(method):
+        return method()
+    return {slot: int(target) for slot, target in ((project.card or {}).get("slot_quotas") or {}).items()}
+
+
 def write_json(path, data):
     """Write JSON so a reader sees either the old file or the new one, never a half-written one."""
     return write_text(path, json.dumps(data, ensure_ascii=False, indent=1))
@@ -569,6 +577,14 @@ class Project:
     def undecided(self):
         review = self.review()
         return [r for r in self.candidates() if r["id"] not in review]
+
+    def slot_plan(self):
+        """{slot id: target} - the composition plan when the card opts in (`slot_plan: composition`), else the card's
+        own `slot_quotas`. Every slot board (batch B, the review page, scores, the seed report) reads this one."""
+        if str(self.card.get("slot_plan") or "") == "composition":
+            from . import composition
+            return composition.quotas(self)
+        return {slot: int(target) for slot, target in (self.card.get("slot_quotas") or {}).items()}
 
     def quotas(self, planned_slots):
         """Accepted count per slot category against what the plan asked for.

@@ -582,5 +582,145 @@ class ModalLocationTests(unittest.TestCase):
             launch.assert_called_once()
 
 
+class SettingsFieldTests(unittest.TestCase):
+    """목표 장수 / 시드 에포크 / 최종 스텝: loaded per project, saved by the button, and saved before training."""
+
+    setUp = ModalLocationTests.setUp
+    tearDown = ModalLocationTests.tearDown
+    clicked = ModalLocationTests.clicked
+
+    def tab(self):
+        tab = ModalLocationTests.tab(self, "로컬")
+        tab.target_images = _Widget("")
+        tab.seed_epochs = _Widget("")
+        tab.final_steps = _Widget("")
+        tab._settings_for = None
+        tab.logged = []
+        tab._append = tab.logged.append
+        return tab
+
+    def test_a_project_without_settings_shows_the_defaults(self):
+        tab = self.tab()
+        tab.refresh_info()
+        self.assertEqual((tab.target_images.get(), tab.seed_epochs.get(), tab.final_steps.get()),
+                         ("50", "30", "2000"))
+
+    def test_the_fields_show_what_the_project_saved(self):
+        from pipeline import settings
+        settings.write(self.folder, {"target_images": 60, "seed_epochs": 25, "final_steps": 2400})
+        tab = self.tab()
+        tab.refresh_info()
+        self.assertEqual((tab.target_images.get(), tab.seed_epochs.get(), tab.final_steps.get()),
+                         ("60", "25", "2400"))
+
+    def test_a_refresh_keeps_numbers_typed_but_not_saved(self):
+        tab = self.tab()
+        tab.refresh_info()
+        tab.final_steps.set("2500")
+        tab.refresh_info()                     # e.g. after a stage finishes
+        self.assertEqual(tab.final_steps.get(), "2500")
+
+    def test_the_button_saves_the_fields(self):
+        from pipeline import settings
+        tab = self.tab()
+        tab.refresh_info()
+        tab.target_images.set("40")
+        tab.final_steps.set("1800")
+        self.assertIsNotNone(tab.save_settings())
+        self.assertEqual(settings.read(self.folder), {"target_images": 40, "seed_epochs": 30, "final_steps": 1800})
+        self.assertTrue(any("기본값 저장" in line for line in tab.logged))
+
+    def test_seed_training_saves_and_passes_the_epochs(self):
+        from pipeline import settings
+        tab = self.tab()
+        tab.refresh_info()
+        tab.seed_epochs.set("35")
+        argv = self.clicked(tab, "seed_train")
+        self.assertEqual(argv[argv.index("--epochs") + 1], "35")
+        self.assertEqual(settings.read(self.folder)["seed_epochs"], 35)
+        self.assertEqual(argv[-2], "--project")
+
+    def test_the_seed_set_picks_the_policy(self):
+        for label, policy in dataset_tab.SEED_SETS:
+            tab = self.tab()
+            tab.seed_set = _Widget(label)
+            tab.refresh_info()
+            argv = self.clicked(tab, "seed_train")
+            self.assertEqual(argv[argv.index("--policy") + 1], policy)
+        self.assertEqual(dataset_tab.SEED_SETS[0], ("원본만", "seed-originals"))
+
+    def test_final_todo_saves_the_steps_it_will_write(self):
+        from pipeline import settings
+        tab = self.tab()
+        tab.refresh_info()
+        tab.final_steps.set("2200")
+        argv = self.clicked(tab, "todos")
+        self.assertNotIn("--epochs", argv)
+        self.assertEqual(settings.read(self.folder)["final_steps"], 2200)
+
+    def test_a_bad_number_stops_the_stage_before_it_runs(self):
+        from pipeline import settings
+        tab = self.tab()
+        tab.refresh_info()
+        tab.seed_epochs.set("thirty")
+        seen = []
+        with patch.object(dataset_tab.messagebox, "showerror") as shown, \
+                patch.object(tab, "_run_stage", lambda *args, **kwargs: seen.append(args)):
+            tab.start("seed_train")
+        self.assertEqual(seen, [])
+        shown.assert_called_once()
+        self.assertFalse(settings.path(self.folder).exists())
+
+
+class CharacterFieldTests(unittest.TestCase):
+    """나이 / 고정 특징 / 얼굴 특징: loaded from the card with the project, saved into the card by the button."""
+
+    setUp = ModalLocationTests.setUp
+    tearDown = ModalLocationTests.tearDown
+
+    def tab(self):
+        tab = SettingsFieldTests.tab(self)
+        tab.age = _Widget("")
+        tab.fixed_traits = _Widget("")
+        tab.face_traits = _Widget("")
+        return tab
+
+    def card(self):
+        return json.loads((self.folder / "project.json").read_text(encoding="utf-8"))
+
+    def test_the_fields_show_the_card(self):
+        card = self.card()
+        card.update(profile={"age": 28}, fixed_traits=["low ponytail"], face_traits=["mole under her eye"])
+        (self.folder / "project.json").write_text(json.dumps(card), encoding="utf-8")
+        tab = self.tab()
+        tab.refresh_info()
+        self.assertEqual((tab.age.get(), tab.fixed_traits.get(), tab.face_traits.get()),
+                         ("28", "low ponytail", "mole under her eye"))
+
+    def test_the_button_writes_the_card_and_keeps_the_rest_of_it(self):
+        tab = self.tab()
+        tab.refresh_info()
+        tab.age.set("28")
+        tab.fixed_traits.set("low ponytail, black scrunchie")
+        tab.face_traits.set("mole under her eye")
+        self.assertIsNotNone(tab.save_character())
+        card = self.card()
+        self.assertEqual(card["profile"], {"age": 28})
+        self.assertEqual(card["fixed_traits"], ["low ponytail", "black scrunchie"])
+        self.assertEqual(card["face_traits"], ["mole under her eye"])
+        self.assertEqual(card["trigger"], "trg")
+        self.assertTrue(any("캐릭터 저장" in line for line in tab.logged))
+
+    def test_a_bad_age_writes_nothing(self):
+        before = self.card()
+        tab = self.tab()
+        tab.refresh_info()
+        tab.age.set("스물여덟")
+        with patch.object(dataset_tab.messagebox, "showerror") as shown:
+            self.assertIsNone(tab.save_character())
+        shown.assert_called_once()
+        self.assertEqual(self.card(), before)
+
+
 if __name__ == "__main__":
     unittest.main()

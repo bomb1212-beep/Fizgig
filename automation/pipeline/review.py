@@ -1086,7 +1086,7 @@ def main(argv=None):
     parser.add_argument("--no-browser", action="store_true", help="do not open a browser window")
     args = parser.parse_args(argv)
     project = pj.Project.open(args.project)
-    return 0 if serve(project, port=args.port, quota_plan=project.card.get("slot_quotas"),
+    return 0 if serve(project, port=args.port, quota_plan=pj.slot_plan_of(project),
                       open_browser=not args.no_browser) else 0
 
 

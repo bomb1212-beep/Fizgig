@@ -41,7 +41,7 @@ ROOT = AUTO.parent
 if str(AUTO) not in sys.path:
     sys.path.insert(0, str(AUTO))
 
-from pipeline import lineage, models, project as pj  # noqa: E402
+from pipeline import lineage, models, project as pj, prompting, settings  # noqa: E402
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 INSTRUCTION_FILES = ("caption_instructions.txt", "caption_instructions_anime.txt")
@@ -58,6 +58,9 @@ SEED_GENERATORS = ("qwen_edit", "ph3_edit")
 POLICY_GENERATORS = {
     "seed-v1": ("qwen_edit",),
     "seed-v2": ("qwen_edit", "ph3_edit"),
+    # The user's originals and nothing else (2026-11-17): a LoRA that has seen no edit at all, so whatever it draws
+    # for the dataset carries no editor's drift. Every candidate is excluded as generator_not_eligible, by name.
+    "seed-originals": (),
 }
 # The final export is a different question from the seed, so the audit answers it with the same shared checks but two
 # rules of its own: a Krea2 batch B picture may enter once a plan manifest names it, and the generation ceiling is the
@@ -115,7 +118,7 @@ def card_caption(card):
     """The caption the card alone can produce: the trigger, the style, and the traits when the policy includes them."""
     parts = [card.get("trigger", ""), card.get("caption_base", "")]
     if str(card.get("caption_traits") or "omit").lower() == "include":
-        parts += list(card.get("fixed_traits") or [])
+        parts += prompting.all_traits(card)
         parts.append((card.get("outfits") or {}).get("default", ""))
     return ", ".join(part.strip() for part in parts if part and part.strip())
 
@@ -127,7 +130,7 @@ def caption_traits_policy(card):
 
 
 def trait_terms(card):
-    """The words the policy is about: the fixed traits and the default outfit, as written in the card.
+    """The words the policy is about: the fixed and face traits and the default outfit, as written in the card.
 
     The trigger and the caption style are removed from the set even when they coincide with a trait or the default
     outfit: they are what the card wants in *every* caption, so a caption that names the style as its default outfit
@@ -137,7 +140,7 @@ def trait_terms(card):
     protected = {str(card.get("trigger") or "").strip().lower(),
                  str(card.get("caption_base") or "").strip().lower()}
     protected.discard("")
-    terms = [str(t).strip() for t in (card.get("fixed_traits") or []) if str(t or "").strip()]
+    terms = prompting.all_traits(card)
     outfit = str((card.get("outfits") or {}).get("default") or "").strip()
     if outfit:
         terms.append(outfit)
@@ -212,7 +215,7 @@ def _drop_terms_from_sentence(text, terms):
 
 def _append_terms(caption, card):
     """`include`: add the fixed traits and the default outfit that the caption does not already carry."""
-    extra = [t for t in (card.get("fixed_traits") or []) if t and t.lower() not in caption.lower()]
+    extra = [t for t in prompting.all_traits(card) if t.lower() not in caption.lower()]
     outfit = (card.get("outfits") or {}).get("default", "")
     if outfit and outfit.lower() not in caption.lower():
         extra.append(outfit)
@@ -556,7 +559,7 @@ def _audit(project, *, caps=None, log=None, policy=None, purpose="seed"):
                      "accepted": sum(1 for entry in kept_candidates(kept, project, slot)),
                      "eligible": sum(1 for entry in unique
                                      if entry["kind"] == "candidate" and entry["slot"] == slot)}
-              for slot, target in (project.card.get("slot_quotas") or {}).items()}
+              for slot, target in pj.slot_plan_of(project).items()}
     return {
         "policy": policy, "purpose": purpose, "caps": caps,
         "holdout": holdout,
@@ -924,10 +927,14 @@ def main(argv=None):
     parser.add_argument("--migrate-review", action="store_true", help="tag review history and move stated reasons")
     parser.add_argument("--apply", action="store_true", help="with --freeze-holdout/--migrate-review: really write")
     parser.add_argument("--build", action="store_true", help="build the snapshot")
+    parser.add_argument("--policy", choices=sorted(POLICY_GENERATORS), default=SEED_POLICY,
+                        help=f"which pictures may enter the seed set (default {SEED_POLICY}; "
+                             "seed-originals: the user's originals only)")
     parser.add_argument("--train", action="store_true",
                         help="with --build: train the LoRA on the new snapshot once it is published")
-    parser.add_argument("--epochs", type=int, default=30,
-                        help="with --train: passes over the snapshot (target_steps = images x epochs)")
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="with --train: passes over the snapshot (target_steps = images x epochs); "
+                             "default: seed_epochs in the project's settings.json (30 when unset)")
     parser.add_argument("--rank", type=int, help="with --train: override the LoRA rank")
     parser.add_argument("--learning-rate", type=float, help="with --train: override the learning rate")
     parser.add_argument("--megapixels", type=float, help="with --train: override the training resolution budget")
@@ -944,7 +951,7 @@ def main(argv=None):
         project.migrate_review(apply=args.apply)
     if args.freeze_holdout:
         project.freeze_holdout(apply=args.apply)
-    report = audit(project)
+    report = audit(project, policy=args.policy)
     counts = report["counts"]
     print(f"policy {report['policy']}  holdout {len(report['holdout']['ids'])} "
           f"({'frozen' if report['holdout']['frozen'] else 'not frozen'})")
@@ -961,15 +968,16 @@ def main(argv=None):
         pj.write_text(Path(args.json), json.dumps(report, ensure_ascii=False, indent=1))
         print(f"  report -> {args.json}")
     if args.build:
-        snapshot = build_snapshot(project)
+        snapshot = build_snapshot(project, policy=args.policy)
         print(f"snapshot {snapshot['id']} base={snapshot['base']} reused={snapshot['reused']}")
         if args.train:
             # Training needs the snapshot to exist first, and reuses it when it is already published and intact, so a
             # rerun after a crash trains the same images rather than rebuilding them under a new id.
-            config = runner_config(project, snapshot, epochs=args.epochs, rank=args.rank,
+            epochs = args.epochs or settings.read(project)["seed_epochs"]
+            config = runner_config(project, snapshot, epochs=epochs, rank=args.rank,
                                    learning_rate=args.learning_rate, megapixels=args.megapixels,
                                    backend=args.backend, modal_gpu=args.modal_gpu)
-            print(f"training {config['id']}: {len(snapshot['inputs'])} image(s) x {args.epochs} epochs "
+            print(f"training {config['id']}: {len(snapshot['inputs'])} image(s) x {epochs} epochs "
                   f"= {config['target_steps']} steps, save every ~{config['save_every_steps_approx']} "
                   f"[{config['backend']}{' / ' + config['modal_gpu'] if config['backend'] == 'modal' else ''}]")
             runs = train(project, snapshot, config=config)

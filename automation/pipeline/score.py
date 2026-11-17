@@ -125,7 +125,7 @@ def run(project, *, scorers=("clip_vision", "arcface"), log=print, embedder=None
     near = common.phash_groups([{"id": r["id"], "path": r["path"]} for r in rows_targets])
     # `Project.quotas` already knows how an accepted candidate maps to a planned slot, including the category-prefix
     # fallback for records that predate slot ids, so the slot fill is asked of it rather than recomputed here.
-    planned = {slot: int(target) for slot, target in (project.card.get("slot_quotas") or {}).items()}
+    planned = pj.slot_plan_of(project)
     fill_rows = []
     for slot, block in (project.quotas(planned) or {}).items():
         fill_rows.append({"slot": slot, "target": block["target"], "accepted": block["accepted"],

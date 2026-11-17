@@ -29,6 +29,8 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 
 import proctree
+from pipeline import prompting
+from pipeline import settings as project_settings
 
 
 # Ordered as the pipeline runs. The third field is the module and its arguments, without `--project`, which is added
@@ -41,6 +43,8 @@ STAGES = (
     ("gen_a", "생성 A", ("gen_qwen_edit",), "툴2로 편집을 실행하고 결과를 후보로 등록합니다(GPU)"),
     ("gen_ph3", "P-H3 편집", ("ph3_edit",), "P-H3로 부족 슬롯을 편집해 등록합니다(GPU)"),
     ("batch_import", "배치 B 등록", ("batch_gen", "import"), "그려진 배치 B를 후보로 등록합니다(제출 없음)"),
+    ("ph3_refine", "측면 다듬기", ("ph3_refine",),
+     "배치 B의 측면 후보를 원본 참조로 P-H3가 다듬어 같은 칸 후보로 등록합니다(GPU)"),
     ("holdout_draw", "홀드아웃 그리기", ("evaluate", "holdout", "--draw"), "홀드아웃 프롬프트를 선택 LoRA로 그립니다(GPU)"),
     ("holdout_score", "홀드아웃 평가", ("evaluate", "holdout", "--score"), "그려진 셀을 채점해 family별 보고서를 냅니다"),
     ("review", "검수 열기", ("review",), "브라우저에서 검수 페이지를 엽니다(서버는 계속 실행)"),
@@ -123,13 +127,30 @@ def exports_for_project(folder):
     return rows
 
 
+def projects_base(automation_dir):
+    """The folder projects live in: `pipeline.projects_dir` of that automation folder's config.json, the way
+    `pipeline.project.projects_dir` reads it (relative to the trainer root, `automation/projects` when unset).
+
+    The tab used to look only at `automation/projects`, so after the 2026-11-14 move to `data/projects` it listed no
+    project at all while every CLI stage still found them.
+    """
+    auto = Path(automation_dir).resolve()           # a relative "..": its parent must be the real trainer root
+    try:
+        cfg = json.loads((auto / "config.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        cfg = {}
+    value = str(((cfg.get("pipeline") or {}) if isinstance(cfg, dict) else {}).get("projects_dir") or "").strip()
+    path = Path(os.path.expanduser(value or "automation/projects"))
+    return path if path.is_absolute() else (auto.parent / path).resolve()
+
+
 def project_roots(automation_dir):
-    """Every project folder under `automation/projects`, newest first.
+    """Every project folder under the projects folder (projects_base), newest first.
 
     Read from disk rather than from a settings list: a project is a folder with a `project.json`, so one copied in by
     hand must appear here too, and one whose folder was deleted must not.
     """
-    base = Path(automation_dir) / "projects"
+    base = projects_base(automation_dir)
     if not base.is_dir():
         return []
     found = []
@@ -255,7 +276,11 @@ def stage_command(automation_dir, project_dir, spec):
 # `gen_qwen_edit` and `ph3_edit` were added by spec N2 - both already took `--cancel-file` and poll it at a slot
 # boundary, and both leave every finished picture imported-able, so a pause there is a real pause. The resume contract
 # holds because each records what it drew before the next slot; a rerun skips what is on disk.
-CANCELABLE = {"epochs", "batch_gen", "fix", "gen_qwen_edit", "ph3_edit"}
+CANCELABLE = {"epochs", "batch_gen", "fix", "gen_qwen_edit", "ph3_edit", "ph3_refine"}
+
+# The 시드 세트 choices for the 시드 학습 button, label -> pipeline.seed --policy. The first is the default: since
+# 2026-11-17 the seed LoRA learns from the user's originals alone, and the LoRA then draws the missing compositions.
+SEED_SETS = (("원본만", "seed-originals"), ("원본+채택 에디트", "seed-v2"))
 
 # The two buttons the Modal choice applies to. Everything else stays local by construction.
 MODAL_STAGES = ("seed_train", "todos")
@@ -317,6 +342,17 @@ class DatasetTab:
         self.run = tk.StringVar()           # the seed run the epoch stages work on (spec N5)
         self.epoch = tk.StringVar()         # the epoch a person picked in this tab (spec N5)
         self.export_choice = tk.StringVar()  # the published export the final todo step would use (spec N5)
+        # The editable project numbers; filled from <project>/settings.json when a project is picked.
+        self.target_images = tk.StringVar(value=str(project_settings.DEFAULTS["target_images"]))
+        self.seed_epochs = tk.StringVar(value=str(project_settings.DEFAULTS["seed_epochs"]))
+        self.final_steps = tk.StringVar(value=str(project_settings.DEFAULTS["final_steps"]))
+        self._settings_for = None          # the project folder the three fields were last loaded from
+        # The character's age and traits (pipeline.prompting): written into the card, read by every Krea2 prompt.
+        self.age = tk.StringVar(value="")
+        self.fixed_traits = tk.StringVar(value="")
+        self.face_traits = tk.StringVar(value="")
+        # Which pictures the 시드 학습 button trains on: the originals alone, or with the accepted edits (seed-v2).
+        self.seed_set = tk.StringVar(value=SEED_SETS[0][0])
         self.status = tk.StringVar(value="프로젝트를 고르세요")
         self.info = tk.StringVar(value="")
         self._buttons = {}
@@ -360,8 +396,10 @@ class DatasetTab:
         # Run / epoch / export selection (spec N5). These are choices a person makes once and every stage after them
         # uses: the epoch buttons all take the same run, so a project with more than one run never has to be typed at
         # a terminal, and an epoch is only ever recorded by an explicit click here.
-        picks = ttk.Frame(tab)
-        picks.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        rows = ttk.Frame(tab)
+        rows.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        picks = ttk.Frame(rows)
+        picks.pack(side="top", fill="x")
         ttk.Label(picks, text="학습 런", style="Heading.TLabel").pack(side="left")
         self.run_combo = ttk.Combobox(picks, textvariable=self.run, state="readonly", width=40)
         self.run_combo.pack(side="left", padx=(8, 4))
@@ -378,6 +416,44 @@ class DatasetTab:
         self.export_combo = ttk.Combobox(picks, textvariable=self.export_choice, state="readonly", width=22)
         self.export_combo.pack(side="left", padx=(8, 4))
         self.app.controls.append((self.export_combo, "readonly"))
+
+        # The project's three numbers (pipeline.settings): saved per project, read by the CLIs themselves, so the
+        # command line and this tab train for the same length. 시드 학습 and 최종 학습 준비 save them before they run.
+        numbers = ttk.Frame(rows)
+        numbers.pack(side="top", fill="x", pady=(6, 0))
+        for index, (label, variable, width) in enumerate((("목표 장수", self.target_images, 6),
+                                                          ("시드 에포크", self.seed_epochs, 5),
+                                                          ("최종 스텝", self.final_steps, 7))):
+            ttk.Label(numbers, text=label, style="Heading.TLabel").pack(side="left", padx=(12 if index else 0, 0))
+            entry = ttk.Entry(numbers, textvariable=variable, width=width, justify="right")
+            entry.pack(side="left", padx=(6, 0))
+            self.app.controls.append((entry, "normal"))
+        self.settings_button = self.app.button(numbers, "기본값 저장", self.save_settings)
+        self.settings_button.pack(side="left", padx=(8, 0))
+        ttk.Label(numbers, text="시드 세트", style="Heading.TLabel").pack(side="left", padx=(16, 0))
+        self.seed_set_combo = ttk.Combobox(numbers, textvariable=self.seed_set, state="readonly", width=16,
+                                           values=[label for label, _policy in SEED_SETS])
+        self.seed_set_combo.pack(side="left", padx=(6, 0))
+        self.app.controls.append((self.seed_set_combo, "readonly"))
+        ttk.Label(numbers, text="목표 장수는 전신·상반신 절반, 얼굴 절반으로 나눕니다. 시드 에포크는 원본 LoRA, "
+                                "최종 스텝은 최종 학습 todo에 들어갑니다.",
+                  style="Muted.TLabel").pack(side="left", padx=(12, 0))
+
+        # The character as every generated picture is asked for it (pipeline.prompting): an age keeps an anime model
+        # from drawing a child, and a trait typed here is in every prompt (face traits only where the face is big).
+        character = ttk.Frame(rows)
+        character.pack(side="top", fill="x", pady=(6, 0))
+        for index, (label, variable, width) in enumerate((("나이", self.age, 4),
+                                                          ("고정 특징", self.fixed_traits, 30),
+                                                          ("얼굴 특징", self.face_traits, 30))):
+            ttk.Label(character, text=label, style="Heading.TLabel").pack(side="left", padx=(12 if index else 0, 0))
+            entry = ttk.Entry(character, textvariable=variable, width=width)
+            entry.pack(side="left", padx=(6, 0))
+            self.app.controls.append((entry, "normal"))
+        self.character_button = self.app.button(character, "캐릭터 저장", self.save_character)
+        self.character_button.pack(side="left", padx=(8, 0))
+        ttk.Label(character, text="쉼표로 구분. 얼굴 특징(점 등)은 얼굴이 크게 나오는 컷에만 넣습니다.",
+                  style="Muted.TLabel").pack(side="left", padx=(12, 0))
 
         ttk.Label(tab, text="단계", style="Heading.TLabel").grid(row=3, column=0, sticky="w", pady=(10, 6))
         grid = ttk.Frame(tab)
@@ -518,7 +594,92 @@ class DatasetTab:
         self.info.set(" · ".join(bits))
         self.status.set(self._idle_status())
         self.refresh_picks(folder)
+        self.refresh_settings(folder)
         self._apply_stage_rules(summary)
+
+    # ------------------------------------------------------------- project numbers
+
+    def refresh_settings(self, folder):
+        """Load the three fields from the project's settings.json when the project changes.
+
+        Only on a change of project: a refresh after a stage finishes must not throw away numbers a person typed and
+        has not saved yet. A tab built without the fields (the rule tests) skips this.
+        """
+        if getattr(self, "target_images", None) is None or folder == getattr(self, "_settings_for", None):
+            return
+        values = project_settings.read(folder)
+        self.target_images.set(str(values["target_images"]))
+        self.seed_epochs.set(str(values["seed_epochs"]))
+        self.final_steps.set(str(values["final_steps"]))
+        self._settings_for = folder
+        self.refresh_character(folder)
+
+    def refresh_character(self, folder):
+        """Load the age and trait fields from the project's card. A tab built without them skips this."""
+        if getattr(self, "age", None) is None or folder is None:
+            return
+        try:
+            from pipeline import project as pj
+            card = pj.Project.open(folder).card
+        except Exception:  # noqa: BLE001 - a broken card shows empty fields; the stages report it properly
+            card = {}
+        values = prompting.fields(card)
+        self.age.set(values["age"])
+        self.fixed_traits.set(values["fixed_traits"])
+        self.face_traits.set(values["face_traits"])
+
+    def save_character(self):
+        """Write the age and traits into the selected project's card. Returns the saved fields, or None."""
+        folder = self.project_dir()
+        parent = getattr(self, "parent", None)
+        if folder is None:
+            messagebox.showinfo("캐릭터 저장", "먼저 프로젝트를 고르세요.", parent=parent)
+            return None
+        from pipeline import project as pj
+        try:
+            project = pj.Project.open(folder)
+            project.card = prompting.apply(project.card, {"age": self.age.get(),
+                                                          "fixed_traits": self.fixed_traits.get(),
+                                                          "face_traits": self.face_traits.get()})
+        except prompting.ProfileError:
+            messagebox.showerror("캐릭터 저장", f"나이는 1~{prompting.MAX_AGE} 사이의 정수이거나 비워 둡니다.",
+                                 parent=parent)
+            return None
+        project.save()
+        saved = prompting.fields(project.card)
+        self._append(f'캐릭터 저장: 나이 {saved["age"] or "(없음)"} · 고정 특징 [{saved["fixed_traits"]}] · '
+                     f'얼굴 특징 [{saved["face_traits"]}] ({Path(folder) / "project.json"})\n')
+        return saved
+
+    def settings_values(self):
+        """The three fields as typed, keyed like settings.json."""
+        return {"target_images": self.target_images.get(), "seed_epochs": self.seed_epochs.get(),
+                "final_steps": self.final_steps.get()}
+
+    def save_settings(self, quiet=False):
+        """Write the fields to the selected project's settings.json. Returns the saved values, or None.
+
+        `quiet` is for a stage that saves on its way in: it logs instead of showing a box when nothing went wrong.
+        """
+        folder = self.project_dir()
+        if folder is None:
+            if not quiet:
+                messagebox.showinfo("기본값 저장", "먼저 프로젝트를 고르세요.", parent=getattr(self, "parent", None))
+            return None
+        try:
+            saved = project_settings.write(folder, self.settings_values())
+        except project_settings.SettingsError:
+            low_high = " / ".join(f"{name} {low}~{high}" for name, (low, high) in (
+                ("목표 장수", project_settings.LIMITS["target_images"]),
+                ("시드 에포크", project_settings.LIMITS["seed_epochs"]),
+                ("최종 스텝", project_settings.LIMITS["final_steps"])))
+            messagebox.showerror("기본값 저장", f"세 값은 모두 정수여야 합니다: {low_high}",
+                                 parent=getattr(self, "parent", None))
+            return None
+        self._settings_for = folder
+        self._append(f'기본값 저장: 목표 {saved["target_images"]}장 · 시드 {saved["seed_epochs"]}에포크 · '
+                     f'최종 {saved["final_steps"]}스텝 ({project_settings.path(folder)})\n')
+        return saved
 
     # ------------------------------------------------------------- run/epoch/export picks
 
@@ -664,6 +825,18 @@ class DatasetTab:
         if spec is None:
             return
         spec = self._with_picked_export(self._with_picked_run(spec))
+        if key in ("seed_train", "todos") and getattr(self, "target_images", None) is not None:
+            # The numbers in the fields are what this click trains with: saved first, so the CLI reads the same values
+            # (export writes final_steps into the todo), and passed explicitly to the seed run so its log says so.
+            saved = self.save_settings(quiet=True)
+            if saved is None:
+                return
+            if key == "seed_train":
+                spec = spec + ("--epochs", str(saved["seed_epochs"]))
+                seed_set = getattr(self, "seed_set", None)
+                policy = dict(SEED_SETS).get(seed_set.get()) if seed_set is not None else None
+                if policy:
+                    spec = spec + ("--policy", policy)
         location = getattr(self, "location", None)
         modal = bool(location is not None and location.get() == "Modal" and key in MODAL_STAGES)
         if modal:

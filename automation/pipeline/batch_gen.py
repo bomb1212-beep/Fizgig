@@ -30,7 +30,8 @@ from pathlib import Path
 
 from . import comfy as comfy_mod
 from . import epochs as epochs_mod
-from . import krea2_gen, lineage, make_cancel, models
+from . import composition, krea2_gen, lineage, make_cancel, models, prompting
+from . import project as pj
 
 AUTO = Path(__file__).resolve().parents[1]          # automation
 
@@ -81,16 +82,17 @@ class BatchError(RuntimeError):
 def category_of(slot_id):
     """`ang_front_close` -> `angles`: the first field of a slot id is its category, by the plan's own convention."""
     head = str(slot_id).split("_")[0]
-    return {"ang": "angles", "frm": "framing", "exp": "expressions", "bg": "backgrounds", "pos": "poses"}.get(head, head)
+    return {"ang": "angles", "frm": "framing", "exp": "expressions", "bg": "backgrounds", "pos": "poses",
+            "cmp": "composition"}.get(head, head)
 
 
-def prompt_for(card, slot_id):
-    """`trigger, caption_base, fixed_traits, outfit, slot wording`, the order spec 3.4 fixes."""
-    parts = [card.get("trigger", ""), card.get("caption_base", "")]
-    parts += list(card.get("fixed_traits") or [])
-    parts.append((card.get("outfits") or {}).get("default", ""))
-    parts.append(SLOT_PROMPTS[slot_id])
-    return ", ".join(p.strip() for p in parts if p and str(p).strip())
+def prompt_for(card, slot_id, cell=None):
+    """`trigger, caption_base, profile, fixed_traits, face_traits, outfit, slot wording` (prompting.build).
+
+    A composition cell (`cell`, from `composition.plan`) brings its own wording: its shot, view, pose, expression and
+    background, in the tag vocabulary of the training captions.
+    """
+    return prompting.build(card, cell["tags"] if cell is not None else SLOT_PROMPTS[slot_id], cell)
 
 
 def training_of(project):
@@ -136,9 +138,10 @@ def slot_board(project, *, log=None):
     Read-only on purpose: planning an edit must never rewrite batch B's manifest, and neither generator needs a seed
     snapshot to classify slots.
     """
-    quotas = project.card.get("slot_quotas") or {}
+    quotas = pj.slot_plan_of(project)
     if not quotas:
-        raise BatchError("the card has no slot_quotas, so there is nothing to fill")
+        raise BatchError("the card has no slot plan (slot_quotas, or slot_plan: composition), so there is nothing "
+                         "to fill")
     board = project.quotas(quotas)
     waiting = {}
     for record in project.undecided():
@@ -171,7 +174,7 @@ def short_slots(project, *, log=None):
     """
     draw, pending = slot_board(project, log=log)
     for entry in draw:
-        if entry["slot"] not in SLOT_PROMPTS:
+        if entry["slot"] not in SLOT_PROMPTS and not composition.is_cell(entry["slot"]):
             raise BatchError(f"slot {entry['slot']!r} has no prompt in SLOT_PROMPTS; "
                              "add one rather than guessing its wording")
     return draw, pending
@@ -188,6 +191,10 @@ def plan(project, *, seeds_per_slot=SEEDS_PER_SLOT, log=print):
     training = training_of(project)
     draw, waiting = short_slots(project, log=log)
     prompts = (project.card.get("krea2_inference") or {})
+    variant, dit_key, speed_key = drawing_setup(prompts)
+    cells = {}
+    if any(composition.is_cell(entry["slot"]) for entry in draw):
+        cells = {row["slot_id"]: row for row in composition.plan(project)["cells"]}
     size = dict(prompts.get("size") or {"width": 1024, "height": 1536})
     chosen = epochs_mod.chosen(project)
     checkpoint = None
@@ -201,7 +208,7 @@ def plan(project, *, seeds_per_slot=SEEDS_PER_SLOT, log=print):
             seed = BASE_SEED + n
             tasks.append({
                 "slot_id": entry["slot"], "category": entry["category"], "seed": seed,
-                "prompt": prompt_for(project.card, entry["slot"]),
+                "prompt": prompt_for(project.card, entry["slot"], cells.get(entry["slot"])),
                 "file": f"images/{entry['slot']}__s{seed}.png",
                 "status": "pending", "sha256": None,
             })
@@ -214,8 +221,11 @@ def plan(project, *, seeds_per_slot=SEEDS_PER_SLOT, log=print):
         "generation": training["generation"],
         "trained_on_snapshot": training["trained_on_snapshot"],
         "checkpoint": checkpoint,
-        "graph_version": krea2_gen.GRAPH_VERSION["b"],
-        "inference": {k: (prompts.get(k)) for k in ("variant", "steps", "cfg", "sampler", "scheduler")},
+        "graph_version": krea2_gen.GRAPH_VERSION[variant],
+        "inference": {**{k: (prompts.get(k)) for k in ("steps", "cfg", "sampler", "scheduler")},
+                      "variant": variant, "dit": dit_key,
+                      "dit_file": Path(dit_path(dit_key)).name if dit_path(dit_key) else "",
+                      "speed_lora": speed_key},
         "size": size,
         "slots": draw,
         "waiting": waiting,
@@ -229,6 +239,8 @@ def plan(project, *, seeds_per_slot=SEEDS_PER_SLOT, log=print):
         + (f", checkpoint {checkpoint['checkpoint_sha256'][:12]}" if checkpoint else ", no epoch chosen yet"))
     for row in waiting:
         log(f"  waiting on review: {row['slot']} (short {row['short']}, {row['waiting']} pending)")
+    for warning in prompting.warnings(project.card):
+        log(f"[batch_b] warning: {warning}")
     return manifest
 
 
@@ -353,11 +365,14 @@ def run(project, manifest, *, client, names, log=print, cancel=None):
             break
         started = time.time()
         try:
+            variant = manifest["inference"].get("variant") or "b"
             graph = krea2_gen.build(
-                manifest["inference"]["variant"] or "b",
-                unet=names["b_unet"], clip=names["clip"], vae=names["vae"], prompt=task["prompt"],
+                variant,
+                unet=names.get("unet") or names["b_unet"], clip=names["clip"], vae=names["vae"],
+                prompt=task["prompt"],
                 width=manifest["size"]["width"], height=manifest["size"]["height"], seed=task["seed"],
-                character_lora=names["character_lora"], speed_lora=names["speed_lora"],
+                character_lora=names["character_lora"],
+                speed_lora=names["speed_lora"] if variant == "b" else None,
                 filename_prefix=f"pipeline_batch_b/{task['slot_id']}",
             )
             out.parent.mkdir(parents=True, exist_ok=True)
@@ -391,12 +406,38 @@ def _reusable(path, task, log):
     return lineage.sha256_file(path) == recorded
 
 
+# The configurations batch B can draw with, and the DiT each uses unless the card names another. M0 chose (b), RAW DiT
+# + Turbo LoRA; on 2026-11-17 the user moved batch B to (a) on the anime-tuned Turbo DiT. (c) conditions on reference
+# pictures and is not a batch generator.
+DRAWABLE = ("a", "b")
+DEFAULT_DIT = {"a": "krea2_turbo_dit", "b": "krea2_raw_dit"}
+
+
+def drawing_setup(inference):
+    """(variant, DiT config key, speed LoRA key or None) from the card's `krea2_inference`."""
+    variant = str(inference.get("variant") or "b")
+    if variant not in DRAWABLE:
+        raise BatchError(f"batch B draws with configuration a or b, but the card says {variant!r}")
+    dit_key = str(inference.get("dit") or DEFAULT_DIT[variant])
+    speed_key = str(inference.get("speed_lora") or "krea2_turbo_lora") if variant == "b" else None
+    return variant, dit_key, speed_key
+
+
+def dit_path(key):
+    """The absolute path a DiT key names: the family's declared files, or any extra key config.json pins."""
+    try:
+        declared = models.resolve("krea2")
+    except (ImportError, ValueError):       # the family registry lives in Fizgig's src/; config.json still answers
+        declared = {}
+    known = {**declared, **models.overrides("krea2")}
+    return known.get(key) or ""
+
+
 def assert_variant(manifest):
-    """Batch B is the (b) configuration: RAW DiT + Turbo LoRA + the character LoRA, the one M0 chose."""
+    """The plan's configuration must be one batch B can draw; the plan pins it, so the card moving later is moot."""
     variant = (manifest.get("inference") or {}).get("variant") or "b"
-    if variant != "b":
-        raise BatchError(f"batch B draws with configuration (b), but the card says {variant!r}; "
-                         "the M0 evidence for (b) does not transfer to another configuration")
+    if variant not in DRAWABLE:
+        raise BatchError(f"batch B draws with configuration a or b, but the plan says {variant!r}")
 
 
 def candidates_of(project, manifest):
@@ -422,7 +463,7 @@ def candidates_of(project, manifest):
         record = lineage.record(
             out, generator="krea2_lora", parent_ids=[], train_generation=int(manifest["generation"]),
             edit_depth=0, slot=slot,
-            models={"dit": {"name": "krea2_raw"},
+            models={"dit": {"name": (manifest.get("inference") or {}).get("dit_file") or "krea2_raw"},
                     "loras": [lineage.model_entry(
                         lora, trained_on_snapshot=manifest["trained_on_snapshot"],
                         trained_on_generation=(manifest.get("training") or {}).get("trained_on_generation", 0))]},
@@ -512,6 +553,11 @@ def main(argv=None):
                 if problems:
                     raise BatchError("model problems: " + "; ".join(problems))
                 names = epochs_mod.resolve_names(client)
+                dit_key = (manifest.get("inference") or {}).get("dit") or DEFAULT_DIT["b"]
+                if not dit_path(dit_key) or not Path(dit_path(dit_key)).is_file():
+                    raise BatchError(f"the plan's DiT {dit_key!r} is not a model file config.json or prefs.json "
+                                     f"names ({dit_path(dit_key) or 'no path'})")
+                names["unet"] = client.name_for("unet", dit_path(dit_key))
                 names["character_lora"] = client.name_for("lora", character_lora_path(project))
                 cancel = make_cancel(args.cancel_file)
                 done, skipped, failed = run(project, manifest, client=client, names=names, cancel=cancel)

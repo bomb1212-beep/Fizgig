@@ -38,6 +38,7 @@ from pathlib import Path
 
 from . import lineage
 from . import project as pj
+from . import settings
 from . import seed
 
 # The policy tag travels with the report and the manifest, so an export keeps meaning what it meant when it was
@@ -429,6 +430,9 @@ def plan_todos(project, manifest, *, families=None, automation_dir=None, backend
         families = supported
     existing = {str(job.get("id") or "") for job in read_todo(todo_path(automation_dir))}
     export_id = manifest["id"]
+    # The final run's length is the project's own setting (the GUI's 최종 스텝), written into the job so it does not
+    # silently follow whatever config.json's global target_steps happens to be when the job runs.
+    final_steps = settings.read(project)["final_steps"]
     out = []
     for family in families:
         # The id carries the export and the family: re-running the same export adds nothing, and a new export is a new
@@ -439,6 +443,7 @@ def plan_todos(project, manifest, *, families=None, automation_dir=None, backend
             "trigger": project.card.get("trigger") or project.card.get("id"),
             "dataset_root": manifest.get("dataset") or manifest.get("base"),
             "export": export_id, "export_manifest": str(Path(manifest.get("base") or "") / "export_manifest.json"),
+            "target_steps": final_steps,
             "present": job_id in existing,
         }
         if backend == "modal":

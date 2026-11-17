@@ -23,6 +23,26 @@ AUTO = ROOT / "automation"
 DEFAULT_FAMILY = "qwen_image21"
 
 
+def _src_first():
+    """Put Fizgig's `src/` at the front of sys.path before importing the `fizgig` package.
+
+    Since Fizgig 8 the repo root holds `fizgig.py`, the app launcher. A stage started from the root (the GUI's stages
+    are: `python -m pipeline.X` with the root as working directory) has the root first on sys.path, so `import
+    fizgig` found that launcher instead of the package and failed with a circular import - and importing the launcher
+    would also run its start-up. runner.py has always put src/ first; this does the same for the pipeline modules.
+    """
+    import sys
+
+    src = str(ROOT / "src")
+    if sys.path[:1] != [src]:
+        if src in sys.path:
+            sys.path.remove(src)
+        sys.path.insert(0, src)
+    loaded = sys.modules.get("fizgig")
+    if loaded is not None and not hasattr(loaded, "__path__"):
+        del sys.modules["fizgig"]                 # the launcher module, not the package
+
+
 def read_json(path, default=None):
     """The parsed file, or `default` when it is missing or unreadable (a broken prefs.json must not crash doctor)."""
     try:
@@ -40,6 +60,7 @@ def prefs_path():
     can move), or the Fizgig folder's own while Fizgig 8 has not started yet to move it. Reading never moves it:
     user_data.migrate() is Fizgig's to run."""
     try:
+        _src_first()
         from fizgig.user_data import PREFS_FILE
         new = Path(PREFS_FILE)
     except ImportError:                  # run without src on the path
@@ -60,6 +81,7 @@ def prefs():
 
 def description(family):
     """The family's FamilyDescription. Imported lazily so this module stays importable without torch."""
+    _src_first()
     from fizgig.families.registry import get
     desc = get(family)
     if desc is None:
@@ -69,6 +91,7 @@ def description(family):
 
 
 def _registry_keys():
+    _src_first()
     from fizgig.families.registry import FAMILIES
     return FAMILIES
 

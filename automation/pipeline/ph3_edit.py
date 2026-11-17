@@ -54,7 +54,7 @@ def write_manifest(project, manifest):
     os.replace(temp, path)
 
 
-def sources(project, *, caps=None, log=None):
+def sources(project, *, caps=None, log=None, candidate_ok=None):
     """(usable, unusable) - accepted pictures an edit may start from, with every refusal named.
 
     Editing puts the source picture into the child's lineage, so the source has to be as clean as a training input,
@@ -67,6 +67,9 @@ def sources(project, *, caps=None, log=None):
     becoming a picture no audit can ever admit.
     """
     caps = caps or lineage.caps(project.card.get("lineage"))
+    # Which candidates may be a source at all: accepted ones here; ph3_refine polishes undecided batch B pictures.
+    if candidate_ok is None:
+        candidate_ok = lambda record, decision: decision == "accept"  # noqa: E731
     holdout = project.holdout_entry()
     holdout_ids = set(holdout["ids"])
     holdout_shas = set(holdout["shas"])
@@ -142,7 +145,7 @@ def sources(project, *, caps=None, log=None):
         usable.append({"id": record["id"], "path": str(path), "origin": "source", "sha256": actual,
                        "generation": 1, "edit_depth": 1})
     for record in project.candidates():
-        if (review.get(record["id"]) or {}).get("decision") != "accept":
+        if not candidate_ok(record, (review.get(record["id"]) or {}).get("decision")):
             continue
         if record["id"] in holdout_ids or record.get("sha256") in holdout_shas:
             refuse(record, "holdout_source", "carries a holdout's id or bytes")

@@ -124,13 +124,9 @@ def slots(limit=None):
 
 
 def prompt_for(card, slot):
-    """`trigger, caption_base, fixed_traits, outfit, slot wording`, in that order (spec 3.4)."""
-    parts = [card.get("trigger", ""), card.get("caption_base", "")]
-    parts += list(card.get("fixed_traits") or [])
-    default_outfit = (card.get("outfits") or {}).get("default", "")
-    parts.append(default_outfit)
-    parts.append(slot.get("prompt", ""))
-    return ", ".join(p.strip() for p in parts if p and p.strip())
+    """`trigger, caption_base, profile, traits, outfit, slot wording` (prompting.build, spec 3.4's order)."""
+    from . import prompting
+    return prompting.build(card, slot.get("prompt", ""))
 
 
 # --------------------------------------------------------------------------------------------- tool2 side (method A)

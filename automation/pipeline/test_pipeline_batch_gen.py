@@ -141,7 +141,7 @@ class ShortSlotTests(unittest.TestCase):
         self.project.card["slot_quotas"] = {}
         with self.assertRaises(batch_gen.BatchError) as caught:
             batch_gen.short_slots(self.project)
-        self.assertIn("no slot_quotas", str(caught.exception))
+        self.assertIn("no slot plan", str(caught.exception))
 
     def test_the_category_comes_from_the_slot_id(self):
         self.assertEqual(batch_gen.category_of("ang_quarter_close"), "angles")
@@ -362,13 +362,54 @@ class RunTests(unittest.TestCase):
         self.assertTrue(all(task["status"] == "done" for task in archived["tasks"]))
         self.assertTrue(all(task.get("sha256") for task in archived["tasks"]))
 
-    def test_another_configuration_is_refused_before_anything_is_drawn(self):
-        self.manifest["inference"]["variant"] = "a"
+    def test_the_reference_configuration_is_refused_before_anything_is_drawn(self):
+        self.manifest["inference"]["variant"] = "c"
         client = self.client()
         with self.assertRaises(batch_gen.BatchError) as caught:
             batch_gen.run(self.project, self.manifest, client=client, names=self.names(), log=lambda *_: None)
-        self.assertIn("configuration (b)", str(caught.exception))
+        self.assertIn("configuration a or b", str(caught.exception))
         self.assertEqual(client.runs, [])
+
+    def test_the_turbo_configuration_draws_on_the_plans_dit_without_the_turbo_lora(self):
+        # (a): the Turbo DiT (here the anime-tuned one the plan pinned) already holds the distillation, so the Turbo
+        # LoRA must not be stacked on it.
+        self.manifest["inference"]["variant"] = "a"
+        client = self.client()
+        names = dict(self.names(), unet="anime_turbo.safetensors")
+        batch_gen.run(self.project, self.manifest, client=client, names=names, log=lambda *_: None)
+        graph = client.runs[0]["graph"]
+        unets = [node["inputs"]["unet_name"] for node in graph.values() if node["class_type"] == "UNETLoader"]
+        loras = [node["inputs"]["lora_name"] for node in graph.values() if node["class_type"] == "LoraLoaderModelOnly"]
+        self.assertEqual(unets, ["anime_turbo.safetensors"])
+        self.assertEqual(loras, ["char.safetensors"])
+
+
+class DrawingSetupTests(unittest.TestCase):
+    """Which configuration and DiT a plan pins, read from the card's krea2_inference."""
+
+    def test_the_default_is_the_raw_dit_with_the_turbo_lora(self):
+        self.assertEqual(batch_gen.drawing_setup({}), ("b", "krea2_raw_dit", "krea2_turbo_lora"))
+
+    def test_turbo_takes_the_named_dit_and_no_speed_lora(self):
+        self.assertEqual(batch_gen.drawing_setup({"variant": "a", "dit": "krea2_anime_turbo_dit",
+                                                  "speed_lora": "krea2_turbo_lora"}),
+                         ("a", "krea2_anime_turbo_dit", None))
+        self.assertEqual(batch_gen.drawing_setup({"variant": "a"})[1], "krea2_turbo_dit")
+
+    def test_the_reference_configuration_is_not_a_batch_generator(self):
+        with self.assertRaises(batch_gen.BatchError):
+            batch_gen.drawing_setup({"variant": "c"})
+
+    def test_the_plan_pins_the_configuration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = FakeProject(tmp, card=tiny_card(krea2_inference={
+                "variant": "a", "dit": "krea2_turbo_dit", "size": {"width": 1024, "height": 1536}}))
+            write_snapshot(project)
+            manifest = batch_gen.plan(project, log=lambda *_: None)
+        self.assertEqual(manifest["inference"]["variant"], "a")
+        self.assertEqual(manifest["inference"]["dit"], "krea2_turbo_dit")
+        self.assertIsNone(manifest["inference"]["speed_lora"])
+        self.assertEqual(manifest["graph_version"], "krea2_t2i_turbo@1")
 
 
 class CandidatesTests(unittest.TestCase):
